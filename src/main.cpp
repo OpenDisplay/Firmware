@@ -4073,20 +4073,28 @@ void drawBootScreen() {
         int srcH     = BOOT_LOGO_G5_HEIGHT;
         int srcPitch = (srcW + 7) / 8;
 
-        uint8_t* srcBuf = (uint8_t*)malloc(srcH * srcPitch);
-        if (srcBuf) {
-            G5DECODER g5dec;
-            g5dec.init(srcW, srcH, (uint8_t*)boot_logo_g5 + 8, sizeof(boot_logo_g5) - 8);
-            for (int y = 0; y < srcH; y++)
-                g5dec.decodeLine(srcBuf + y * srcPitch);
-
+        // Single-row decode buffer
+        // srcRow is monotonically non-decreasing as currentY increases, so we
+        // advance the G5 decoder forward only, reusing the buffer when the same
+        // source row is needed by multiple display rows (upscaling case).
+        uint8_t srcRowBuf[32];  // 256px / 8 bits = 32 bytes
+        G5DECODER g5dec;
+        g5dec.init(srcW, srcH, (uint8_t*)boot_logo_g5 + 8, sizeof(boot_logo_g5) - 8);
+        int decodedRow = -1;
+        {
             for (; currentY < logoAreaH && currentY < H; currentY++) {
                 memset(rowBuf, whiteValue, pitch);
 
                 // Logo pixels (logoX/logoY may be negative when zoomed in)
                 if (currentY >= logoY && currentY < logoY + logoSize) {
                     int srcRow = (currentY - logoY) * srcH / logoSize;
-                    const uint8_t* srcLine = srcBuf + srcRow * srcPitch;
+                    // Advance decoder to srcRow (forward only; reuse buffer if same row)
+                    while (decodedRow < srcRow && decodedRow < srcH - 1) {
+                        decodedRow++;
+                        g5dec.decodeLine(srcRowBuf);
+                    }
+                    if (decodedRow != srcRow) continue; // srcRow out of range, skip
+                    const uint8_t* srcLine = srcRowBuf;
                     int dxStart = (logoX < 0) ? -logoX : 0;
                     for (int dx = dxStart; dx < logoSize; dx++) {
                         int dispX  = logoX + dx;
@@ -4126,10 +4134,6 @@ void drawBootScreen() {
 
                 bbepWriteData(&bbep, rowBuf, pitch);
             }
-            free(srcBuf);
-        } else {
-            for (; currentY < logoAreaH && currentY < H; currentY++)
-                bbepWriteData(&bbep, whiteRow, pitch);
         }
     }
     #else
