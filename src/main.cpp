@@ -3995,7 +3995,7 @@ void drawBootScreen() {
         pitch = (W + 7) / 8;
         whiteValue = 0xFF;
     }
-    int fontScale = (W < FONT_SMALL_THRESHOLD) ? 1 : 2;
+    int fontScale = (W < FONT_SMALL_THRESHOLD || H < FONT_SMALL_THRESHOLD) ? 1 : 2;
     int charW     = FONT_BASE_WIDTH  * fontScale;
     int charH     = FONT_BASE_HEIGHT * fontScale;
     int gap       = charH / 2;
