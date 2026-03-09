@@ -1,4 +1,5 @@
 #include "main.h"
+#include "logo.h"
 
 void setup() {
     #ifndef DISABLE_USB_SERIAL
@@ -2202,10 +2203,8 @@ void initDisplay(){
     writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width));
     bbepWakeUp(&bbep);
     bbepSendCMDSequence(&bbep, bbep.pInitFull);
-    String chipId = getChipIdHex();
-    String infoText = "opendisplay.org\nName: OD" + chipId + "\nFW: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()) + "\nFirmware by\nJonas Niesner";
     if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
-    writeTextAndFill(infoText.c_str());
+    drawBootScreen();
     bbepRefresh(&bbep, REFRESH_FULL);
     waitforrefresh(60);
     bbepSleep(&bbep, 1);  // Put display to sleep before power down
@@ -3916,6 +3915,301 @@ void writeTextAndFill(const char* text) {
             bbepWriteData(&bbep, whiteRow, otherPlanePitch);
         }
         writeSerial("writeTextAndFill: Cleared other plane (PLANE_" + String(otherPlane == PLANE_0 ? "0" : "1") + ") with zeros for grayscale display");
+    }
+}
+
+// One entry per panel color: fill byte for PLANE_0 and PLANE_1 (BWR/BWY only)
+struct BootColor { uint8_t fill0; uint8_t fill1; };
+
+static int getBootColors(uint8_t colorScheme, BootColor out[]) {
+    switch (colorScheme) {
+        case 0:                                                       // BW (1bpp)
+            out[0] = {0x00, 0x00}; out[1] = {0xFF, 0x00}; return 2;
+        case 1:                                                       // BWR (1bpp dual-plane)
+            out[0] = {0x00, 0x00}; out[1] = {0xFF, 0x00}; out[2] = {0xFF, 0xFF}; return 3;
+        case 2:                                                       // BWY (1bpp dual-plane)
+            out[0] = {0x00, 0x00}; out[1] = {0xFF, 0x00}; out[2] = {0xFF, 0xFF}; return 3;
+        case 3:                                                       // 3-4 color (2bpp)
+            out[0] = {0x00, 0x00}; out[1] = {0x55, 0x00};
+            out[2] = {0xAA, 0x00}; out[3] = {0xFF, 0x00}; return 4;
+        case 4:                                                       // 4bpp gray (16 levels → 4 shown)
+            out[0] = {0x00, 0x00}; out[1] = {0x55, 0x00};
+            out[2] = {0xAA, 0x00}; out[3] = {0xFF, 0x00}; return 4;
+        default:                                                      // 4-gray 2bpp
+            out[0] = {0x00, 0x00}; out[1] = {0x55, 0x00};
+            out[2] = {0xAA, 0x00}; out[3] = {0xFF, 0x00}; return 4;
+    }
+}
+
+static void setBlackPixel(uint8_t* buf, int pitch, int x, int bitsPerPixel) {
+    if (bitsPerPixel == 4) {
+        int bp = x / 2;
+        if (bp >= pitch) return;
+        if (x % 2 == 0) buf[bp] &= 0x0F; else buf[bp] &= 0xF0;
+    } else if (bitsPerPixel == 2) {
+        int bp = x / 4;
+        if (bp >= pitch) return;
+        buf[bp] &= ~(0x03 << (6 - (x % 4) * 2));
+    } else {
+        int bp = x / 8;
+        if (bp >= pitch) return;
+        buf[bp] &= ~(0x80 >> (x % 8));
+    }
+}
+
+static void bootRenderTextRow(uint8_t* rowBuf, int pitch, int fontRow,
+                              const char* str, int startX,
+                              int charW, int fontScale,
+                              int bitsPerPixel, uint8_t colorScheme) {
+    int len = (int)strlen(str);
+    for (int ci = 0; ci < len; ci++) {
+        uint8_t c = (uint8_t)str[ci];
+        if (c < 32 || c > 127) c = 32;
+        uint8_t fontData[7];
+        memcpy_P(fontData, &writelineFont[(c - 32) * 7], 7);
+        if (bitsPerPixel == 4)
+            renderChar_4BPP(rowBuf, fontData, fontRow, ci, startX, charW, pitch, fontScale);
+        else if (bitsPerPixel == 2)
+            renderChar_2BPP(rowBuf, fontData, fontRow, ci, startX, charW, pitch, colorScheme, fontScale);
+        else
+            renderChar_1BPP(rowBuf, fontData, fontRow, ci, startX, charW, pitch, fontScale);
+    }
+}
+
+void drawBootScreen() {
+    int W = globalConfig.displays[0].pixel_width;
+    int H = globalConfig.displays[0].pixel_height;
+    if (W == 0 || H == 0) return;
+
+    uint8_t colorScheme = globalConfig.displays[0].color_scheme;
+    int bitsPerPixel = getBitsPerPixel();
+    int pitch;
+    uint8_t whiteValue;
+    if (bitsPerPixel == 4) {
+        pitch = W / 2;
+        whiteValue = 0xFF;
+    } else if (bitsPerPixel == 2) {
+        pitch = (W + 3) / 4;
+        whiteValue = (colorScheme == 5) ? 0xFF : 0x55;
+    } else {
+        pitch = (W + 7) / 8;
+        whiteValue = 0xFF;
+    }
+    int fontScale = (W < FONT_SMALL_THRESHOLD) ? 1 : 2;
+    int charW     = FONT_BASE_WIDTH  * fontScale;
+    int charH     = FONT_BASE_HEIGHT * fontScale;
+    int gap       = charH / 2;
+    int lineGap   = charH / 4;
+
+    // Single centered info string: "ODxxxxxx - FW dev"
+    String chipId = getChipIdHex();
+    char deviceFwStr[32];
+    if (getFirmwareMajor() == 0 && getFirmwareMinor() == 0)
+        snprintf(deviceFwStr, sizeof(deviceFwStr), "OD%s - FW dev", chipId.c_str());
+    else
+        snprintf(deviceFwStr, sizeof(deviceFwStr), "OD%s - FW %d.%d", chipId.c_str(), getFirmwareMajor(), getFirmwareMinor());
+
+    // Color squares — arranged in a grid (max 4 per row)
+    BootColor squareColors[16];
+    int numSquares = getBootColors(colorScheme, squareColors);
+    int pixPerByte = (bitsPerPixel == 4) ? 2 : (bitsPerPixel == 2) ? 4 : 8;
+    int numCols;
+    if      (numSquares <= 3) numCols = numSquares;
+    else if (numSquares == 4) numCols = 2;
+    else                      numCols = min(4, (numSquares + 1) / 2);
+    int numRows    = (numSquares + numCols - 1) / numCols;
+    int squareSize = min(H / 12, W / (numCols * 5));
+    squareSize     = (squareSize / pixPerByte) * pixPerByte;
+    if (squareSize < pixPerByte * 2) squareSize = pixPerByte * 2;
+    int sqSpacing  = (squareSize / 4 / pixPerByte) * pixPerByte;
+    if (sqSpacing < pixPerByte) sqSpacing = pixPerByte;
+    int sqGroupW   = numCols * squareSize + (numCols - 1) * sqSpacing;
+    int sqGroupH   = numRows * squareSize + (numRows - 1) * sqSpacing;
+    uint8_t lMask  = (bitsPerPixel == 4) ? 0x0F : (bitsPerPixel == 2) ? 0x3F : 0x7F;
+    uint8_t rMask  = (bitsPerPixel == 4) ? 0xF0 : (bitsPerPixel == 2) ? 0xFC : 0xFE;
+
+    // Bottom info strip: rule + gap + deviceFw + lineGap + credit + gap
+    int infoAreaH = 1 + gap + charH + lineGap + charH + gap;
+    int logoAreaH = H - infoAreaH;
+    if (logoAreaH < 0) logoAreaH = 0;
+
+    // Logo centered in logoAreaH.
+    // Small displays zoom in (130% of the smaller dimension) so the icon
+    // content fills the screen; the rendering loop clips naturally at the edges.
+    // Large displays use 95% for a small margin.
+    int logoBase = min(logoAreaH, W);
+    int logoPct  = (W < FONT_SMALL_THRESHOLD) ? 130 : 95;
+    int logoSize = (logoBase * logoPct / 100 / pixPerByte) * pixPerByte;
+    int logoX    = (W - logoSize) / 2;   // may be negative on small displays → clips
+    int logoY    = (logoAreaH - logoSize) / 2;  // may be negative → clips top/bottom
+
+    // Color square grid: bottom-left corner inside the logo's white interior.
+    // The source icon has visible content between ~8% and ~68% of its height,
+    // so anchor the BOTTOM of the square group at 65% of logoSize from logoY.
+    int sqLeftInset  = ((logoX + logoSize * 14 / 100) / pixPerByte) * pixPerByte;
+    int sqOriginX_logo = sqLeftInset;
+    int sqBottomY    = logoY + logoSize * 65 / 100;
+    int sqStripY     = sqBottomY - sqGroupH;
+    if (sqStripY < logoY) sqStripY = logoY;
+
+    auto cx = [&](const char* s) -> int {
+        int x = (W - (int)strlen(s) * charW) / 2;
+        return (x < 2) ? 2 : x;
+    };
+
+    uint8_t* whiteRow = staticWhiteRow;
+    uint8_t* rowBuf   = staticRowBuffer;
+    memset(whiteRow, whiteValue, pitch);
+
+    bbepSetAddrWindow(&bbep, 0, 0, W, H);
+    bbepStartWrite(&bbep, getplane());
+
+    int currentY = 0;
+
+    // Logo area — decode G5 logo, stream row-by-row, overlay squares at sqStripY
+    #ifdef BOOT_HAS_LOGO
+    {
+        int srcW     = BOOT_LOGO_G5_WIDTH;
+        int srcH     = BOOT_LOGO_G5_HEIGHT;
+        int srcPitch = (srcW + 7) / 8;
+
+        uint8_t* srcBuf = (uint8_t*)malloc(srcH * srcPitch);
+        if (srcBuf) {
+            G5DECODER g5dec;
+            g5dec.init(srcW, srcH, (uint8_t*)boot_logo_g5 + 8, sizeof(boot_logo_g5) - 8);
+            for (int y = 0; y < srcH; y++)
+                g5dec.decodeLine(srcBuf + y * srcPitch);
+
+            for (; currentY < logoAreaH && currentY < H; currentY++) {
+                memset(rowBuf, whiteValue, pitch);
+
+                // Logo pixels (logoX/logoY may be negative when zoomed in)
+                if (currentY >= logoY && currentY < logoY + logoSize) {
+                    int srcRow = (currentY - logoY) * srcH / logoSize;
+                    const uint8_t* srcLine = srcBuf + srcRow * srcPitch;
+                    int dxStart = (logoX < 0) ? -logoX : 0;
+                    for (int dx = dxStart; dx < logoSize; dx++) {
+                        int dispX  = logoX + dx;
+                        if (dispX >= W) break;
+                        int srcCol = dx * srcW / logoSize;
+                        if (!((srcLine[srcCol / 8] >> (7 - srcCol % 8)) & 1))
+                            setBlackPixel(rowBuf, pitch, dispX, bitsPerPixel);
+                    }
+                }
+
+                // Color square grid overlaid on top of logo
+                int sqRow = currentY - sqStripY;
+                if (sqRow >= 0 && sqRow < sqGroupH) {
+                    int gridRow    = sqRow / (squareSize + sqSpacing);
+                    int pixInRow   = sqRow % (squareSize + sqSpacing);
+                    if (gridRow < numRows && pixInRow < squareSize) {
+                        bool borderRow  = (pixInRow == 0 || pixInRow == squareSize - 1);
+                        // Bottom-up: gridRow 0 = top display row = last color row
+                        int colorRow   = numRows - 1 - gridRow;
+                        int sqStart    = colorRow * numCols;
+                        int sqEnd      = min(sqStart + numCols, numSquares);
+                        for (int sq = sqStart; sq < sqEnd; sq++) {
+                            int col       = sq - sqStart;
+                            int sx        = sqOriginX_logo + col * (squareSize + sqSpacing);
+                            int byteStart = sx / pixPerByte;
+                            int byteCount = squareSize / pixPerByte;
+                            if (borderRow) {
+                                memset(rowBuf + byteStart, 0x00, byteCount);
+                            } else {
+                                memset(rowBuf + byteStart, squareColors[sq].fill0, byteCount);
+                                rowBuf[byteStart]                 &= lMask;
+                                rowBuf[byteStart + byteCount - 1] &= rMask;
+                            }
+                        }
+                    }
+                }
+
+                bbepWriteData(&bbep, rowBuf, pitch);
+            }
+            free(srcBuf);
+        } else {
+            for (; currentY < logoAreaH && currentY < H; currentY++)
+                bbepWriteData(&bbep, whiteRow, pitch);
+        }
+    }
+    #else
+    for (; currentY < logoAreaH && currentY < H; currentY++)
+        bbepWriteData(&bbep, whiteRow, pitch);
+    #endif
+
+    // Rule
+    if (currentY < H) {
+        memset(rowBuf, 0x00, pitch);
+        bbepWriteData(&bbep, rowBuf, pitch);
+        currentY++;
+    }
+
+    // Gap
+    for (int i = 0; i < gap && currentY < H; i++, currentY++)
+        bbepWriteData(&bbep, whiteRow, pitch);
+
+    // Device + FW string centered
+    for (int row = 0; row < charH && currentY < H; row++, currentY++) {
+        memset(rowBuf, whiteValue, pitch);
+        bootRenderTextRow(rowBuf, pitch, row / fontScale, deviceFwStr, cx(deviceFwStr), charW, fontScale, bitsPerPixel, colorScheme);
+        bbepWriteData(&bbep, rowBuf, pitch);
+    }
+
+    // Credit line
+    for (int i = 0; i < lineGap && currentY < H; i++, currentY++)
+        bbepWriteData(&bbep, whiteRow, pitch);
+    for (int row = 0; row < charH && currentY < H; row++, currentY++) {
+        memset(rowBuf, whiteValue, pitch);
+        bootRenderTextRow(rowBuf, pitch, row / fontScale, "by Jonas Niesner", cx("by Jonas Niesner"), charW, fontScale, bitsPerPixel, colorScheme);
+        bbepWriteData(&bbep, rowBuf, pitch);
+    }
+
+    // Gap
+    for (int i = 0; i < gap && currentY < H; i++, currentY++)
+        bbepWriteData(&bbep, whiteRow, pitch);
+
+    // Fill any remaining rows
+    while (currentY < H) {
+        bbepWriteData(&bbep, whiteRow, pitch);
+        currentY++;
+    }
+
+    // BWR/BWY: PLANE_1 — all zeros except color squares at sqStripY
+    if (colorScheme == 1 || colorScheme == 2) {
+        memset(whiteRow, 0x00, pitch);
+        bbepSetAddrWindow(&bbep, 0, 0, W, H);
+        bbepStartWrite(&bbep, PLANE_1);
+        for (int y = 0; y < H; y++) {
+            int sqRow = y - sqStripY;
+            if (sqRow < 0 || sqRow >= sqGroupH) {
+                bbepWriteData(&bbep, whiteRow, pitch);
+                continue;
+            }
+            int gridRow  = sqRow / (squareSize + sqSpacing);
+            int pixInRow = sqRow % (squareSize + sqSpacing);
+            if (gridRow >= numRows || pixInRow >= squareSize) {
+                bbepWriteData(&bbep, whiteRow, pitch);
+                continue;
+            }
+            memset(rowBuf, 0x00, pitch);
+            bool borderRow = (pixInRow == 0 || pixInRow == squareSize - 1);
+            int colorRow   = numRows - 1 - gridRow;
+            int sqStart    = colorRow * numCols;
+            int sqEnd      = min(sqStart + numCols, numSquares);
+            for (int sq = sqStart; sq < sqEnd; sq++) {
+                if (squareColors[sq].fill1 == 0x00) continue;
+                int col       = sq - sqStart;
+                int sx        = sqOriginX_logo + col * (squareSize + sqSpacing);
+                int byteStart = sx / pixPerByte;
+                int byteCount = squareSize / pixPerByte;
+                if (!borderRow) {
+                    memset(rowBuf + byteStart, squareColors[sq].fill1, byteCount);
+                    rowBuf[byteStart]                 &= lMask;
+                    rowBuf[byteStart + byteCount - 1] &= rMask;
+                }
+            }
+            bbepWriteData(&bbep, rowBuf, pitch);
+        }
     }
 }
 

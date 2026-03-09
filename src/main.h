@@ -2,6 +2,7 @@
 #include "structs.h"
 #include "uzlib.h"
 #include <bb_epaper.h>
+#include <Group5.h>
 #include <SPI.h>
 
 #ifndef BUILD_VERSION
@@ -300,6 +301,7 @@ float readChipTemperature();  // Returns chip temperature in degrees Celsius
 int getplane();
 int getBitsPerPixel();
 void writeTextAndFill(const char* text);
+void drawBootScreen();
 
 // Encryption functions
 bool isEncryptionEnabled();
