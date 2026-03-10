@@ -169,3 +169,29 @@ struct GlobalConfig {
     uint8_t minor_version;      // Protocol minor version
     bool loaded;                // True if config was successfully loaded
 };
+
+// 0x27: security_config
+struct SecurityConfig {
+    uint8_t encryption_enabled;     // 0 = disabled, 1 = enabled
+    uint8_t encryption_key[16];    // AES-128 master key (16 bytes)
+    uint16_t session_timeout_seconds; // Session timeout (0 = no timeout)
+    // Bitfield flags (reserved[0]):
+    // Bit 0: rewrite_allowed - Allow unauthenticated config writes when encryption is enabled
+    // Bit 1: show_key_on_screen - Show encryption key on screen (future feature)
+    // Bit 2: reset_pin_enabled - Reset pin enabled (must be set for reset pin to work)
+    // Bit 3: reset_pin_polarity - Reset pin polarity (0 = LOW triggers, 1 = HIGH triggers)
+    // Bit 4: reset_pin_pullup - Enable pullup on reset pin
+    // Bit 5: reset_pin_pulldown - Enable pulldown on reset pin
+    // Bits 6-7: Reserved
+    uint8_t flags;                  // Security flags bitfield
+    uint8_t reset_pin;               // Reset pin number
+    uint8_t reserved[43];           // Reserved bytes for future use
+} __attribute__((packed));
+
+// Security flags bitfield definitions
+#define SECURITY_FLAG_REWRITE_ALLOWED     (1 << 0)
+#define SECURITY_FLAG_SHOW_KEY_ON_SCREEN  (1 << 1)
+#define SECURITY_FLAG_RESET_PIN_ENABLED   (1 << 2)
+#define SECURITY_FLAG_RESET_PIN_POLARITY  (1 << 3)
+#define SECURITY_FLAG_RESET_PIN_PULLUP    (1 << 4)
+#define SECURITY_FLAG_RESET_PIN_PULLDOWN  (1 << 5)

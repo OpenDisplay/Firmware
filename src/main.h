@@ -236,6 +236,11 @@ String getChipIdHex();
 
 void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len);
 void sendResponse(uint8_t* response, uint8_t len);
+void sendResponseUnencrypted(uint8_t* response, uint8_t len);
+void secureEraseConfig();
+void checkResetPin();
+void reboot();
+void enterDFUMode();
 void initio();
 void initDataBuses();
 void initButtons();
@@ -296,6 +301,19 @@ int getplane();
 int getBitsPerPixel();
 void writeTextAndFill(const char* text);
 
+// Encryption functions
+bool isEncryptionEnabled();
+bool isAuthenticated();
+void clearEncryptionSession();
+bool checkEncryptionSessionTimeout();
+void updateEncryptionSessionActivity();
+bool handleAuthenticate(uint8_t* data, uint16_t len);
+bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plaintext, uint16_t* plaintext_len, uint8_t* nonce, uint8_t* auth_tag, uint16_t command_header);
+bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* ciphertext, uint16_t* ciphertext_len, uint8_t* nonce, uint8_t* auth_tag);
+bool verifyNonceReplay(uint8_t* nonce);
+void incrementNonceCounter();
+uint8_t* getCurrentNonce();
+
 typedef struct {
     bool active;
     uint32_t totalSize;
@@ -317,6 +335,30 @@ extern chunked_write_state_t chunkedWriteState;
 chunked_write_state_t chunkedWriteState = {false, 0, 0, {0}, 0, 0};
 struct GlobalConfig globalConfig = {0};
 uint8_t configReadResponseBuffer[128];
+
+// Encryption session state
+struct EncryptionSession {
+    bool authenticated;              // Session is authenticated
+    uint8_t session_key[16];         // Derived session key (zeroized on clear)
+    uint8_t session_id[8];          // Session identifier (8 bytes, derived via CMAC)
+    uint64_t nonce_counter;         // Per-session counter (64-bit, prevents wrap)
+    uint64_t last_seen_counter;     // Last accepted counter value
+    uint64_t replay_window[64];     // Sliding window for replay protection (64 packets)
+    uint32_t last_activity;         // Timestamp of last activity
+    uint8_t integrity_failures;     // Consecutive integrity failures (max 3)
+    uint32_t session_start_time;    // Session establishment time
+    uint8_t auth_attempts;          // Authentication attempts (for rate limiting)
+    uint32_t last_auth_time;        // Last authentication attempt time
+    uint8_t client_nonce[16];       // Client nonce from auth (16 bytes)
+    uint8_t server_nonce[16];       // Server nonce from auth (16 bytes)
+    uint8_t pending_server_nonce[16]; // Pending server nonce (expires after 30 seconds)
+    uint32_t server_nonce_time;     // Time when server nonce was generated
+};
+
+// Security configuration
+struct SecurityConfig securityConfig = {0};
+EncryptionSession encryptionSession = {0};
+bool encryptionInitialized = false;
 
 #ifdef TARGET_ESP32
 // RTC memory variables for deep sleep state tracking

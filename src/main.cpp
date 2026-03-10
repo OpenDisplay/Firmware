@@ -1240,6 +1240,11 @@ void full_config_init(){
     if (loadGlobalConfig()) {
         writeSerial("Global configuration loaded successfully");
         printConfigSummary();
+        // Initialize encryption session
+        clearEncryptionSession();
+        encryptionInitialized = true;
+        // Check reset pin after config is loaded
+        checkResetPin();
         #ifdef TARGET_NRF
         if (globalConfig.loaded && (globalConfig.system_config.device_flags & DEVICE_FLAG_XIAOINIT)) {
             writeSerial("Device flag DEVICE_FLAG_XIAOINIT is set, calling xiaoinit()...");
@@ -1264,8 +1269,14 @@ void ble_init(){
     Bluefruit.autoConnLed(false);
     Bluefruit.setTxPower(globalConfig.power_option.tx_power);
     Bluefruit.begin(1, 0);
-    bledfu.begin();
-    writeSerial("BLE DFU initialized successfully");
+    // Only initialize DFU service if encryption is NOT enabled
+    // If encryption is enabled, DFU entry is gated behind CMD_ENTER_DFU (0x0051)
+    if (!isEncryptionEnabled()) {
+        bledfu.begin();
+        writeSerial("BLE DFU initialized successfully (encryption disabled)");
+    } else {
+        writeSerial("BLE DFU service NOT initialized (encryption enabled - use CMD_ENTER_DFU)");
+    }
     writeSerial("BLE initialized successfully");
     writeSerial("Setting up BLE service 0x2446...");
     imageService.begin();
@@ -2270,6 +2281,101 @@ String getChipIdHex() {
     #endif
 }
 
+// Securely erase config by overwriting with zeros
+void secureEraseConfig() {
+    writeSerial("=== SECURE ERASE CONFIG ===");
+    static uint8_t zeroBuffer[512];
+    memset(zeroBuffer, 0, sizeof(zeroBuffer));
+    
+    #ifdef TARGET_NRF
+    if (InternalFS.exists(CONFIG_FILE_PATH)) {
+        // Open file and overwrite with zeros
+        File file = InternalFS.open(CONFIG_FILE_PATH, FILE_O_WRITE);
+        if (file) {
+            // Get file size
+            size_t fileSize = file.size();
+            file.seek(0);
+            // Overwrite entire file with zeros
+            size_t written = 0;
+            while (written < fileSize) {
+                size_t toWrite = (fileSize - written < sizeof(zeroBuffer)) ? (fileSize - written) : sizeof(zeroBuffer);
+                file.write(zeroBuffer, toWrite);
+                written += toWrite;
+            }
+            file.close();
+            writeSerial("Config file securely erased (" + String(written) + " bytes)");
+        }
+        InternalFS.remove(CONFIG_FILE_PATH);
+    }
+    #elif defined(TARGET_ESP32)
+    if (LittleFS.exists(CONFIG_FILE_PATH)) {
+        // Open file and overwrite with zeros
+        File file = LittleFS.open(CONFIG_FILE_PATH, FILE_WRITE);
+        if (file) {
+            // Get file size
+            size_t fileSize = file.size();
+            file.seek(0);
+            // Overwrite entire file with zeros
+            size_t written = 0;
+            while (written < fileSize) {
+                size_t toWrite = (fileSize - written < sizeof(zeroBuffer)) ? (fileSize - written) : sizeof(zeroBuffer);
+                file.write(zeroBuffer, toWrite);
+                written += toWrite;
+            }
+            file.close();
+            writeSerial("Config file securely erased (" + String(written) + " bytes)");
+        }
+        LittleFS.remove(CONFIG_FILE_PATH);
+    }
+    #endif
+    writeSerial("Config securely erased");
+}
+
+// Check reset pin on boot
+void checkResetPin() {
+    // Check if reset pin is enabled
+    if (!(securityConfig.flags & SECURITY_FLAG_RESET_PIN_ENABLED)) {
+        return; // Reset pin disabled
+    }
+    
+    uint8_t pin = securityConfig.reset_pin;
+    bool polarity = (securityConfig.flags & SECURITY_FLAG_RESET_PIN_POLARITY) != 0;
+    bool pullup = (securityConfig.flags & SECURITY_FLAG_RESET_PIN_PULLUP) != 0;
+    bool pulldown = (securityConfig.flags & SECURITY_FLAG_RESET_PIN_PULLDOWN) != 0;
+    
+    writeSerial("Checking reset pin " + String(pin) + " (polarity: " + String(polarity ? "HIGH" : "LOW") + 
+                ", pullup: " + String(pullup) + ", pulldown: " + String(pulldown) + ")");
+    
+    #ifdef TARGET_ESP32
+    pinMode(pin, INPUT);
+    if (pullup) {
+        pinMode(pin, INPUT_PULLUP);
+    } else if (pulldown) {
+        pinMode(pin, INPUT_PULLDOWN);
+    }
+    #elif defined(TARGET_NRF)
+    pinMode(pin, INPUT);
+    if (pullup) {
+        pinMode(pin, INPUT_PULLUP);
+    }
+    // nRF doesn't have built-in pulldown, would need external resistor
+    #endif
+    
+    // Wait 100ms and check pin state
+    delay(100);
+    bool pinState = digitalRead(pin);
+    
+    // Check if pin state matches trigger polarity
+    if (pinState == polarity) {
+        writeSerial("Reset pin triggered! Securely erasing config and rebooting...");
+        secureEraseConfig();
+        delay(100);
+        reboot();
+    } else {
+        writeSerial("Reset pin not triggered (state: " + String(pinState ? "HIGH" : "LOW") + ")");
+    }
+}
+
 void reboot(){
     writeSerial("=== REBOOT COMMAND (0x000F) ===");
     delay(100);
@@ -2281,16 +2387,190 @@ void reboot(){
     #endif
 }
 
-void sendResponse(uint8_t* response, uint8_t len){
-    writeSerial("Sending response:");
+#ifdef TARGET_NRF
+extern "C" void bootloader_util_app_start(uint32_t start_addr);
+#endif
+
+// Enter DFU/OTA bootloader mode
+void enterDFUMode() {
+    writeSerial("=== ENTER DFU MODE COMMAND (0x0051) ===");
+    
+    #ifdef TARGET_NRF
+    writeSerial("Preparing to enter DFU bootloader mode...");
+    
+    // The Adafruit nRF52 bootloader requires a direct warm jump, not a cold reset.
+    // This replicates the exact sequence from BLEDfu.cpp in the Adafruit framework.
+    
+    // 1. Stop advertising on disconnect so it doesn't restart
+    Bluefruit.Advertising.restartOnDisconnect(false);
+    
+    // 2. Disconnect BLE if connected
+    if (Bluefruit.connected()) {
+        writeSerial("Disconnecting BLE...");
+        Bluefruit.disconnect(Bluefruit.connHandle());
+        delay(100);
+    }
+    
+    // 3. Set GPREGRET to DFU OTA magic via SoftDevice API
+    sd_power_gpregret_clr(0, 0xFF);
+    sd_power_gpregret_set(0, 0xB1); // DFU_OTA_MAGIC
+    
+    // 4. Disable the SoftDevice
+    sd_softdevice_disable();
+    
+    // 5. Disable all interrupts
+    NVIC->ICER[0] = 0xFFFFFFFF;
+    NVIC->ICPR[0] = 0xFFFFFFFF;
+    #if defined(__NRF_NVIC_ISER_COUNT) && __NRF_NVIC_ISER_COUNT == 2
+    NVIC->ICER[1] = 0xFFFFFFFF;
+    NVIC->ICPR[1] = 0xFFFFFFFF;
+    #endif
+    
+    // 6. Set vector table to bootloader and jump directly to it
+    sd_softdevice_vector_table_base_set(NRF_UICR->NRFFW[0]);
+    __set_CONTROL(0); // Switch to MSP (required for FreeRTOS)
+    bootloader_util_app_start(NRF_UICR->NRFFW[0]);
+    
+    while(1) {} // Never reached
+    #endif
+    
+    #ifdef TARGET_ESP32
+    // For ESP32, we simply reboot - OTA is typically handled via WiFi/HTTP
+    // If a bootloader is configured to check for OTA mode, it can be set via NVS
+    // For now, we just reboot normally
+    writeSerial("ESP32: Rebooting (OTA typically handled via WiFi)");
+    delay(100); // Allow logs to flush
+    esp_restart();
+    #endif
+}
+
+// Send unencrypted response (for error messages that need to be readable by old tooling)
+void sendResponseUnencrypted(uint8_t* response, uint8_t len) {
+    // Skip encryption entirely - just send the response as-is
+    writeSerial("Sending unencrypted response (error/status):");
     writeSerial("  Length: " + String(len) + " bytes");
     writeSerial("  Command: 0x" + String(response[0], HEX) + String(response[1], HEX));
     String hexDump = "  Full command: ";
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < len && i < 32; i++) { // Limit hex dump to 32 bytes
         if (i > 0) hexDump += " ";
         if (response[i] < 16) hexDump += "0";
         hexDump += String(response[i], HEX);
     }
+    if (len > 32) hexDump += " ...";
+    writeSerial(hexDump);
+    #ifdef TARGET_ESP32
+    if (wifiServerConnected && wifiClient.connected()) {
+        uint8_t tcpPacket[1024];
+        uint32_t pos = 0;
+        uint32_t lengthPos = pos;
+        pos += 2;
+        tcpPacket[pos++] = 0x01;
+        tcpPacket[pos++] = 0x00;
+        uint8_t responsePacketId = (len > 1) ? response[1] : 0x00;
+        tcpPacket[pos++] = responsePacketId;
+        memcpy(&tcpPacket[pos], response, len);
+        pos += len;
+        uint32_t dataLen = pos - 2;
+        uint16_t crc = calculateCRC16CCITT(&tcpPacket[2], dataLen);
+        tcpPacket[pos++] = crc & 0xFF;
+        tcpPacket[pos++] = (crc >> 8) & 0xFF;
+        uint16_t totalLength = pos;
+        tcpPacket[lengthPos] = totalLength & 0xFF;
+        tcpPacket[lengthPos + 1] = (totalLength >> 8) & 0xFF;
+        size_t bytesWritten = wifiClient.write(tcpPacket, pos);
+        if (bytesWritten == pos) {
+            writeSerial("TCP response sent (" + String(bytesWritten) + " bytes)");
+        } else {
+            writeSerial("ERROR: TCP response incomplete (expected " + String(pos) + ", wrote " + String(bytesWritten) + ")");
+        }
+    }
+    if (len <= MAX_RESPONSE_SIZE) {
+        uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE;
+        if (nextHead != responseQueueTail) {
+            memcpy(responseQueue[responseQueueHead].data, response, len);
+            responseQueue[responseQueueHead].len = len;
+            responseQueue[responseQueueHead].pending = true;
+            responseQueueHead = nextHead;
+            writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE) + ")");
+        } else {
+            writeSerial("ERROR: Response queue full, dropping response");
+        }
+    } else {
+        writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE) + ")");
+    }
+    #endif
+    #ifdef TARGET_NRF
+    if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
+        // Log response details for debugging
+        String hexDump = "NRF: Sending unencrypted response: ";
+        for (int i = 0; i < len && i < 32; i++) {
+            if (i > 0) hexDump += " ";
+            if (response[i] < 16) hexDump += "0";
+            hexDump += String(response[i], HEX);
+        }
+        if (len > 32) hexDump += "...";
+        writeSerial(hexDump);
+        writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)");
+        imageCharacteristic.notify(response, len);
+        // Increase delay to ensure notification is sent before next operation
+        delay(50); // Increased delay to let BLE stack process
+    } else {
+        writeSerial("ERROR: Cannot send BLE response - not connected or notifications not enabled");
+        writeSerial("  Connected: " + String(Bluefruit.connected() ? "yes" : "no"));
+        writeSerial("  Notify enabled: " + String(imageCharacteristic.notifyEnabled() ? "yes" : "no"));
+    }
+    #endif
+}
+
+void sendResponse(uint8_t* response, uint8_t len){
+    // Encrypted response buffer must be at function scope so it stays valid
+    // until the response is actually sent (queued for BLE notification)
+    static uint8_t encrypted_response[600];
+    
+    // Check if response should be encrypted
+    if (isAuthenticated() && len >= 2) {
+        // Don't encrypt authentication (0x0050), firmware version (0x0043), and error responses (0xFE, 0xFF)
+        uint16_t command = (response[0] << 8) | response[1];
+        uint8_t status = (len >= 3) ? response[2] : 0x00;
+        
+        // Skip encryption for:
+        // - Authentication command (0x0050)
+        // - Firmware version command (0x0043)
+        // - Error responses (status 0xFE = auth required, 0xFF = generic error)
+        if (command != 0x0050 && command != 0x0043 && status != 0xFE && status != 0xFF) {
+            uint8_t nonce[16];
+            uint8_t auth_tag[12];
+            uint16_t encrypted_len = 0;
+            
+            if (encryptResponse(response, len, encrypted_response, &encrypted_len, nonce, auth_tag)) {
+                writeSerial("Sending encrypted response:");
+                writeSerial("  Original length: " + String(len) + " bytes");
+                writeSerial("  Encrypted length: " + String(encrypted_len) + " bytes");
+                // Send encrypted response instead
+                response = encrypted_response;
+                len = encrypted_len;
+            } else {
+                writeSerial("WARNING: Failed to encrypt response, sending unencrypted error response");
+                // Send generic error response instead of unencrypted data
+                uint8_t errorResponse[] = {0xFF, (uint8_t)(command & 0xFF), 0x00};
+                response = errorResponse;
+                len = sizeof(errorResponse);
+            }
+        } else {
+            writeSerial("Sending unencrypted response (authentication/firmware version/error)");
+        }
+    }
+    
+    writeSerial("Sending response:");
+    writeSerial("  Length: " + String(len) + " bytes");
+    writeSerial("  Command: 0x" + String(response[0], HEX) + String(response[1], HEX));
+    String hexDump = "  Full command: ";
+    for (int i = 0; i < len && i < 32; i++) { // Limit hex dump to 32 bytes
+        if (i > 0) hexDump += " ";
+        if (response[i] < 16) hexDump += "0";
+        hexDump += String(response[i], HEX);
+    }
+    if (len > 32) hexDump += " ...";
     writeSerial(hexDump);
     #ifdef TARGET_ESP32
     if (wifiServerConnected && wifiClient.connected()) {
@@ -2336,12 +2616,24 @@ void sendResponse(uint8_t* response, uint8_t len){
     #endif
     #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
-        imageCharacteristic.notify(response, len);
+        // Log response details for debugging
+        String hexDump = "NRF: Sending response: ";
+        for (int i = 0; i < len && i < 32; i++) {
+            if (i > 0) hexDump += " ";
+            if (response[i] < 16) hexDump += "0";
+            hexDump += String(response[i], HEX);
+        }
+        if (len > 32) hexDump += "...";
+        writeSerial(hexDump);
         writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)");
+        imageCharacteristic.notify(response, len);
+        // Increase delay to ensure notification is sent before next operation
+        delay(50); // Increased delay to let BLE stack process
     } else {
         writeSerial("ERROR: Cannot send BLE response - not connected or notifications not enabled");
+        writeSerial("  Connected: " + String(Bluefruit.connected() ? "yes" : "no"));
+        writeSerial("  Notify enabled: " + String(imageCharacteristic.notifyEnabled() ? "yes" : "no"));
     }
-    delay(20); // Brief delay to let BLE stack process
     #endif
 }
 
@@ -2606,6 +2898,22 @@ void handleWriteConfig(uint8_t* data, uint16_t len){
         writeSerial("ERROR: No config data received");
         return;
     }
+    
+    // Check if encryption is enabled and rewrite is not allowed
+    if (isEncryptionEnabled() && !isAuthenticated()) {
+        // Check if rewrite_allowed flag is set
+        bool rewriteAllowed = (securityConfig.flags & SECURITY_FLAG_REWRITE_ALLOWED) != 0;
+        if (!rewriteAllowed) {
+            writeSerial("ERROR: Config write requires authentication (encryption enabled)");
+            uint8_t response[] = {0x00, (uint8_t)(0x0041 & 0xFF), 0xFE}; // Auth required
+            sendResponseUnencrypted(response, sizeof(response));
+            return;
+        } else {
+            // Rewrite allowed - securely erase old config before writing new one
+            writeSerial("Rewrite allowed: Securely erasing old config before write...");
+            secureEraseConfig();
+        }
+    }
     if (len > CONFIG_CHUNK_SIZE) {
         writeSerial("Starting chunked write (received: " + String(len) + " bytes)");
         chunkedWriteState.active = true;
@@ -2650,6 +2958,23 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len){
         uint8_t errorResponse[] = {0xFF, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
+    }
+    
+    // Check if encryption is enabled and rewrite is not allowed (only check on first chunk)
+    if (chunkedWriteState.receivedChunks == 1 && isEncryptionEnabled() && !isAuthenticated()) {
+        // Check if rewrite_allowed flag is set
+        bool rewriteAllowed = (securityConfig.flags & SECURITY_FLAG_REWRITE_ALLOWED) != 0;
+        if (!rewriteAllowed) {
+            writeSerial("ERROR: Config write requires authentication (encryption enabled)");
+            chunkedWriteState.active = false;
+            uint8_t response[] = {0x00, (uint8_t)(0x0042 & 0xFF), 0xFE}; // Auth required
+            sendResponseUnencrypted(response, sizeof(response));
+            return;
+        } else {
+            // Rewrite allowed - securely erase old config before writing new one (only once on first chunk)
+            writeSerial("Rewrite allowed: Securely erasing old config before write...");
+            secureEraseConfig();
+        }
     }
     if (len == 0) {
         writeSerial("ERROR: No chunk data received");
@@ -2702,6 +3027,9 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len){
 
 bool loadGlobalConfig(){
     memset(&globalConfig, 0, sizeof(globalConfig));
+    // Initialize security config defaults
+    memset(&securityConfig, 0, sizeof(securityConfig));
+    // Reset pin defaults to disabled (flag not set)
     wifiConfigured = false;
     wifiSsid[0] = '\0';
     wifiPassword[0] = '\0';
@@ -2941,6 +3269,50 @@ bool loadGlobalConfig(){
                         writeSerial("WiFi configured: true");
                     } else {
                         writeSerial("ERROR: Not enough data for wifi_config");
+                        globalConfig.loaded = false;
+                        return false;
+                    }
+                }
+                break;
+            case 0x27: // security_config
+                {
+                    if (offset + sizeof(struct SecurityConfig) <= configLen) {
+                        memcpy(&securityConfig, &configData[offset], sizeof(struct SecurityConfig));
+                        offset += sizeof(struct SecurityConfig);
+                        // Check if key is all zeros (encryption disabled)
+                        bool keyIsZero = true;
+                        for (int i = 0; i < 16; i++) {
+                            if (securityConfig.encryption_key[i] != 0) {
+                                keyIsZero = false;
+                                break;
+                            }
+                        }
+                        if (keyIsZero) {
+                            securityConfig.encryption_enabled = 0;
+                            writeSerial("Security config: Encryption disabled (key is all zeros)");
+                        } else if (securityConfig.encryption_enabled) {
+                            writeSerial("Security config: Encryption enabled");
+                            writeSerial("Session timeout: " + String(securityConfig.session_timeout_seconds) + " seconds");
+                        } else {
+                            writeSerial("Security config: Encryption disabled (flag set to 0)");
+                        }
+                        // Log security flags
+                        if (securityConfig.flags & SECURITY_FLAG_REWRITE_ALLOWED) {
+                            writeSerial("Security config: Rewrite allowed (unauthorized config writes permitted)");
+                        }
+                        if (securityConfig.flags & SECURITY_FLAG_SHOW_KEY_ON_SCREEN) {
+                            writeSerial("Security config: Show key on screen enabled (future feature)");
+                        }
+                        if (securityConfig.flags & SECURITY_FLAG_RESET_PIN_ENABLED) {
+                            writeSerial("Security config: Reset pin " + String(securityConfig.reset_pin) + 
+                                       " enabled (polarity: " + String((securityConfig.flags & SECURITY_FLAG_RESET_PIN_POLARITY) ? "HIGH" : "LOW") + 
+                                       ", pullup: " + String((securityConfig.flags & SECURITY_FLAG_RESET_PIN_PULLUP) ? "yes" : "no") + 
+                                       ", pulldown: " + String((securityConfig.flags & SECURITY_FLAG_RESET_PIN_PULLDOWN) ? "yes" : "no") + ")");
+                        } else {
+                            writeSerial("Security config: Reset pin disabled");
+                        }
+                    } else {
+                        writeSerial("ERROR: Not enough data for security_config");
                         globalConfig.loaded = false;
                         return false;
                     }
@@ -3844,13 +4216,1095 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     }
 }
 
+// ============================================================================
+// Encryption and Authentication Functions
+// ============================================================================
+
+bool isEncryptionEnabled() {
+    return (securityConfig.encryption_enabled == 1) && 
+           (securityConfig.encryption_key[0] != 0 || 
+            memcmp(securityConfig.encryption_key, securityConfig.encryption_key + 1, 15) != 0);
+}
+
+bool isAuthenticated() {
+    return encryptionSession.authenticated && 
+           (encryptionSession.session_start_time > 0) &&
+           checkEncryptionSessionTimeout();
+}
+
+void clearEncryptionSession() {
+    // Zeroize session key
+    memset(encryptionSession.session_key, 0, 16);
+    memset(encryptionSession.client_nonce, 0, 16);
+    memset(encryptionSession.server_nonce, 0, 16);
+    memset(encryptionSession.pending_server_nonce, 0, 16);
+    encryptionSession.authenticated = false;
+    encryptionSession.nonce_counter = 0;
+    encryptionSession.last_seen_counter = 0;
+    encryptionSession.integrity_failures = 0;
+    encryptionSession.session_start_time = 0;
+    encryptionSession.last_activity = 0;
+    encryptionSession.auth_attempts = 0;
+    encryptionSession.server_nonce_time = 0;
+    memset(encryptionSession.replay_window, 0, sizeof(encryptionSession.replay_window));
+    writeSerial("Encryption session cleared");
+}
+
+bool checkEncryptionSessionTimeout() {
+    if (!encryptionSession.authenticated) return false;
+    if (securityConfig.session_timeout_seconds == 0) return true; // No timeout
+    
+    uint32_t currentTime = millis() / 1000; // Convert to seconds
+    uint32_t sessionAge = currentTime - (encryptionSession.session_start_time / 1000);
+    
+    if (sessionAge >= securityConfig.session_timeout_seconds) {
+        writeSerial("Encryption session timeout (" + String(sessionAge) + "s >= " + 
+                   String(securityConfig.session_timeout_seconds) + "s)");
+        clearEncryptionSession();
+        return false;
+    }
+    return true;
+}
+
+void updateEncryptionSessionActivity() {
+    if (encryptionSession.authenticated) {
+        encryptionSession.last_activity = millis();
+    }
+}
+
+// Simple constant-time comparison
+bool constantTimeCompare(const uint8_t* a, const uint8_t* b, size_t len) {
+    uint8_t result = 0;
+    for (size_t i = 0; i < len; i++) {
+        result |= a[i] ^ b[i];
+    }
+    return result == 0;
+}
+
+// Platform-specific crypto includes
+#ifdef TARGET_ESP32
+#include "mbedtls/aes.h"
+#include "mbedtls/ccm.h"
+#include "mbedtls/cmac.h"
+#include "esp_random.h"
+
+// AES-CMAC implementation using mbedtls
+bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, uint8_t* mac) {
+    mbedtls_cipher_context_t ctx;
+    const mbedtls_cipher_info_t* cipher_info = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_128_ECB);
+    
+    if (cipher_info == NULL) {
+        writeSerial("ERROR: Failed to get cipher info for AES-128-ECB");
+        return false;
+    }
+    
+    mbedtls_cipher_init(&ctx);
+    if (mbedtls_cipher_setup(&ctx, cipher_info) != 0) {
+        writeSerial("ERROR: Failed to setup cipher");
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+    
+    if (mbedtls_cipher_cmac_starts(&ctx, key, 128) != 0) {
+        writeSerial("ERROR: Failed to start CMAC");
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+    
+    if (mbedtls_cipher_cmac_update(&ctx, message, message_len) != 0) {
+        writeSerial("ERROR: Failed to update CMAC");
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+    
+    if (mbedtls_cipher_cmac_finish(&ctx, mac) != 0) {
+        writeSerial("ERROR: Failed to finish CMAC");
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+    
+    mbedtls_cipher_free(&ctx);
+    return true;
+}
+
+// AES-ECB encryption
+bool aes_ecb_encrypt(const uint8_t* key, const uint8_t* input, uint8_t* output) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    
+    if (mbedtls_aes_setkey_enc(&aes, key, 128) != 0) {
+        writeSerial("ERROR: Failed to set AES key");
+        mbedtls_aes_free(&aes);
+        return false;
+    }
+    
+    if (mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, input, output) != 0) {
+        writeSerial("ERROR: Failed to encrypt with AES-ECB");
+        mbedtls_aes_free(&aes);
+        return false;
+    }
+    
+    mbedtls_aes_free(&aes);
+    return true;
+}
+
+// AES-CCM encryption
+bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
+                     const uint8_t* ad, size_t ad_len,
+                     const uint8_t* plaintext, size_t plaintext_len,
+                     uint8_t* ciphertext, uint8_t* tag, size_t tag_len) {
+    mbedtls_ccm_context ccm;
+    mbedtls_ccm_init(&ccm);
+    
+    if (mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+        writeSerial("ERROR: Failed to set CCM key");
+        mbedtls_ccm_free(&ccm);
+        return false;
+    }
+    
+    int ret = mbedtls_ccm_encrypt_and_tag(&ccm, plaintext_len, nonce, nonce_len,
+                                          ad, ad_len, plaintext, ciphertext, tag, tag_len);
+    mbedtls_ccm_free(&ccm);
+    
+    if (ret != 0) {
+        writeSerial("ERROR: CCM encrypt failed: " + String((int)ret));
+        return false;
+    }
+    
+    return true;
+}
+
+// AES-CCM decryption
+bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
+                     const uint8_t* ad, size_t ad_len,
+                     const uint8_t* ciphertext, size_t ciphertext_len,
+                     uint8_t* plaintext, const uint8_t* tag, size_t tag_len) {
+    mbedtls_ccm_context ccm;
+    mbedtls_ccm_init(&ccm);
+    
+    if (mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+        writeSerial("ERROR: Failed to set CCM key");
+        mbedtls_ccm_free(&ccm);
+        return false;
+    }
+    
+    // Validate CCM parameters before calling
+    // CCM nonce length must be between 7 and 13 bytes
+    if (nonce_len < 7 || nonce_len > 13) {
+        writeSerial("ERROR: Invalid CCM nonce length (must be 7-13 bytes)");
+        mbedtls_ccm_free(&ccm);
+        return false;
+    }
+    
+    // CCM tag length must be 4, 6, 8, 10, 12, 14, or 16 bytes
+    if (tag_len != 4 && tag_len != 6 && tag_len != 8 && tag_len != 10 && tag_len != 12 && tag_len != 14 && tag_len != 16) {
+        writeSerial("ERROR: Invalid CCM tag length (must be 4, 6, 8, 10, 12, 14, or 16 bytes)");
+        mbedtls_ccm_free(&ccm);
+        return false;
+    }
+    
+    // CCM requires at least 1 byte of plaintext/ciphertext
+    if (ciphertext_len == 0) {
+        writeSerial("ERROR: CCM ciphertext length is 0 (must be at least 1 byte)");
+        mbedtls_ccm_free(&ccm);
+        return false;
+    }
+    
+    int ret = mbedtls_ccm_auth_decrypt(&ccm, ciphertext_len, nonce, nonce_len,
+                                       ad, ad_len, ciphertext, plaintext, tag, tag_len);
+    mbedtls_ccm_free(&ccm);
+    
+    if (ret != 0) {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "ERROR: CCM decrypt failed: %d (ciphertext_len=%zu, nonce_len=%zu, tag_len=%zu)", 
+                 ret, ciphertext_len, nonce_len, tag_len);
+        writeSerial(err_buf);
+        // Error -15 is MBEDTLS_ERR_CCM_BAD_INPUT
+        if (ret == -15) {
+            writeSerial("ERROR: MBEDTLS_ERR_CCM_BAD_INPUT - invalid input parameters");
+        }
+        return false;
+    }
+    
+    return true;
+}
+
+// RNG
+void secure_random(uint8_t* output, size_t len) {
+    esp_fill_random(output, len);
+}
+
+#else // TARGET_NRF
+// For nRF52840, use CryptoCell CC310 hardware accelerator via Adafruit_nRFCrypto
+// This uses the ARM CryptoCell CC310 built into the nRF52840 chip.
+// Lowest memory footprint: all crypto runs on hardware, no software AES needed.
+#include <string.h>
+#include <Adafruit_nRFCrypto.h>
+#include "nrf_cc310/include/crys_aesccm.h"
+#include "nrf_cc310/include/ssi_aes.h"
+#include "nrf_cc310/include/ssi_aes_defs.h"
+
+static bool cc310_initialized = false;
+
+static bool init_cc310() {
+    if (cc310_initialized) return true;
+    if (!nRFCrypto.begin()) {
+        writeSerial("ERROR: Failed to initialize CryptoCell CC310");
+        return false;
+    }
+    cc310_initialized = true;
+    writeSerial("CryptoCell CC310 initialized successfully");
+    return true;
+}
+
+// AES-CMAC using CC310 hardware (SaSi_Aes API with CMAC mode)
+bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, uint8_t* mac) {
+    if (!init_cc310()) return false;
+
+    SaSiAesUserContext_t ctx;
+    SaSiAesUserKeyData_t keyData;
+    keyData.pKey = (uint8_t*)key;
+    keyData.keySize = 16;
+
+    SaSiError_t err = SaSi_AesInit(&ctx, SASI_AES_ENCRYPT, SASI_AES_MODE_CMAC, SASI_AES_PADDING_NONE);
+    if (err != SASI_OK) {
+        writeSerial("ERROR: SaSi_AesInit (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+        return false;
+    }
+
+    err = SaSi_AesSetKey(&ctx, SASI_AES_USER_KEY, &keyData, sizeof(keyData));
+    if (err != SASI_OK) {
+        writeSerial("ERROR: SaSi_AesSetKey (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+        SaSi_AesFree(&ctx);
+        return false;
+    }
+
+    // For CMAC, SaSi_AesFinish must process the last block (applies K1/K2 XOR).
+    // SaSi_AesBlock handles all intermediate blocks EXCEPT the last one.
+    size_t block_len = 0;    // bytes to process via SaSi_AesBlock
+    size_t finish_offset = 0;
+    size_t finish_len = message_len;
+
+    if (message_len > 16) {
+        if (message_len % 16 == 0) {
+            // Exact multiple of block size: keep last full block for Finish (K1 XOR)
+            block_len = message_len - 16;
+        } else {
+            // Partial last block: keep it for Finish (K2 XOR)
+            block_len = (message_len / 16) * 16;
+        }
+        finish_offset = block_len;
+        finish_len = message_len - block_len;
+    }
+
+    if (block_len > 0) {
+        err = SaSi_AesBlock(&ctx, (uint8_t*)message, block_len, NULL);
+        if (err != SASI_OK) {
+            writeSerial("ERROR: SaSi_AesBlock (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+            SaSi_AesFree(&ctx);
+            return false;
+        }
+    }
+
+    size_t mac_size = 16;
+    err = SaSi_AesFinish(&ctx, finish_len, (uint8_t*)message + finish_offset, finish_len, mac, &mac_size);
+    if (err != SASI_OK) {
+        writeSerial("ERROR: SaSi_AesFinish (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+        SaSi_AesFree(&ctx);
+        return false;
+    }
+
+    SaSi_AesFree(&ctx);
+    return true;
+}
+
+// AES-ECB single-block encryption using CC310 hardware
+bool aes_ecb_encrypt(const uint8_t* key, const uint8_t* input, uint8_t* output) {
+    if (!init_cc310()) return false;
+
+    SaSiAesUserContext_t ctx;
+    SaSiAesUserKeyData_t keyData;
+    keyData.pKey = (uint8_t*)key;
+    keyData.keySize = 16;
+
+    SaSiError_t err = SaSi_AesInit(&ctx, SASI_AES_ENCRYPT, SASI_AES_MODE_ECB, SASI_AES_PADDING_NONE);
+    if (err != SASI_OK) {
+        writeSerial("ERROR: SaSi_AesInit (ECB) failed: 0x" + String((unsigned long)err, HEX));
+        return false;
+    }
+
+    err = SaSi_AesSetKey(&ctx, SASI_AES_USER_KEY, &keyData, sizeof(keyData));
+    if (err != SASI_OK) {
+        writeSerial("ERROR: SaSi_AesSetKey (ECB) failed: 0x" + String((unsigned long)err, HEX));
+        SaSi_AesFree(&ctx);
+        return false;
+    }
+
+    // For ECB, single block: use Finish directly (dataSize=16, one block)
+    size_t out_size = 16;
+    err = SaSi_AesFinish(&ctx, 16, (uint8_t*)input, 16, output, &out_size);
+    if (err != SASI_OK) {
+        writeSerial("ERROR: SaSi_AesFinish (ECB) failed: 0x" + String((unsigned long)err, HEX));
+        SaSi_AesFree(&ctx);
+        return false;
+    }
+
+    SaSi_AesFree(&ctx);
+    return true;
+}
+
+// AES-CCM encryption using CC310 hardware (integrated CRYS_AESCCM function)
+bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
+                     const uint8_t* ad, size_t ad_len,
+                     const uint8_t* plaintext, size_t plaintext_len,
+                     uint8_t* ciphertext, uint8_t* tag, size_t tag_len) {
+    if (!init_cc310()) return false;
+
+    // Validate nonce length (CCM requires 7-13)
+    if (nonce_len < 7 || nonce_len > 13) {
+        writeSerial("ERROR: Invalid CCM nonce length: " + String((int)nonce_len));
+        return false;
+    }
+    // Validate tag length (CCM requires 4, 6, 8, 10, 12, 14, or 16)
+    if (tag_len < 4 || tag_len > 16 || (tag_len % 2 != 0)) {
+        writeSerial("ERROR: Invalid CCM tag length: " + String((int)tag_len));
+        return false;
+    }
+
+    // Prepare key buffer (CC310 expects 32-byte key buffer)
+    CRYS_AESCCM_Key_t ccmKey;
+    memset(ccmKey, 0, sizeof(ccmKey));
+    memcpy(ccmKey, key, 16);
+
+    CRYS_AESCCM_Mac_Res_t macRes;
+    memset(macRes, 0, sizeof(macRes));
+
+    CRYSError_t err = CRYS_AESCCM(
+        SASI_AES_ENCRYPT,
+        ccmKey,
+        CRYS_AES_Key128BitSize,
+        (uint8_t*)nonce, (uint8_t)nonce_len,
+        (uint8_t*)ad, (uint32_t)ad_len,
+        (uint8_t*)plaintext, (uint32_t)plaintext_len,
+        ciphertext,
+        (uint8_t)tag_len,
+        macRes
+    );
+
+    if (err != CRYS_OK) {
+        writeSerial("ERROR: CRYS_AESCCM (encrypt) failed: 0x" + String((unsigned long)err, HEX));
+        return false;
+    }
+
+    // Copy the tag from macRes
+    memcpy(tag, macRes, tag_len);
+    return true;
+}
+
+// AES-CCM decryption using CC310 hardware (integrated CRYS_AESCCM function)
+bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
+                     const uint8_t* ad, size_t ad_len,
+                     const uint8_t* ciphertext, size_t ciphertext_len,
+                     uint8_t* plaintext, const uint8_t* tag, size_t tag_len) {
+    if (!init_cc310()) return false;
+
+    if (nonce_len < 7 || nonce_len > 13) {
+        writeSerial("ERROR: Invalid CCM nonce length: " + String((int)nonce_len));
+        return false;
+    }
+    if (tag_len < 4 || tag_len > 16 || (tag_len % 2 != 0)) {
+        writeSerial("ERROR: Invalid CCM tag length: " + String((int)tag_len));
+        return false;
+    }
+
+    CRYS_AESCCM_Key_t ccmKey;
+    memset(ccmKey, 0, sizeof(ccmKey));
+    memcpy(ccmKey, key, 16);
+
+    // CC310 decrypt expects the tag in macRes; it verifies it internally
+    CRYS_AESCCM_Mac_Res_t macRes;
+    memset(macRes, 0, sizeof(macRes));
+    memcpy(macRes, tag, tag_len);
+
+    CRYSError_t err = CRYS_AESCCM(
+        SASI_AES_DECRYPT,
+        ccmKey,
+        CRYS_AES_Key128BitSize,
+        (uint8_t*)nonce, (uint8_t)nonce_len,
+        (uint8_t*)ad, (uint32_t)ad_len,
+        (uint8_t*)ciphertext, (uint32_t)ciphertext_len,
+        plaintext,
+        (uint8_t)tag_len,
+        macRes
+    );
+
+    if (err != CRYS_OK) {
+        writeSerial("ERROR: CRYS_AESCCM (decrypt) failed: 0x" + String((unsigned long)err, HEX));
+        return false;
+    }
+
+    return true;
+}
+
+// Secure RNG using CC310 hardware
+void secure_random(uint8_t* output, size_t len) {
+    if (!init_cc310()) {
+        writeSerial("WARNING: CC310 not initialized, using non-secure random");
+        for (size_t i = 0; i < len; i++) {
+            output[i] = random(256);
+        }
+        return;
+    }
+
+    if (!nRFCrypto.Random.generate(output, (uint16_t)len)) {
+        writeSerial("ERROR: CC310 RNG failed, using non-secure fallback");
+        for (size_t i = 0; i < len; i++) {
+            output[i] = random(256);
+        }
+    }
+}
+
+#endif // TARGET_NRF
+
+// Derive session key using AES-KDF (SP 800-108 Counter Mode)
+bool deriveSessionKey(const uint8_t* master_key, const uint8_t* client_nonce, 
+                     const uint8_t* server_nonce, uint8_t* session_key) {
+    // Build context: "OpenDisplay session" || device_id || client_nonce || server_nonce
+    // For device_id, we'll use a simple identifier (can be improved)
+    uint8_t device_id[4] = {0x00, 0x00, 0x00, 0x01}; // Placeholder device ID
+    
+    // Build input for CMAC
+    uint8_t cmac_input[64];
+    size_t offset = 0;
+    const char* label = "OpenDisplay session";
+    memcpy(cmac_input + offset, label, strlen(label));
+    offset += strlen(label);
+    cmac_input[offset++] = 0x00; // Separator
+    memcpy(cmac_input + offset, device_id, 4);
+    offset += 4;
+    memcpy(cmac_input + offset, client_nonce, 16);
+    offset += 16;
+    memcpy(cmac_input + offset, server_nonce, 16);
+    offset += 16;
+    // Key length in bits (128 = 0x0080, big-endian)
+    cmac_input[offset++] = 0x00; // High byte
+    cmac_input[offset++] = 0x80; // Low byte
+    
+    // Compute intermediate via CMAC
+    uint8_t intermediate[16];
+    if (!aes_cmac(master_key, cmac_input, offset, intermediate)) {
+        return false;
+    }
+    
+    // Build final input block: counter (8 bytes, value=1, big-endian) || intermediate (8 bytes)
+    uint8_t final_input[16];
+    uint64_t counter_be = 1; // Counter = 1, big-endian
+    // Convert to big-endian
+    for (int i = 0; i < 8; i++) {
+        final_input[i] = (counter_be >> (56 - i * 8)) & 0xFF;
+    }
+    memcpy(final_input + 8, intermediate, 8);
+    
+    // Derive session key via AES-ECB
+    if (!aes_ecb_encrypt(master_key, final_input, session_key)) {
+        return false;
+    }
+    
+    return true;
+}
+
+// Derive session ID from nonces
+void deriveSessionId(const uint8_t* session_key, const uint8_t* client_nonce,
+                     const uint8_t* server_nonce, uint8_t* session_id) {
+    uint8_t input[32];
+    memcpy(input, client_nonce, 16);
+    memcpy(input + 16, server_nonce, 16);
+    
+    uint8_t cmac_output[16];
+    if (aes_cmac(session_key, input, 32, cmac_output)) {
+        // Copy 8 bytes (session_id is 8 bytes)
+        for (int i = 0; i < 8; i++) {
+            session_id[i] = cmac_output[i];
+        }
+    } else {
+        memset(session_id, 0, 8);
+    }
+}
+
+// Verify nonce replay protection (sliding window)
+bool verifyNonceReplay(uint8_t* nonce) {
+    if (!encryptionSession.authenticated) return false;
+    
+    // Extract session_id and counter from nonce (16 bytes: 8 bytes session_id + 8 bytes counter)
+    uint8_t nonce_session_id[8];
+    uint64_t nonce_counter = 0;
+    memcpy(nonce_session_id, nonce, 8);
+    
+    // Extract counter (big-endian)
+    for (int i = 0; i < 8; i++) {
+        nonce_counter = (nonce_counter << 8) | nonce[8 + i];
+    }
+    
+    // Verify session_id matches
+    if (!constantTimeCompare(nonce_session_id, encryptionSession.session_id, 8)) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "ERROR: Nonce session_id mismatch\n  Nonce ID: %02X%02X%02X%02X%02X%02X%02X%02X\n  Expected: %02X%02X%02X%02X%02X%02X%02X%02X",
+                 nonce_session_id[0], nonce_session_id[1], nonce_session_id[2], nonce_session_id[3],
+                 nonce_session_id[4], nonce_session_id[5], nonce_session_id[6], nonce_session_id[7],
+                 encryptionSession.session_id[0], encryptionSession.session_id[1], encryptionSession.session_id[2], encryptionSession.session_id[3],
+                 encryptionSession.session_id[4], encryptionSession.session_id[5], encryptionSession.session_id[6], encryptionSession.session_id[7]);
+        writeSerial(buf);
+        return false;
+    }
+    
+    // Check if counter is within replay window (±32 from last_seen_counter)
+    int64_t counter_diff = (int64_t)nonce_counter - (int64_t)encryptionSession.last_seen_counter;
+    
+    if (counter_diff < -32 || counter_diff > 32) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "ERROR: Nonce counter outside replay window (counter=%llu, last_seen=%llu, diff=%lld)", 
+                 (unsigned long long)nonce_counter, (unsigned long long)encryptionSession.last_seen_counter, (long long)counter_diff);
+        writeSerial(buf);
+        return false;
+    }
+    
+    // Check if counter was already seen (simple check - can be improved with bitmap)
+    // For now, we'll just check if it's greater than last_seen
+    if (nonce_counter <= encryptionSession.last_seen_counter && counter_diff != 0) {
+        // Check if it's in the seen window
+        bool already_seen = false;
+        for (int i = 0; i < 64; i++) {
+            if (encryptionSession.replay_window[i] == nonce_counter) {
+                already_seen = true;
+                break;
+            }
+        }
+        if (already_seen) {
+            writeSerial("ERROR: Nonce counter already seen (replay detected)");
+            return false;
+        }
+    }
+    
+    // Update replay window
+    if (nonce_counter > encryptionSession.last_seen_counter) {
+        encryptionSession.last_seen_counter = nonce_counter;
+    }
+    
+    // Add to replay window (simple circular buffer)
+    static uint8_t replay_window_index = 0;
+    encryptionSession.replay_window[replay_window_index] = nonce_counter;
+    replay_window_index = (replay_window_index + 1) % 64;
+    
+    return true;
+}
+
+// Get current nonce for encryption
+void getCurrentNonce(uint8_t* nonce) {
+    if (!encryptionSession.authenticated) {
+        memset(nonce, 0, 16);
+        return;
+    }
+    
+    // Build nonce: session_id (8 bytes) || counter (8 bytes, big-endian)
+    memcpy(nonce, encryptionSession.session_id, 8);
+    
+    // Convert counter to big-endian
+    uint64_t counter = encryptionSession.nonce_counter;
+    for (int i = 0; i < 8; i++) {
+        nonce[8 + i] = (counter >> (56 - i * 8)) & 0xFF;
+    }
+}
+
+// Increment nonce counter
+void incrementNonceCounter() {
+    if (encryptionSession.authenticated) {
+        encryptionSession.nonce_counter++;
+    }
+}
+
+// Handle authentication command (0x0050)
+bool handleAuthenticate(uint8_t* data, uint16_t len) {
+    if (!isEncryptionEnabled()) {
+        uint8_t response[] = {0x00, 0x50, 0x03}; // Status: Encryption not configured
+        sendResponse(response, sizeof(response));
+        return false;
+    }
+    
+    // Check rate limiting
+    uint32_t currentTime = millis();
+    if (encryptionSession.last_auth_time > 0) {
+        uint32_t timeSinceLastAuth = (currentTime - encryptionSession.last_auth_time) / 1000;
+        if (timeSinceLastAuth < 60) { // 1 minute window
+            if (encryptionSession.auth_attempts >= 10) {
+                uint8_t response[] = {0x00, 0x50, 0x04}; // Status: Rate limit exceeded
+                sendResponse(response, sizeof(response));
+                return false;
+            }
+        } else {
+            encryptionSession.auth_attempts = 0; // Reset counter
+        }
+    }
+    
+    encryptionSession.auth_attempts++;
+    encryptionSession.last_auth_time = currentTime;
+    
+    // Step 1: Client requests authentication (len == 1, data[0] == 0x00)
+    if (len == 1 && data[0] == 0x00) {
+        // Check if already authenticated
+        if (encryptionSession.authenticated && checkEncryptionSessionTimeout()) {
+            // Client is requesting new authentication - clear old session and start fresh
+            writeSerial("New authentication requested, clearing existing session");
+            clearEncryptionSession();
+            // Fall through to generate new challenge
+        }
+        
+        // Generate server nonce for new challenge
+        secure_random(encryptionSession.pending_server_nonce, 16);
+        encryptionSession.server_nonce_time = currentTime;
+        
+        // Send challenge: status (0x00) || server_nonce (16 bytes)
+        uint8_t response[2 + 1 + 16]; // Header (2) + status (1) + server_nonce (16) = 19 bytes
+        response[0] = 0x00;
+        response[1] = 0x50;
+        response[2] = 0x00; // Status: Challenge sent
+        memcpy(response + 3, encryptionSession.pending_server_nonce, 16);
+        sendResponse(response, sizeof(response));
+        
+        writeSerial("Authentication challenge sent");
+        return false; // Not authenticated yet
+    }
+    
+    // Step 2: Client responds with client_nonce (16 bytes) || challenge_response (16 bytes)
+    if (len == 32) {
+        uint8_t client_nonce[16];
+        uint8_t challenge_response[16];
+        memcpy(client_nonce, data, 16);
+        memcpy(challenge_response, data + 16, 16);
+        
+        // Check if server nonce is still valid (30 second timeout)
+        if (currentTime - encryptionSession.server_nonce_time > 30000) {
+            writeSerial("ERROR: Server nonce expired");
+            uint8_t response[] = {0x00, 0x50, 0xFF}; // Status: Error
+            sendResponse(response, sizeof(response));
+            return false;
+        }
+        
+        // Compute expected challenge response
+        uint8_t device_id[4] = {0x00, 0x00, 0x00, 0x01}; // Placeholder device ID
+        uint8_t challenge_input[36]; // server_nonce (16) || client_nonce (16) || device_id (4)
+        memcpy(challenge_input, encryptionSession.pending_server_nonce, 16);
+        memcpy(challenge_input + 16, client_nonce, 16);
+        memcpy(challenge_input + 32, device_id, 4);
+        
+        // Debug: log challenge input
+        char challenge_hex[80];
+        snprintf(challenge_hex, sizeof(challenge_hex), "Challenge input (36 bytes): %02X%02X%02X%02X...%02X%02X%02X%02X",
+                 challenge_input[0], challenge_input[1], challenge_input[2], challenge_input[3],
+                 challenge_input[32], challenge_input[33], challenge_input[34], challenge_input[35]);
+        writeSerial(challenge_hex);
+        
+        uint8_t expected_response[16];
+        writeSerial("Computing expected CMAC...");
+        if (!aes_cmac(securityConfig.encryption_key, challenge_input, 36, expected_response)) {
+            writeSerial("ERROR: Failed to compute expected CMAC");
+            uint8_t response[] = {0x00, 0x50, 0xFF}; // Status: Error
+            sendResponse(response, sizeof(response));
+            return false;
+        }
+        
+        // Debug: log expected response
+        char expected_hex[50];
+        snprintf(expected_hex, sizeof(expected_hex), "Expected response: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                 expected_response[0], expected_response[1], expected_response[2], expected_response[3],
+                 expected_response[4], expected_response[5], expected_response[6], expected_response[7],
+                 expected_response[8], expected_response[9], expected_response[10], expected_response[11],
+                 expected_response[12], expected_response[13], expected_response[14], expected_response[15]);
+        writeSerial(expected_hex);
+        
+        // Debug: log received challenge response
+        char received_hex[50];
+        snprintf(received_hex, sizeof(received_hex), "Received response: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                 challenge_response[0], challenge_response[1], challenge_response[2], challenge_response[3],
+                 challenge_response[4], challenge_response[5], challenge_response[6], challenge_response[7],
+                 challenge_response[8], challenge_response[9], challenge_response[10], challenge_response[11],
+                 challenge_response[12], challenge_response[13], challenge_response[14], challenge_response[15]);
+        writeSerial(received_hex);
+        
+        // Constant-time comparison
+        if (!constantTimeCompare(challenge_response, expected_response, 16)) {
+            writeSerial("ERROR: Authentication failed (wrong key)");
+            uint8_t response[] = {0x00, 0x50, 0x01}; // Status: Authentication failed
+            sendResponse(response, sizeof(response));
+            // Zeroize pending server nonce
+            memset(encryptionSession.pending_server_nonce, 0, 16);
+            return false;
+        }
+        
+        // Authentication successful - establish session
+        memcpy(encryptionSession.client_nonce, client_nonce, 16);
+        memcpy(encryptionSession.server_nonce, encryptionSession.pending_server_nonce, 16);
+        
+        // Derive session key
+        if (!deriveSessionKey(securityConfig.encryption_key, client_nonce, 
+                            encryptionSession.pending_server_nonce, encryptionSession.session_key)) {
+            writeSerial("ERROR: Failed to derive session key");
+            uint8_t response[] = {0x00, 0x50, 0xFF}; // Status: Error
+            sendResponse(response, sizeof(response));
+            return false;
+        }
+        
+        // Derive session ID (use server_nonce which was copied from pending_server_nonce)
+        deriveSessionId(encryptionSession.session_key, client_nonce, 
+                       encryptionSession.server_nonce, encryptionSession.session_id);
+        
+        // Debug: verify session ID was set correctly
+        char session_id_hex[17];
+        for (int i = 0; i < 8; i++) {
+            sprintf(&session_id_hex[i*2], "%02X", encryptionSession.session_id[i]);
+        }
+        session_id_hex[16] = '\0';
+        writeSerial("Session ID after authentication: " + String(session_id_hex));
+        
+        // Verify session ID is not all zeros
+        bool session_id_valid = false;
+        for (int i = 0; i < 8; i++) {
+            if (encryptionSession.session_id[i] != 0) {
+                session_id_valid = true;
+                break;
+            }
+        }
+        if (!session_id_valid) {
+            writeSerial("ERROR: Session ID is invalid (all zeros)!");
+            uint8_t response[] = {0x00, 0x50, 0xFF}; // Status: Error
+            sendResponse(response, sizeof(response));
+            return false;
+        }
+        
+        // Initialize session
+        encryptionSession.authenticated = true;
+        encryptionSession.nonce_counter = 0;
+        encryptionSession.last_seen_counter = 0;
+        encryptionSession.integrity_failures = 0;
+        encryptionSession.session_start_time = currentTime;
+        encryptionSession.last_activity = currentTime;
+        memset(encryptionSession.replay_window, 0, sizeof(encryptionSession.replay_window));
+        
+        // Zeroize pending server nonce
+        memset(encryptionSession.pending_server_nonce, 0, 16);
+        encryptionSession.server_nonce_time = 0;
+        
+        // Send server response
+        // Note: Use server_nonce (already copied from pending_server_nonce) for consistency
+        uint8_t server_response[16];
+        uint8_t server_input[36];
+        memcpy(server_input, encryptionSession.server_nonce, 16); // Use server_nonce (same as pending_server_nonce at this point)
+        memcpy(server_input + 16, client_nonce, 16);
+        memcpy(server_input + 32, device_id, 4);
+        if (!aes_cmac(encryptionSession.session_key, server_input, 36, server_response)) {
+            writeSerial("ERROR: Failed to compute server response");
+            clearEncryptionSession();
+            uint8_t response[] = {0x00, 0x50, 0xFF}; // Status: Error
+            sendResponse(response, sizeof(response));
+            return false;
+        }
+        
+        uint8_t response[2 + 1 + 16]; // Header (2) + status (1) + server_response (16) = 19 bytes
+        response[0] = 0x00;
+        response[1] = 0x50;
+        response[2] = 0x00; // Status: Success
+        memcpy(response + 3, server_response, 16);
+        
+        // Debug: log the response being sent
+        char response_hex[64];
+        snprintf(response_hex, sizeof(response_hex), "Sending auth success response: %02X %02X %02X %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                 response[0], response[1], response[2],
+                 response[3], response[4], response[5], response[6], response[7],
+                 response[8], response[9], response[10], response[11], response[12],
+                 response[13], response[14], response[15], response[16], response[17], response[18]);
+        writeSerial(response_hex);
+        
+        sendResponse(response, sizeof(response));
+        
+        writeSerial("Authentication successful, session established");
+        return true;
+    }
+    
+    // Invalid request format
+    writeSerial("ERROR: Invalid authentication request format (len=" + String(len) + ")");
+    uint8_t response[] = {0x00, 0x50, 0xFF}; // Status: Error
+    sendResponse(response, sizeof(response));
+    return false;
+}
+
+// Decrypt command
+bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plaintext, 
+                   uint16_t* plaintext_len, uint8_t* nonce_full, uint8_t* auth_tag, uint16_t command_header) {
+    if (!isAuthenticated()) {
+        return false;
+    }
+    
+    // Verify nonce replay protection (uses full 16-byte nonce)
+    if (!verifyNonceReplay(nonce_full)) {
+        encryptionSession.integrity_failures++;
+        if (encryptionSession.integrity_failures >= 3) {
+            writeSerial("Too many integrity failures, clearing session");
+            clearEncryptionSession();
+        }
+        return false;
+    }
+    
+    // Extract encrypted payload length
+    uint16_t encrypted_len = ciphertext_len;
+    if (encrypted_len > 512) { // Sanity check
+        writeSerial("ERROR: Encrypted payload too large");
+        return false;
+    }
+    
+    // Debug: log encrypted payload length
+    char len_buf[64];
+    snprintf(len_buf, sizeof(len_buf), "DecryptCommand: encrypted_len=%u, command=0x%04X", encrypted_len, command_header);
+    writeSerial(len_buf);
+    
+    // Extract 13-byte nonce for CCM (last 13 bytes of 16-byte nonce)
+    // Nonce format: [session_id: 8 bytes][counter: 8 bytes]
+    // CCM uses: [session_id last 5 bytes][counter: 8 bytes] = 13 bytes
+    uint8_t nonce[13];
+    memcpy(nonce, nonce_full + 3, 13); // Skip first 3 bytes, use last 13
+    
+    // Debug: log nonce and parameters
+    char nonce_buf[64];
+    snprintf(nonce_buf, sizeof(nonce_buf), "CCM nonce (13 bytes): %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+             nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7],
+             nonce[8], nonce[9], nonce[10], nonce[11], nonce[12]);
+    writeSerial(nonce_buf);
+    char param_buf[128];
+    snprintf(param_buf, sizeof(param_buf), "CCM decrypt params: nonce_len=13, ad_len=2, ciphertext_len=%u, tag_len=12",
+             encrypted_len);
+    writeSerial(param_buf);
+    
+    // Decrypt using AES-CCM
+    // Additional data: command header (2 bytes, big-endian)
+    uint8_t ad[2];
+    ad[0] = (command_header >> 8) & 0xFF;
+    ad[1] = command_header & 0xFF;
+    
+    // Handle zero-byte ciphertext: CCM requires at least 1 byte
+    // Solution: Client always includes a 1-byte length field, so encrypted_len should never be 0
+    if (encrypted_len == 0) {
+        writeSerial("ERROR: Encrypted payload is 0 bytes (should include length byte)");
+        return false;
+    }
+    
+    // Decrypt: first byte is payload length, rest is actual payload
+    // Use static buffer to avoid stack overflow (ESP32 has limited stack)
+    static uint8_t decrypted_with_length[512];
+    bool success = aes_ccm_decrypt(encryptionSession.session_key, nonce, 13, // CCM uses 13-byte nonce
+                                   ad, 2, ciphertext, encrypted_len,
+                                   decrypted_with_length, auth_tag, 12);
+    
+    if (success) {
+        // Extract payload length (first byte)
+        uint8_t payload_length = decrypted_with_length[0];
+        
+        // Validate length
+        if (payload_length > encrypted_len - 1) {
+            writeSerial("ERROR: Invalid payload length in decrypted data");
+            return false;
+        }
+        
+        // Copy actual payload (skip length byte)
+        if (payload_length > 0) {
+            memcpy(plaintext, decrypted_with_length + 1, payload_length);
+        }
+        *plaintext_len = payload_length;
+        encryptionSession.integrity_failures = 0; // Reset on success
+        updateEncryptionSessionActivity();
+        return true;
+    } else {
+        encryptionSession.integrity_failures++;
+        if (encryptionSession.integrity_failures >= 3) {
+            writeSerial("Too many integrity failures, clearing session");
+            clearEncryptionSession();
+        }
+        return false;
+    }
+}
+
+// Encrypt response
+bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* ciphertext,
+                    uint16_t* ciphertext_len, uint8_t* nonce, uint8_t* auth_tag) {
+    if (!isAuthenticated()) {
+        return false;
+    }
+    
+    // Get current nonce (16 bytes: session_id + counter)
+    getCurrentNonce(nonce);
+    incrementNonceCounter();
+    
+    // Extract 13-byte nonce for CCM (last 13 bytes of 16-byte nonce)
+    // Nonce format: [session_id: 8 bytes][counter: 8 bytes]
+    // CCM uses: [session_id last 5 bytes][counter: 8 bytes] = 13 bytes
+    uint8_t nonce_ccm[13];
+    memcpy(nonce_ccm, nonce + 3, 13); // Skip first 3 bytes, use last 13
+    
+    // Encrypt using AES-CCM
+    // Additional data: response header (2 bytes)
+    uint8_t ad[2] = {plaintext[0], plaintext[1]}; // Command header
+    
+    // Debug: log encryption parameters
+    // Use static buffer to avoid stack overflow (ESP32 has limited stack)
+    static char enc_buf[256];
+    snprintf(enc_buf, sizeof(enc_buf), "EncryptResponse: plaintext_len=%u, payload_len=%u, nonce_16bytes=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+             plaintext_len, plaintext_len - 2,
+             nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7],
+             nonce[8], nonce[9], nonce[10], nonce[11], nonce[12], nonce[13], nonce[14], nonce[15]);
+    writeSerial(enc_buf);
+    
+    // Handle zero-byte payload: CCM requires at least 1 byte
+    // Solution: Always include a 1-byte length field as part of the encrypted payload
+    // Use static buffer to avoid stack overflow (ESP32 has limited stack)
+    static uint8_t payload_with_length[513]; // Max payload + 1 byte length
+    uint16_t payload_len = plaintext_len - 2;
+    payload_with_length[0] = payload_len & 0xFF; // Length byte (1 byte, supports up to 255)
+    if (payload_len > 0) {
+        memcpy(payload_with_length + 1, plaintext + 2, payload_len);
+    }
+    uint16_t total_payload_len = 1 + payload_len; // Always at least 1 byte (length)
+    
+    // Encrypt: output goes to ciphertext + 2 + 16 (after header and nonce)
+    bool success = aes_ccm_encrypt(encryptionSession.session_key, nonce_ccm, 13, // CCM uses 13-byte nonce
+                                   ad, 2, payload_with_length, total_payload_len,
+                                   ciphertext + 2 + 16, auth_tag, 12);
+    
+    if (success) {
+        // Build encrypted response: header (2) || nonce (16) || encrypted_data || tag (12)
+        // IMPORTANT: Copy nonce FIRST before any other operations to avoid buffer issues
+        uint8_t nonce_copy[16];
+        memcpy(nonce_copy, nonce, 16); // Make a copy to prevent overwriting
+        
+        ciphertext[0] = plaintext[0];
+        ciphertext[1] = plaintext[1];
+        memcpy(ciphertext + 2, nonce_copy, 16); // Insert nonce after header
+        // Encrypted data (including length byte) is already at ciphertext + 2 + 16
+        memcpy(ciphertext + 2 + 16 + total_payload_len, auth_tag, 12);
+        *ciphertext_len = 2 + 16 + total_payload_len + 12;
+        
+        // Debug: verify nonce was copied correctly
+        char nonce_debug[64];
+        snprintf(nonce_debug, sizeof(nonce_debug), "Response nonce (before): %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                 nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7],
+                 nonce[8], nonce[9], nonce[10], nonce[11], nonce[12], nonce[13], nonce[14], nonce[15]);
+        writeSerial(nonce_debug);
+        char nonce_after[64];
+        snprintf(nonce_after, sizeof(nonce_after), "Response nonce (after copy): %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                 ciphertext[2], ciphertext[3], ciphertext[4], ciphertext[5], ciphertext[6], ciphertext[7],
+                 ciphertext[8], ciphertext[9], ciphertext[10], ciphertext[11], ciphertext[12], ciphertext[13],
+                 ciphertext[14], ciphertext[15], ciphertext[16], ciphertext[17]);
+        writeSerial(nonce_after);
+        updateEncryptionSessionActivity();
+        return true;
+    }
+    
+    return false;
+}
+
 void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len) {
     if (len < 2) {
         writeSerial("ERROR: Command too short (" + String(len) + " bytes)");
         return;
     }
+    
     uint16_t command = (data[0] << 8) | data[1];  // Fixed byte order
     writeSerial("Processing command: 0x" + String(command, HEX));
+    
+    // Handle authentication command (always unencrypted)
+    if (command == 0x0050) {
+        writeSerial("=== AUTHENTICATE COMMAND (0x0050) ===");
+        handleAuthenticate(data + 2, len - 2);
+        return;
+    }
+    
+    // Handle firmware version command (always unencrypted)
+    if (command == 0x0043) {
+        writeSerial("=== FIRMWARE VERSION COMMAND (0x0043) ===");
+        handleFirmwareVersion();
+        return;
+    }
+    
+    // Check if encryption is required for other commands
+    if (isEncryptionEnabled()) {
+        if (!isAuthenticated()) {
+            writeSerial("ERROR: Command requires authentication (encryption enabled)");
+            // Send unencrypted error response so existing tooling can understand it
+            uint8_t response[] = {0x00, (uint8_t)(command & 0xFF), 0xFE}; // Auth required
+            sendResponseUnencrypted(response, sizeof(response));
+            return;
+        }
+        
+        // Check if command is encrypted or unencrypted
+        // Encrypted format: [command: 2] [nonce: 16] [encrypted_data] [tag: 12] (minimum 30 bytes)
+        // Unencrypted format: [command: 2] [payload...] (typically 2-20 bytes)
+        if (len < 2 + 16 + 12) {
+            // Command is too short to be encrypted - treat as unencrypted command
+            writeSerial("ERROR: Unencrypted command received when encryption is enabled");
+            // Send unencrypted error response so existing tooling can understand it
+            uint8_t response[] = {0x00, (uint8_t)(command & 0xFF), 0xFE}; // Auth required (unencrypted)
+            sendResponseUnencrypted(response, sizeof(response));
+            return;
+        }
+        
+        uint8_t nonce_full[16];
+        uint8_t nonce[13]; // CCM uses 13-byte nonce (extract last 13 bytes from 16-byte nonce)
+        uint8_t auth_tag[12];
+        // Use static buffer to avoid stack overflow (ESP32 has limited stack)
+        static uint8_t plaintext[512];
+        uint16_t plaintext_len = 0;
+        
+        // Extract full 16-byte nonce and tag
+        memcpy(nonce_full, data + 2, 16);
+        memcpy(auth_tag, data + len - 12, 12);
+        
+        // Calculate encrypted data length
+        uint16_t encrypted_data_len = len - 2 - 16 - 12; // Total - header - nonce - tag
+        
+        // Debug: log received data structure
+        // Use static buffers to avoid stack overflow (ESP32 has limited stack)
+        static char data_buf[256];
+        snprintf(data_buf, sizeof(data_buf), "Encrypted command: len=%u, command=0x%04X, encrypted_data_len=%u", 
+                 len, command, encrypted_data_len);
+        writeSerial(data_buf);
+        static char nonce_buf[64];
+        snprintf(nonce_buf, sizeof(nonce_buf), "Full nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                 nonce_full[0], nonce_full[1], nonce_full[2], nonce_full[3],
+                 nonce_full[4], nonce_full[5], nonce_full[6], nonce_full[7],
+                 nonce_full[8], nonce_full[9], nonce_full[10], nonce_full[11],
+                 nonce_full[12], nonce_full[13], nonce_full[14], nonce_full[15]);
+        writeSerial(nonce_buf);
+        
+        // Extract last 13 bytes for CCM (nonce format: [session_id: 8 bytes][counter: 8 bytes])
+        // CCM uses last 13 bytes: [session_id last 5 bytes][counter: 8 bytes]
+        memcpy(nonce, nonce_full + 3, 13); // Skip first 3 bytes, use last 13
+        
+        // Decrypt (pass nonce_full for replay protection, decryptCommand will extract 13-byte nonce for CCM)
+        if (!decryptCommand(data + 2 + 16, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
+            writeSerial("ERROR: Decryption failed");
+            // Send unencrypted error response so existing tooling can understand it
+            uint8_t response[] = {0x00, (uint8_t)(command & 0xFF), 0xFF}; // Generic error (unencrypted)
+            sendResponseUnencrypted(response, sizeof(response));
+            return;
+        }
+        
+        // Reconstruct command with decrypted data
+        // Use static buffer to avoid stack overflow (ESP32 has limited stack)
+        static uint8_t decrypted_data[512];
+        decrypted_data[0] = data[0];
+        decrypted_data[1] = data[1];
+        memcpy(decrypted_data + 2, plaintext, plaintext_len);
+        len = 2 + plaintext_len;
+        data = decrypted_data;
+    }
+    
+    // Process decrypted/unencrypted command
     switch (command) {
         case 0x0040: // Read Config command
             writeSerial("=== READ CONFIG COMMAND (0x0040) ===");
@@ -3893,6 +5347,11 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         case 0x0073: // LED Activate command
             writeSerial("=== LED ACTIVATE COMMAND (0x0073) ===");
             handleLedActivate(data + 2, len - 2);
+            break;
+        case 0x0051: // Enter DFU Mode command
+            writeSerial("=== ENTER DFU MODE COMMAND (0x0051) ===");
+            // This command is already authenticated (passed through encryption gate)
+            enterDFUMode();
             break;
         default:
             writeSerial("ERROR: Unknown command: 0x" + String(command, HEX));
