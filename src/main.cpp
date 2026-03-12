@@ -2204,7 +2204,7 @@ void initDisplay(){
     bbepWakeUp(&bbep);
     bbepSendCMDSequence(&bbep, bbep.pInitFull);
     if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
-    drawBootScreen();
+    drawBootScreen(123456); // TODO change to real passcode if set
     bbepRefresh(&bbep, REFRESH_FULL);
     waitforrefresh(60);
     bbepSleep(&bbep, 1);  // Put display to sleep before power down
@@ -3976,7 +3976,7 @@ static void bootRenderTextRow(uint8_t* rowBuf, int pitch, int fontRow,
     }
 }
 
-void drawBootScreen() {
+void drawBootScreen(uint32_t passcode) {
     int W = globalConfig.displays[0].pixel_width;
     int H = globalConfig.displays[0].pixel_height;
     if (W == 0 || H == 0) return;
@@ -4023,13 +4023,20 @@ void drawBootScreen() {
     if (squareSize < pixPerByte * 2) squareSize = pixPerByte * 2;
     int sqSpacing  = (squareSize / 4 / pixPerByte) * pixPerByte;
     if (sqSpacing < pixPerByte) sqSpacing = pixPerByte;
-    int sqGroupW   = numCols * squareSize + (numCols - 1) * sqSpacing;
+
     int sqGroupH   = numRows * squareSize + (numRows - 1) * sqSpacing;
     uint8_t lMask  = (bitsPerPixel == 4) ? 0x0F : (bitsPerPixel == 2) ? 0x3F : 0x7F;
     uint8_t rMask  = (bitsPerPixel == 4) ? 0xF0 : (bitsPerPixel == 2) ? 0xFC : 0xFE;
 
-    // Bottom info strip: rule + gap + deviceFw + lineGap + credit + gap
-    int infoAreaH = 1 + gap + charH + lineGap + charH + gap;
+    // Passcode strip (optional): gap + squareSize + gap
+    bool showPasscode = (passcode != 0);
+    char digits[7] = {};
+    if (showPasscode)
+        snprintf(digits, sizeof(digits), "%06lu", (unsigned long)passcode);
+    int passcodeStripH = showPasscode ? (gap + squareSize + gap) : 0;
+
+    // Bottom info strip: [passcode strip] + rule + gap + deviceFw + lineGap + credit + gap
+    int infoAreaH = passcodeStripH + 1 + gap + charH + lineGap + charH + gap;
     int logoAreaH = H - infoAreaH;
     if (logoAreaH < 0) logoAreaH = 0;
 
@@ -4071,8 +4078,6 @@ void drawBootScreen() {
     {
         int srcW     = BOOT_LOGO_G5_WIDTH;
         int srcH     = BOOT_LOGO_G5_HEIGHT;
-        int srcPitch = (srcW + 7) / 8;
-
         // Single-row decode buffer
         // srcRow is monotonically non-decreasing as currentY increases, so we
         // advance the G5 decoder forward only, reusing the buffer when the same
@@ -4140,6 +4145,50 @@ void drawBootScreen() {
     for (; currentY < logoAreaH && currentY < H; currentY++)
         bbepWriteData(&bbep, whiteRow, pitch);
     #endif
+
+    // Passcode strip — 6 digit squares centered between logo and rule
+    if (showPasscode) {
+        int digitGroupW = 6 * squareSize + 5 * sqSpacing;
+        int digitOriginX = ((W - digitGroupW) / 2 / pixPerByte) * pixPerByte;
+
+        // Top gap
+        for (int i = 0; i < gap && currentY < H; i++, currentY++)
+            bbepWriteData(&bbep, whiteRow, pitch);
+
+        // Digit squares
+        int charStartRow = (squareSize - charH) / 2;  // vertical centering offset
+        for (int row = 0; row < squareSize && currentY < H; row++, currentY++) {
+            memset(rowBuf, whiteValue, pitch);
+            bool borderRow = (row == 0 || row == squareSize - 1);
+            for (int d = 0; d < 6; d++) {
+                int sx        = digitOriginX + d * (squareSize + sqSpacing);
+                int byteStart = sx / pixPerByte;
+                int byteCount = squareSize / pixPerByte;
+                if (byteCount < 1) byteCount = 1;
+                if (borderRow) {
+                    memset(rowBuf + byteStart, 0x00, byteCount);
+                } else {
+                    // White fill with left/right border pixels
+                    memset(rowBuf + byteStart, whiteValue, byteCount);
+                    rowBuf[byteStart]                 &= lMask;
+                    rowBuf[byteStart + byteCount - 1] &= rMask;
+                    // Digit character — centered horizontally and vertically
+                    int fontRow = row - charStartRow;
+                    if (fontRow >= 0 && fontRow < charH) {
+                        int charX = sx + (squareSize - charW) / 2;
+                        char ch[2] = {digits[d], '\0'};
+                        bootRenderTextRow(rowBuf, pitch, fontRow / fontScale, ch,
+                                          charX, charW, fontScale, bitsPerPixel, colorScheme);
+                    }
+                }
+            }
+            bbepWriteData(&bbep, rowBuf, pitch);
+        }
+
+        // Bottom gap
+        for (int i = 0; i < gap && currentY < H; i++, currentY++)
+            bbepWriteData(&bbep, whiteRow, pitch);
+    }
 
     // Rule
     if (currentY < H) {

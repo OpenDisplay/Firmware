@@ -301,7 +301,7 @@ float readChipTemperature();  // Returns chip temperature in degrees Celsius
 int getplane();
 int getBitsPerPixel();
 void writeTextAndFill(const char* text);
-void drawBootScreen();
+void drawBootScreen(uint32_t passcode = 0);
 
 // Encryption functions
 bool isEncryptionEnabled();
