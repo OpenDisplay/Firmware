@@ -1,3 +1,6 @@
+#ifndef STRUCTS_H
+#define STRUCTS_H
+
 #include <stdint.h>
 
 // Image transfer state variables
@@ -195,3 +198,5 @@ struct SecurityConfig {
 #define SECURITY_FLAG_RESET_PIN_POLARITY  (1 << 3)
 #define SECURITY_FLAG_RESET_PIN_PULLUP    (1 << 4)
 #define SECURITY_FLAG_RESET_PIN_PULLDOWN  (1 << 5)
+
+#endif
