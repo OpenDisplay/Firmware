@@ -27,7 +27,9 @@ struct SystemConfig {
     uint8_t communication_modes; // Supported communication modes (bitfield)
     uint8_t device_flags;       // Misc device flags (bitfield)
     uint8_t pwr_pin;            // Power pin number (0xFF if not present)
-    uint8_t reserved[17];       // Reserved bytes for future use
+    uint8_t reserved[15];       // Reserved bytes for future use
+    uint8_t pwr_pin_2;          // Optional 2nd power/enable (e.g. Seeed ED103 TFT_ENABLE); 0 or 0xFF = default (11)
+    uint8_t pwr_pin_3;          // Optional 3rd power/enable (e.g. ITE_ENABLE); 0 or 0xFF = default (21)
 } __attribute__((packed));
 
 // 0x02: manufacturer_data
@@ -55,6 +57,28 @@ struct PowerOption {
     uint8_t reserved[10];        // Reserved bytes for future use
 } __attribute__((packed));
 
+// Panel IDs must match web/firmware/toolbox/config.yaml display.panel_ic_type enum values.
+// Decimal 3000–3999 = Seeed_GFX / OpenDisplay runtime epaper (add new IDs here as panels ship).
+#define PANEL_IC_SEEED_ED103TC2_1872X1404 3000u
+#define PANEL_IC_SEEED_ED103TC2_1872X1404_4GRAY 3001u
+
+// display.color_scheme (config.yaml); use with matching panel (e.g. gray16 + panel_ic 3001).
+#define COLOR_SCHEME_GRAY16 6u
+
+// display.transmission_modes (config.yaml bitfield). ZIPXL extends ZIP on builds with a larger buffer.
+#if defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY) && defined(BOARD_HAS_PSRAM)
+#define MAX_COMPRESSED_BUFFER_BYTES (512u * 1024u)
+#elif defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY)
+#define MAX_COMPRESSED_BUFFER_BYTES (256u * 1024u)
+#else
+#define MAX_COMPRESSED_BUFFER_BYTES (54u * 1024u)
+#endif
+#define TRANSMISSION_MODE_ZIPXL          (1u << 0)
+#define TRANSMISSION_MODE_ZIP            (1u << 1)
+#define TRANSMISSION_MODE_G5             (1u << 2)
+#define TRANSMISSION_MODE_DIRECT_WRITE   (1u << 3)
+#define TRANSMISSION_MODE_CLEAR_ON_BOOT  (1u << 7)
+
 // 0x20: display (repeatable, max 4 instances)
 struct DisplayConfig {
     uint8_t instance_number;    // Unique index for multiple display blocks (0-based)
@@ -68,21 +92,22 @@ struct DisplayConfig {
     uint8_t rotation;           // Physical rotation in degrees (enum)
     uint8_t reset_pin;          // Pin number for panel reset (0xFF if none)
     uint8_t busy_pin;           // Pin number to read panel busy status (0xFF if none)
-    uint8_t dc_pin;             // Data/Command select pin (0xFF if none)
+    uint8_t dc_pin;             // SPI MISO for Seeed ED103/IT8951 (OpenDisplay); else data/command if used
     uint8_t cs_pin;             // SPI chip select pin (0xFF if none)
     uint8_t data_pin;           // Data out pin (MOSI / data line)
     uint8_t partial_update_support; // Partial update capability (enum)
     uint8_t color_scheme;       // Color scheme supported by the display
     uint8_t transmission_modes; // Supported image/data transmission modes (bitfield)
-    uint8_t clk_pin;     // Reserved / spare pin 1
-    uint8_t reserved_pin_2;     // Reserved / spare pin 2
-    uint8_t reserved_pin_3;     // Reserved / spare pin 3
+    uint8_t clk_pin;            // SPI SCLK (Seeed ePaper)
+    uint8_t reserved_pin_2;     // Spare GPIO (Seeed enables use system_config.pwr_pin_2/3)
+    uint8_t reserved_pin_3;     // Spare GPIO
     uint8_t reserved_pin_4;     // Reserved / spare pin 4
     uint8_t reserved_pin_5;     // Reserved / spare pin 5
     uint8_t reserved_pin_6;     // Reserved / spare pin 6
     uint8_t reserved_pin_7;     // Reserved / spare pin 7
     uint8_t reserved_pin_8;     // Reserved / spare pin 8
-    uint8_t reserved[15];       // Reserved bytes for future use
+    uint16_t full_update_mC;    // Energy for full refresh in millicoulombs (0 = unknown)
+    uint8_t reserved[13];       // Reserved bytes for future use
 } __attribute__((packed));
 
 // 0x21: led (repeatable, max 4 instances)
@@ -97,12 +122,32 @@ struct LedConfig {
     uint8_t reserved[15];       // Reserved bytes for future use
 } __attribute__((packed));
 
+// 0x29: passive_buzzer (repeatable, max 4 instances)
+// Frequency in 0x0075 payload: 0 = silence/rest; 1–255 maps linearly to firmware-defined Hz range (not stored in config).
+#define BUZZER_FLAG_ENABLE_ACTIVE_HIGH (1u << 0)
+
+struct PassiveBuzzerConfig {
+    uint8_t instance_number;
+    uint8_t drive_pin;            // PWM / square wave to buzzer (+ transistor)
+    uint8_t enable_pin;           // Optional enable (e.g. FET); 0xFF = unused
+    uint8_t flags;                // BUZZER_FLAG_*
+    uint8_t duty_percent;         // 1–100 PWM duty; 0 = default 50
+    uint8_t reserved[27];
+} __attribute__((packed));
+
 // 0x23: sensor_data (repeatable, max 4 instances)
+#define SENSOR_TYPE_TEMPERATURE 0x0001u
+#define SENSOR_TYPE_HUMIDITY    0x0002u
+#define SENSOR_TYPE_AXP2101     0x0003u
+#define SENSOR_TYPE_SHT40       0x0004u
+
 struct SensorData {
     uint8_t instance_number;    // Unique index for multiple sensor blocks (0-based)
-    uint16_t sensor_type;       // Sensor type enum
+    uint16_t sensor_type;       // Sensor type enum (SENSOR_TYPE_*)
     uint8_t bus_id;             // Instance id of the bus to use for this sensor
-    uint8_t reserved[26];       // Reserved bytes for future use
+    uint8_t i2c_addr_7bit;      // I2C 7-bit address; 0 or 0xFF = default per sensor (SHT40: 0x44)
+    uint8_t msd_data_start_byte; // SHT40: first index in dynamicreturndata for 3-byte MSD block; 0 or 0xFF = default (7)
+    uint8_t reserved[24];       // Reserved for future use
 } __attribute__((packed));
 
 // 0x24: data_bus (repeatable, max 4 instances)
@@ -144,6 +189,28 @@ struct BinaryInputs {
     uint8_t reserved[14];       // Reserved bytes for future use
 } __attribute__((packed));
 
+// 0x28: touch_controller (repeatable, max 4 instances)
+// touch_ic_type: 0 = disabled / none, 1 = GT911
+#define TOUCH_IC_NONE   0u
+#define TOUCH_IC_GT911  1u
+#define TOUCH_FLAG_INVERT_X  (1u << 0)
+#define TOUCH_FLAG_INVERT_Y  (1u << 1)
+#define TOUCH_FLAG_SWAP_XY   (1u << 2)
+
+struct TouchController {
+    uint8_t instance_number;
+    uint16_t touch_ic_type;
+    uint8_t bus_id;             // data_bus index, or 0xFF if I2C already up (e.g. after display init)
+    uint8_t i2c_addr_7bit;      // GT911: 0x5D or 0x14; 0 or 0xFF = auto (try both after reset)
+    uint8_t int_pin;            // GT911 INT, 0xFF = poll only
+    uint8_t rst_pin;            // GT911 RST, 0xFF = skip hardware reset
+    uint8_t display_instance;   // Clip/scale to displays[instance] pixel size
+    uint8_t flags;              // TOUCH_FLAG_*
+    uint8_t poll_interval_ms;   // 0 = default 25 ms
+    uint8_t touch_data_start_byte; // First of 5 bytes in MSD dynamicreturndata (0–6): byte0 low nibble = contacts 1–5 (down) or 6 (released, last xy kept); high nibble = track id
+    uint8_t reserved[21];
+} __attribute__((packed));
+
 // Global configuration structure
 struct GlobalConfig {
     // Required packets (single instances)
@@ -166,12 +233,26 @@ struct GlobalConfig {
     
     struct BinaryInputs binary_inputs[4];
     uint8_t binary_input_count; // Number of binary input instances loaded
-    
+
+    struct TouchController touch_controllers[4];
+    uint8_t touch_controller_count;
+
+    struct PassiveBuzzerConfig passive_buzzers[4];
+    uint8_t passive_buzzer_count;
+
     // Config metadata
     uint8_t version;            // Protocol version
     uint8_t minor_version;      // Protocol minor version
     bool loaded;                // True if config was successfully loaded
 };
+
+// 0x26 (decimal 38): wifi_config — matches web/firmware/toolbox/config.yaml packet_types
+struct WifiConfig {
+    uint8_t ssid[32];
+    uint8_t password[32];
+    uint8_t encryption_type;
+    uint8_t reserved[95];
+} __attribute__((packed));
 
 // 0x27: security_config
 struct SecurityConfig {

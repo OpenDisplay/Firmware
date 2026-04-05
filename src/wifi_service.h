@@ -3,12 +3,12 @@
 
 #ifdef TARGET_ESP32
 
-#define WIFI_SERVER_RECONNECT_DELAY_MS 30000U
-
-void initWiFi();
-void discoverAndConnectWiFiServer();
+void initWiFi(bool waitForConnection = true);
 void disconnectWiFiServer();
 void handleWiFiServer();
+void restartWiFiLanAfterReconnect();
+/// Publish MSD (bytes after company ID) as mDNS TXT key ``msd`` (28 hex chars). No-op if Wi-Fi down.
+void opendisplay_mdns_update_msd_txt(void);
 
 #endif
 

@@ -34,7 +34,6 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DECOMP_CHUNK 512
 #define DECOMP_CHUNK_SIZE 4096
 #define MAX_DICT_SIZE 32768
-#define MAX_IMAGE_SIZE (54 * 1024)
 #define MAX_BLOCKS 64
 // Text rendering constants
 #define FONT_CHAR_WIDTH 16  // 7 font columns + 1 blank column, each doubled (8*2)
@@ -70,13 +69,6 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_PWR_PIN      (1 << 0)  // Bit 0: Device has external power management pin
 #define DEVICE_FLAG_XIAOINIT     (1 << 1)  // Bit 1: Call xiaoinit() after config load (nRF52840 only)
 #define DEVICE_FLAG_WS_PP_INIT   (1 << 2)  // Bit 2: Call ws_pp_init() after config load (Waveshare Photo Printer)
-
-// Transmission mode bit definitions (for display.transmission_modes)
-#define TRANSMISSION_MODE_RAW          (1 << 0)  // Bit 0: Raw transfer
-#define TRANSMISSION_MODE_ZIP          (1 << 1)  // Bit 1: ZIP compressed transfer
-#define TRANSMISSION_MODE_G5           (1 << 2)  // Bit 2: Group 5 compression
-#define TRANSMISSION_MODE_DIRECT_WRITE (1 << 3)  // Bit 3: Direct write mode (bufferless)
-#define TRANSMISSION_MODE_CLEAR_ON_BOOT (1 << 7) // Bit 7: Clear screen at bootup (writeTextAndFill with empty string)
 
 #ifdef TARGET_NRF
 #include <bluefruit.h>
@@ -128,7 +120,9 @@ void bbepSendCMDSequence(BBEPDISP *pBBEP, const uint8_t *pSeq);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
 
-uint8_t compressedDataBuffer[MAX_IMAGE_SIZE];  // Static buffer for compressed image data
+extern uint8_t* compressedDataBuffer;
+void allocCompressedDataBuffer(void);
+
 uint8_t decompressionChunk[DECOMP_CHUNK_SIZE];
 uint8_t dictionaryBuffer[MAX_DICT_SIZE];
 uint8_t bleResponseBuffer[94];
@@ -172,20 +166,17 @@ char wifiPassword[33] = {0};  // 32 bytes + null terminator
 uint8_t wifiEncryptionType = 0;  // 0x00=none, 0x01=WEP, 0x02=WPA, 0x03=WPA2, 0x04=WPA3
 bool wifiConfigured = false;  // True if WiFi config packet (0x26) was received and parsed
 #ifdef TARGET_ESP32
-#include <WiFiClient.h>
-bool wifiConnected = false;  // True if WiFi is currently connected
-bool wifiInitialized = false;  // True if WiFi initialization was attempted
-char wifiServerUrl[65] = {0};  // 64 bytes + null terminator for server URL/hostname
-uint16_t wifiServerPort = 2446;  // Default server port
-bool wifiServerConfigured = false;  // True if server URL is configured
-WiFiClient wifiClient;  // TCP client connection
-bool wifiServerConnected = false;  // True if TCP connection to server is established
-uint32_t wifiServerLastConnectAttempt = 0;  // Timestamp of last connection attempt
-uint8_t tcpReceiveBuffer[8192];  // TCP receive buffer
-uint32_t tcpReceiveBufferPos = 0;  // Current position in receive buffer
-uint32_t wifiNextImageRequestTime = 0;  // Timestamp when next Image Request should be sent (0 = send immediately)
-uint32_t wifiPollInterval = 60;  // Poll interval in seconds (default: 60 seconds)
-bool wifiImageRequestPending = false;  // True when Image Request has been sent and we're waiting for response
+#include <WiFi.h>
+bool wifiConnected = false;
+bool wifiInitialized = false;
+char wifiServerUrl[65] = {0};
+uint16_t wifiServerPort = 2446;
+bool wifiServerConfigured = false;
+WiFiServer wifiServer;
+WiFiClient wifiClient;
+bool wifiServerConnected = false;
+uint8_t tcpReceiveBuffer[8192];
+uint32_t tcpReceiveBufferPos = 0;
 #endif
 
 // Direct write mode state (bufferless display writing)
@@ -203,7 +194,7 @@ uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if
 // Direct write compressed mode: use same buffer as regular image upload
 uint32_t directWriteCompressedSize = 0;  // Total compressed size expected
 uint32_t directWriteCompressedReceived = 0;  // Total compressed bytes received
-uint8_t* directWriteCompressedBuffer = nullptr;  // Pointer to compressedDataBuffer (static allocation only)
+uint8_t* directWriteCompressedBuffer = nullptr;  // Points at compressedDataBuffer when compressed direct-write is active
 uint32_t directWriteStartTime = 0;  // Timestamp when direct write started (for timeout detection)
 bool displayPowerState = false;  // Track display power state (true = powered on, false = powered off)
 

@@ -6,6 +6,10 @@
 #include "structs.h"
 #include <bb_epaper.h>
 #include "qr/qrcode.h"
+#include "display_service.h"
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+#include "display_seeed_gfx.h"
+#endif
 
 extern struct GlobalConfig globalConfig;
 extern struct SecurityConfig securityConfig;
@@ -223,8 +227,15 @@ bool writeBootScreenWithQr() {
     memcpy(k2, keyHex + 16, 16); k2[16] = '\0';
 
     uint8_t* row = staticRowBuffer;
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (!seeed_driver_used()) {
+        bbepSetAddrWindow(&bbep, 0, 0, w, h);
+        bbepStartWrite(&bbep, getplane());
+    }
+#else
     bbepSetAddrWindow(&bbep, 0, 0, w, h);
     bbepStartWrite(&bbep, getplane());
+#endif
     for (uint16_t y = 0; y < h; y++) {
         memset(row, whiteValue, pitch);
         uint16_t availW = qrRight ? qrX : w;
@@ -267,22 +278,37 @@ bool writeBootScreenWithQr() {
                 }
             }
         }
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+        if (seeed_driver_used()) {
+            seeed_gfx_boot_write_row(y, row, pitch);
+        } else {
+            bbepWriteData(&bbep, row, pitch);
+        }
+#else
         bbepWriteData(&bbep, row, pitch);
+#endif
     }
 
-    if (useBitplanes) {
-        memset(row, 0x00, pitch);
-        bbepSetAddrWindow(&bbep, 0, 0, w, h);
-        bbepStartWrite(&bbep, PLANE_1);
-        for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, pitch);
-    }
-    if (colorScheme == 5) {
-        int otherPlane = (getplane() == PLANE_0) ? PLANE_1 : PLANE_0;
-        int otherPlanePitch = (w + 7) / 8;
-        memset(row, 0x00, otherPlanePitch);
-        bbepSetAddrWindow(&bbep, 0, 0, w, h);
-        bbepStartWrite(&bbep, otherPlane);
-        for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, otherPlanePitch);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        seeed_gfx_boot_skip_planes();
+    } else
+#endif
+    {
+        if (useBitplanes) {
+            memset(row, 0x00, pitch);
+            bbepSetAddrWindow(&bbep, 0, 0, w, h);
+            bbepStartWrite(&bbep, PLANE_1);
+            for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, pitch);
+        }
+        if (colorScheme == 5) {
+            int otherPlane = (getplane() == PLANE_0) ? PLANE_1 : PLANE_0;
+            int otherPlanePitch = (w + 7) / 8;
+            memset(row, 0x00, otherPlanePitch);
+            bbepSetAddrWindow(&bbep, 0, 0, w, h);
+            bbepStartWrite(&bbep, otherPlane);
+            for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, otherPlanePitch);
+        }
     }
     writeSerial("Boot screen with QR rendered", true);
     return true;

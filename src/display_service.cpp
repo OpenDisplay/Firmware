@@ -5,10 +5,15 @@
 #include <string.h>
 #include <Wire.h>
 #include "structs.h"
+#include "buzzer_control.h"
+#include "sensor_sht40.h"
 #include "communication.h"
 #include "encryption.h"
 #include "boot_screen.h"
 #include "uzlib.h"
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+#include "display_seeed_gfx.h"
+#endif
 
 #ifdef TARGET_NRF
 extern "C" {
@@ -19,6 +24,7 @@ extern "C" {
 
 #ifdef TARGET_ESP32
 #include <BLEDevice.h>
+#include "wifi_service.h"
 #endif
 
 extern BBEPDISP bbep;
@@ -44,9 +50,19 @@ extern bool directWritePlane2;
 extern bool directWriteBitplanes;
 extern bool directWriteCompressed;
 extern bool directWriteActive;
-extern uint8_t compressedDataBuffer[];
+extern uint8_t* compressedDataBuffer;
 extern uint8_t dictionaryBuffer[];
 extern uint8_t decompressionChunk[];
+
+uint32_t max_compressed_image_rx_bytes(uint8_t tm) {
+    if ((tm & TRANSMISSION_MODE_ZIP) == 0) return 0;
+    if ((tm & TRANSMISSION_MODE_ZIPXL) != 0 &&
+        MAX_COMPRESSED_BUFFER_BYTES > (54u * 1024u)) {
+        return MAX_COMPRESSED_BUFFER_BYTES;
+    }
+    uint32_t stdlim = 54u * 1024u;
+    return stdlim < MAX_COMPRESSED_BUFFER_BYTES ? stdlim : MAX_COMPRESSED_BUFFER_BYTES;
+}
 
 #ifdef TARGET_ESP32
 extern BLEAdvertisementData* advertisementData;
@@ -90,7 +106,6 @@ void flashLed(uint8_t color, uint8_t brightness);
 #define AXP2101_REG_IRQ_STATUS3 0x46
 #define AXP2101_REG_IRQ_STATUS4 0x47
 #define AXP2101_REG_LDO_ONOFF_CTRL1 0x91
-#define TRANSMISSION_MODE_CLEAR_ON_BOOT (1 << 7)
 #define FONT_BASE_WIDTH 8
 #define FONT_BASE_HEIGHT 8
 #define FONT_SMALL_THRESHOLD 264
@@ -170,11 +185,28 @@ int mapEpd(int id){
         case 0x003E: return EP1085_1360x480;
         case 0x003F: return EP31_240x320;
         case 0x0040: return EP75YR_800x480;
+        case 0x0041: return EP_PANEL_UNDEFINED;
         default: return EP_PANEL_UNDEFINED;
     }
 }
 
+bool seeed_driver_used(void) {
+#if !defined(TARGET_ESP32) || !defined(OPENDISPLAY_SEEED_GFX)
+    return false;
+#else
+    if (globalConfig.display_count < 1) return false;
+    const struct DisplayConfig& d = globalConfig.displays[0];
+    if (d.panel_ic_type != PANEL_IC_SEEED_ED103TC2_1872X1404 &&
+        d.panel_ic_type != PANEL_IC_SEEED_ED103TC2_1872X1404_4GRAY) return false;
+    if (d.display_technology != 0 && d.display_technology != 1) return false;
+    return true;
+#endif
+}
+
 bool waitforrefresh(int timeout){
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) return seeed_gfx_wait_refresh(timeout);
+#endif
     for (size_t i = 0; i < (size_t)(timeout * 10); i++){
         delay(100);
         if(i % 5 == 0) writeSerial(".", false);
@@ -263,6 +295,21 @@ void initDataBuses(){
     writeSerial("=== Data Bus Initialization Complete ===", true);
 }
 
+void initOrRestoreWireForOpenDisplay(void) {
+#ifdef TARGET_ESP32
+    if (globalConfig.data_bus_count > 0) {
+        const struct DataBus& bus = globalConfig.data_buses[0];
+        if (bus.bus_type == 0x01 && bus.pin_1 != 0xFF && bus.pin_2 != 0xFF) {
+            uint32_t hz = bus.bus_speed_hz ? bus.bus_speed_hz : 100000u;
+            Wire.begin((int)bus.pin_2, (int)bus.pin_1);
+            Wire.setClock(hz);
+            return;
+        }
+    }
+#endif
+    Wire.begin();
+}
+
 void initio(){
     if(globalConfig.led_count > 0){
         for (uint8_t i = 0; i < globalConfig.led_count; i++) {
@@ -298,6 +345,7 @@ void initio(){
             }
         }
     }
+    initPassiveBuzzers();
     if(globalConfig.system_config.pwr_pin != 0xFF){
     pinMode(globalConfig.system_config.pwr_pin, OUTPUT);
     digitalWrite(globalConfig.system_config.pwr_pin, LOW);
@@ -351,19 +399,23 @@ void initSensors(){
         writeSerial("Initializing sensor " + String(i) + " (instance " + String(sensor->instance_number) + ")", true);
         writeSerial("  Type: 0x" + String(sensor->sensor_type, HEX), true);
         writeSerial("  Bus ID: " + String(sensor->bus_id), true);
-        if(sensor->sensor_type == 0x0003){ // AXP2101 PMIC
+        if(sensor->sensor_type == SENSOR_TYPE_AXP2101){
             writeSerial("  Detected AXP2101 PMIC sensor", true);
         }
-        else if(sensor->sensor_type == 0x0001){ // Temperature sensor
+        else if(sensor->sensor_type == SENSOR_TYPE_TEMPERATURE){
             writeSerial("  Temperature sensor (initialization not implemented)", true);
         }
-        else if(sensor->sensor_type == 0x0002){ // Humidity sensor
+        else if(sensor->sensor_type == SENSOR_TYPE_HUMIDITY){
             writeSerial("  Humidity sensor (initialization not implemented)", true);
+        }
+        else if(sensor->sensor_type == SENSOR_TYPE_SHT40){
+            writeSerial("  SHT40 (I2C + MSD slot)", true);
         }
         else{
             writeSerial("  Unknown sensor type 0x" + String(sensor->sensor_type, HEX), true);
         }
     }
+    initSht40Sensors();
     writeSerial("=== Sensor Initialization Complete ===", true);
 }
 
@@ -859,24 +911,52 @@ static void renderChar_1BPP(uint8_t* rowBuffer, const uint8_t* fontData, int fon
 void initDisplay(){
     writeSerial("=== Initializing Display ===", true);
     if(globalConfig.display_count > 0){
-    pwrmgm(true);
-    memset(&bbep, 0, sizeof(BBEPDISP));
-    int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
-    bbepSetPanelType(&bbep, panelType);
-    bbepSetRotation(&bbep, globalConfig.displays[0].rotation * 90);
-    bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
-    writeSerial(String("Height: ") + String(globalConfig.displays[0].pixel_height), true);
-    writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
-    bbepWakeUp(&bbep);
-    bbepSendCMDSequence(&bbep, bbep.pInitFull);
-    if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
-    writeBootScreenWithQr();
-    bbepRefresh(&bbep, REFRESH_FULL);
-    waitforrefresh(60);
-    bbepSleep(&bbep, 1);
-    delay(200);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        pwrmgm(true);
+        writeSerial("Display: Seeed_GFX (panel_ic " + String(globalConfig.displays[0].panel_ic_type) + ", " +
+                    String(globalConfig.displays[0].pixel_width) + "x" + String(globalConfig.displays[0].pixel_height) + ", " +
+                    String(getBitsPerPixel()) + " bpp)", true);
+        seeed_gfx_epaper_begin();
+        if (opnd_seeed_tcon_busy_timeout_occurred()) {
+            writeSerial("Seeed_GFX init failed (TCON busy timeout) — skipping boot refresh", true);
+            pwrmgm(false);
+            return;
+        }
+        writeSerial(String("Height: ") + String(globalConfig.displays[0].pixel_height), true);
+        writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
+        if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
+            writeBootScreenWithQr();
+            writeSerial("EPD refresh: FULL (boot, Seeed)", true);
+            seeed_gfx_full_update();
+            waitforrefresh(60);
+            seeed_gfx_sleep_after_refresh();
+            delay(200);
+        }
+        pwrmgm(false);
+    } else
+#endif
+    {
+        pwrmgm(true);
+        memset(&bbep, 0, sizeof(BBEPDISP));
+        int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
+        bbepSetPanelType(&bbep, panelType);
+        bbepSetRotation(&bbep, globalConfig.displays[0].rotation * 90);
+        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+        writeSerial(String("Height: ") + String(globalConfig.displays[0].pixel_height), true);
+        writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
+        bbepWakeUp(&bbep);
+        bbepSendCMDSequence(&bbep, bbep.pInitFull);
+        if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
+            writeBootScreenWithQr();
+            writeSerial("EPD refresh: FULL (boot)", true);
+            bbepRefresh(&bbep, REFRESH_FULL);
+            waitforrefresh(60);
+            bbepSleep(&bbep, 1);
+            delay(200);
+        }
+        pwrmgm(false);
     }
-    pwrmgm(false);
     }
     else{
         writeSerial("No display found", true);
@@ -886,13 +966,19 @@ void initDisplay(){
 
 int getplane() {
     uint8_t colorScheme = globalConfig.displays[0].color_scheme;
-    if (colorScheme == 0) return PLANE_0;
+    if (colorScheme == 0 || colorScheme == COLOR_SCHEME_GRAY16) return PLANE_0;
     if (colorScheme == 1 || colorScheme == 2) return PLANE_0;
     if (colorScheme == 5) return PLANE_1;
     return PLANE_1;
 }
 
 int getBitsPerPixel() {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (globalConfig.display_count > 0 &&
+        globalConfig.displays[0].panel_ic_type == PANEL_IC_SEEED_ED103TC2_1872X1404_4GRAY) {
+        return 4;
+    }
+#endif
     if (globalConfig.displays[0].color_scheme == 4) return 4;
     if (globalConfig.displays[0].color_scheme == 3) return 2;
     if (globalConfig.displays[0].color_scheme == 5) return 2;
@@ -936,6 +1022,7 @@ float readChipTemperature() {
 }
 
 void updatemsdata(){
+    pollSht40SensorsForMsd();
     float batteryVoltage = readBatteryVoltage();
     float chipTemperature = readChipTemperature();
     uint16_t batteryVoltageMv = (uint16_t)(batteryVoltage * 1000);
@@ -962,7 +1049,7 @@ void updatemsdata(){
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     Bluefruit.Advertising.addName();
     Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, msd_payload, 16);
-    Bluefruit.Advertising.setInterval(32, 400);
+    Bluefruit.Advertising.setInterval(256, 1600);
     Bluefruit.Advertising.setFastTimeout(1);
     Bluefruit.Advertising.stop();
     Bluefruit.Advertising.start(0);
@@ -991,14 +1078,24 @@ void updatemsdata(){
             pAdvertising->start();
         }
     }
+    opendisplay_mdns_update_msd_txt();
 #endif
     mloopcounter++;
     mloopcounter &= 0x0F;
 }
 
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
+    if (!compressedDataBuffer) {
+        cleanupDirectWriteState(false);
+        uint8_t errorResponse[] = {0xFF, 0xFF};
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
     uint32_t newTotalSize = directWriteCompressedReceived + len;
-    if (newTotalSize > (54 * 1024)) {
+    uint32_t cap = (globalConfig.display_count > 0)
+        ? max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes)
+        : 0;
+    if (cap == 0 || newTotalSize > cap) {
         cleanupDirectWriteState(true);
         uint8_t errorResponse[] = {0xFF, 0xFF};
         sendResponse(errorResponse, sizeof(errorResponse));
@@ -1031,7 +1128,14 @@ void decompressDirectWriteData() {
         res = uzlib_uncompress(&d);
         size_t bytesOut = d.dest - d.dest_start;
         if (bytesOut > 0) {
-            bbepWriteData(&bbep, decompressionChunk, bytesOut);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+            if (seeed_driver_used()) {
+                seeed_gfx_direct_write_chunk(decompressionChunk, (uint32_t)bytesOut);
+            } else
+#endif
+            {
+                bbepWriteData(&bbep, decompressionChunk, bytesOut);
+            }
             directWriteBytesWritten += bytesOut;
         }
     } while (res == TINF_OK && directWriteBytesWritten < directWriteTotalBytes);
@@ -1053,7 +1157,14 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteRefreshMode = 0;
     directWriteStartTime = 0;
     if (refreshDisplay && displayPowerState) {
-        bbepSleep(&bbep, 1);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+        if (seeed_driver_used()) {
+            seeed_gfx_direct_sleep();
+        } else
+#endif
+        {
+            bbepSleep(&bbep, 1);
+        }
         delay(200);
     }
     displayPowerState = false;
@@ -1062,27 +1173,40 @@ void cleanupDirectWriteState(bool refreshDisplay) {
 
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     if (directWriteActive) cleanupDirectWriteState(false);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        seeed_gfx_prepare_hardware();
+    }
+#endif
     uint8_t colorScheme = globalConfig.displays[0].color_scheme;
     directWriteBitplanes = (colorScheme == 1 || colorScheme == 2);
     directWritePlane2 = false;
     directWriteCompressed = (len >= 4);
     directWriteWidth = globalConfig.displays[0].pixel_width;
     directWriteHeight = globalConfig.displays[0].pixel_height;
-    if (directWriteBitplanes) directWriteTotalBytes = (directWriteWidth * directWriteHeight + 7) / 8;
+    uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
+    if (directWriteBitplanes) directWriteTotalBytes = (pixels + 7) / 8;
     else {
         int bitsPerPixel = getBitsPerPixel();
-        if (bitsPerPixel == 4) directWriteTotalBytes = (directWriteWidth * directWriteHeight + 1) / 2;
-        else if (bitsPerPixel == 2) directWriteTotalBytes = (directWriteWidth * directWriteHeight + 3) / 4;
-        else directWriteTotalBytes = (directWriteWidth * directWriteHeight + 7) / 8;
+        if (bitsPerPixel == 4) directWriteTotalBytes = (pixels + 1) / 2;
+        else if (bitsPerPixel == 2) directWriteTotalBytes = (pixels + 3) / 4;
+        else directWriteTotalBytes = (pixels + 7) / 8;
     }
     if (directWriteCompressed) {
+        if (!compressedDataBuffer) {
+            cleanupDirectWriteState(false);
+            uint8_t errorResponse[] = {0xFF, 0xFF};
+            sendResponse(errorResponse, sizeof(errorResponse));
+            return;
+        }
         memcpy(&directWriteDecompressedTotal, data, 4);
         directWriteCompressedBuffer = compressedDataBuffer;
         directWriteCompressedSize = 0;
         directWriteCompressedReceived = 0;
         if (len > 4) {
             uint32_t compressedDataLen = len - 4;
-            if (compressedDataLen > (54 * 1024)) {
+            uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
+            if (compressedDataLen > cap) {
                 cleanupDirectWriteState(false);
                 uint8_t errorResponse[] = {0xFF, 0xFF};
                 sendResponse(errorResponse, sizeof(errorResponse));
@@ -1097,14 +1221,21 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     directWriteStartTime = millis();
     if (displayPowerState) {
         pwrmgm(false);
-        delay(100);
+        delay(50);
     }
     pwrmgm(true);
-    bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
-    bbepWakeUp(&bbep);
-    bbepSendCMDSequence(&bbep, bbep.pInitFull);
-    bbepSetAddrWindow(&bbep, 0, 0, globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height);
-    bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        seeed_gfx_direct_write_reset();
+    } else
+#endif
+    {
+        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+        bbepWakeUp(&bbep);
+        bbepSendCMDSequence(&bbep, bbep.pInitFull);
+        bbepSetAddrWindow(&bbep, 0, 0, globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height);
+        bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
+    }
     uint8_t ackResponse[] = {0x00, 0x70};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
@@ -1118,7 +1249,14 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
     uint32_t remainingBytes = (directWriteBytesWritten < directWriteTotalBytes) ? (directWriteTotalBytes - directWriteBytesWritten) : 0;
     uint16_t bytesToWrite = (len > remainingBytes) ? remainingBytes : len;
     if (bytesToWrite > 0) {
-        bbepWriteData(&bbep, data, bytesToWrite);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+        if (seeed_driver_used()) {
+            seeed_gfx_direct_write_chunk(data, bytesToWrite);
+        } else
+#endif
+        {
+            bbepWriteData(&bbep, data, bytesToWrite);
+        }
         directWriteBytesWritten += bytesToWrite;
     }
     if (directWriteBytesWritten >= directWriteTotalBytes) {
@@ -1131,16 +1269,30 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
 
 void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     if (!directWriteActive) return;
+    directWriteStartTime = 0;
     if (directWriteCompressed && directWriteCompressedReceived > 0) decompressDirectWriteData();
     int refreshMode = REFRESH_FULL;
     if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
+    writeSerial(String("EPD refresh: ") + (refreshMode == REFRESH_FAST ? "FAST" : "FULL") + " (mode=" + String(refreshMode) +
+                ", end payload " + (data != nullptr && len > 0 ? ("0x" + String(data[0], HEX)) : String("none (auto)")) + ")",
+                true);
     uint8_t ackResponse[] = {0x00, 0x72};
     sendResponse(ackResponse, sizeof(ackResponse));
-    delay(100);
-    bbepRefresh(&bbep, refreshMode);
-    bool refreshSuccess = waitforrefresh(60);
-    bbepSleep(&bbep, 1);
-    delay(200);
+    delay(20);
+    bool refreshSuccess = false;
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        seeed_gfx_direct_refresh(refreshMode);
+        refreshSuccess = waitforrefresh(60);
+        seeed_gfx_direct_sleep();
+    } else
+#endif
+    {
+        bbepRefresh(&bbep, refreshMode);
+        refreshSuccess = waitforrefresh(60);
+        bbepSleep(&bbep, 1);
+    }
+    delay(50);
     cleanupDirectWriteState(false);
     if (refreshSuccess) {
         uint8_t refreshResponse[] = {0x00, 0x73};

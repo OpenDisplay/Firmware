@@ -14,8 +14,5 @@ void handleReadMSD();
 void handleReadConfig();
 void handleWriteConfig(uint8_t* data, uint16_t len);
 void handleWriteConfigChunk(uint8_t* data, uint16_t len);
-void sendConnectionNotification(uint8_t status);
-void sendDisplayAnnouncement();
-void sendImageRequest();
 
 #endif
