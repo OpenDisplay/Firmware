@@ -1,5 +1,6 @@
 #include "device_control.h"
 #include "structs.h"
+#include "touch_input.h"
 #include <string.h>
 
 #ifdef TARGET_NRF
@@ -317,6 +318,10 @@ void initButtons() {
         for (uint8_t pinIdx = 0; pinIdx < 8; pinIdx++) {
             uint8_t pin = *instancePins[pinIdx];
             if (pin == 0xFF) continue;
+            if (touch_input_gpio_is_touch_int(pin)) {
+                writeSerial("Button: skip pin " + String(pin) + " (reserved for GT911 INT)", true);
+                continue;
+            }
             if (buttonStateCount >= MAX_BUTTONS) break;
             ButtonState* btn = &buttonStates[buttonStateCount];
             btn->button_id = (input->instance_number * 8) + pinIdx;

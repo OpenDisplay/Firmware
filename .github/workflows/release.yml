@@ -50,6 +50,22 @@ jobs:
           cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
           cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
 
+      - name: Build & Package esp32-s3-N16R8-extuart Firmware
+        run: |
+          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
+          pioenv=esp32-s3-N16R8-extuart
+          pio run --environment ${pioenv}
+          mkdir ${pioenv}
+          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
+          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
+          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
+          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
+          cd ${pioenv}
+          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
+          cd ..
+          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
+          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+
       - name: Build & Package esp32-s3-N8R8 Firmware
         run: |
           export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"

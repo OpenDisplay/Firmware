@@ -79,7 +79,7 @@ void ble_nrf_advertising_start() {
     Bluefruit.Advertising.addName();
     updatemsdata();
     Bluefruit.Advertising.restartOnDisconnect(true);
-    Bluefruit.Advertising.setInterval(32, 200);
+    Bluefruit.Advertising.setInterval(256, 1600);
     Bluefruit.Advertising.setFastTimeout(10);
     writeSerial("Starting BLE advertising...");
     Bluefruit.Advertising.start(0);

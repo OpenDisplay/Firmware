@@ -3,15 +3,17 @@
 #include "config_parser.h"
 #include "encryption.h"
 #include "device_control.h"
-#include "device_control.h"
+#include "buzzer_control.h"
 #include "display_service.h"
 
 #include <Arduino.h>
 #include <string.h>
 
 #ifdef TARGET_ESP32
-#include <WiFiClient.h>
+#include <BLEServer.h>
 #include <WiFi.h>
+#include "wifi_service.h"
+extern BLEServer* pServer;
 #endif
 
 #ifdef TARGET_NRF
@@ -20,6 +22,19 @@
 
 void writeSerial(String message, bool newLine = true);
 bool isAuthenticated();
+
+static void reloadConfigAfterSave(void) {
+    if (!loadGlobalConfig()) {
+        writeSerial("WARNING: Config was saved but reload from storage failed (see errors above). "
+                    "Reboot may be required.");
+        return;
+    }
+    writeSerial("Config reloaded from storage after save");
+    clearEncryptionSession();
+#ifdef TARGET_ESP32
+    initWiFi();
+#endif
+}
 bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* ciphertext,
                     uint16_t* ciphertext_len, uint8_t* nonce, uint8_t* auth_tag);
 bool isEncryptionEnabled();
@@ -49,14 +64,42 @@ struct ResponseQueueItem {
 };
 extern WiFiClient wifiClient;
 extern bool wifiServerConnected;
-extern bool wifiImageRequestPending;
-extern uint32_t wifiNextImageRequestTime;
-extern uint32_t wifiPollInterval;
 extern ResponseQueueItem responseQueue[10];
 extern uint8_t responseQueueHead;
 extern uint8_t responseQueueTail;
 static constexpr uint8_t RESPONSE_QUEUE_SIZE_LOCAL = 10;
 static constexpr uint16_t MAX_RESPONSE_SIZE_LOCAL = 512;
+
+static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
+    if (!wifiServerConnected || !wifiClient.connected() || len == 0) {
+        return;
+    }
+    uint8_t hdr[2] = { (uint8_t)(len & 0xFF), (uint8_t)((len >> 8) & 0xFF) };
+    if (wifiClient.write(hdr, 2) != 2 || wifiClient.write(payload, len) != len) {
+        writeSerial("ERROR: LAN response write incomplete", true);
+    }
+}
+
+/** Mirror responses to BLE only when a central is connected; LAN already got send_wifi_lan_frame. */
+static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len) {
+    if (len > MAX_RESPONSE_SIZE_LOCAL) {
+        writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE_LOCAL) + ")", true);
+        return;
+    }
+    if (pServer == nullptr || pServer->getConnectedCount() == 0) {
+        return;
+    }
+    uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE_LOCAL;
+    if (nextHead == responseQueueTail) {
+        writeSerial("ERROR: Response queue full, dropping response", true);
+        return;
+    }
+    memcpy(responseQueue[responseQueueHead].data, response, len);
+    responseQueue[responseQueueHead].len = len;
+    responseQueue[responseQueueHead].pending = true;
+    responseQueueHead = nextHead;
+    writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE_LOCAL) % RESPONSE_QUEUE_SIZE_LOCAL) + ")", true);
+}
 #endif
 
 #ifdef TARGET_NRF
@@ -77,9 +120,6 @@ static constexpr uint8_t FIRMWARE_SHA_HEX_BYTES = 40;
 static const char kFirmwareShaPlaceholder[FIRMWARE_SHA_HEX_BYTES + 1] =
     "0000000000000000000000000000000000000000";
 
-#define TRANSMISSION_MODE_ZIP (1 << 1)
-#define MAX_IMAGE_SIZE (54 * 1024)
-
 void sendResponseUnencrypted(uint8_t* response, uint8_t len) {
     writeSerial("Sending unencrypted response (error/status):", true);
     writeSerial("  Length: " + String(len) + " bytes", true);
@@ -93,45 +133,8 @@ void sendResponseUnencrypted(uint8_t* response, uint8_t len) {
     if (len > 32) hexDump += " ...";
     writeSerial(hexDump, true);
 #ifdef TARGET_ESP32
-    if (wifiServerConnected && wifiClient.connected()) {
-        uint8_t tcpPacket[1024];
-        uint32_t pos = 0;
-        uint32_t lengthPos = pos;
-        pos += 2;
-        tcpPacket[pos++] = 0x01;
-        tcpPacket[pos++] = 0x00;
-        uint8_t responsePacketId = (len > 1) ? response[1] : 0x00;
-        tcpPacket[pos++] = responsePacketId;
-        memcpy(&tcpPacket[pos], response, len);
-        pos += len;
-        uint32_t dataLen = pos - 2;
-        uint16_t crc = calculateCRC16CCITT(&tcpPacket[2], dataLen);
-        tcpPacket[pos++] = crc & 0xFF;
-        tcpPacket[pos++] = (crc >> 8) & 0xFF;
-        uint16_t totalLength = pos;
-        tcpPacket[lengthPos] = totalLength & 0xFF;
-        tcpPacket[lengthPos + 1] = (totalLength >> 8) & 0xFF;
-        size_t bytesWritten = wifiClient.write(tcpPacket, pos);
-        if (bytesWritten == pos) {
-            writeSerial("TCP response sent (" + String(bytesWritten) + " bytes)", true);
-        } else {
-            writeSerial("ERROR: TCP response incomplete (expected " + String(pos) + ", wrote " + String(bytesWritten) + ")", true);
-        }
-    }
-    if (len <= MAX_RESPONSE_SIZE_LOCAL) {
-        uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE_LOCAL;
-        if (nextHead != responseQueueTail) {
-            memcpy(responseQueue[responseQueueHead].data, response, len);
-            responseQueue[responseQueueHead].len = len;
-            responseQueue[responseQueueHead].pending = true;
-            responseQueueHead = nextHead;
-            writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE_LOCAL) % RESPONSE_QUEUE_SIZE_LOCAL) + ")", true);
-        } else {
-            writeSerial("ERROR: Response queue full, dropping response", true);
-        }
-    } else {
-        writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE_LOCAL) + ")", true);
-    }
+    send_wifi_lan_frame(response, len);
+    esp32_queue_ble_notify_copy(response, len);
 #endif
 #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
@@ -145,7 +148,6 @@ void sendResponseUnencrypted(uint8_t* response, uint8_t len) {
         writeSerial(nrfHexDump, true);
         writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)", true);
         imageCharacteristic.notify(response, len);
-        delay(50);
     } else {
         writeSerial("ERROR: Cannot send BLE response - not connected or notifications not enabled", true);
         writeSerial("  Connected: " + String(Bluefruit.connected() ? "yes" : "no"), true);
@@ -159,6 +161,8 @@ void sendResponse(uint8_t* response, uint8_t len) {
     if (isAuthenticated() && len >= 2) {
         uint16_t command = (response[0] << 8) | response[1];
         uint8_t status = (len >= 3) ? response[2] : 0x00;
+        // Encrypt all authenticated responses except auth/version handshakes and FE/FF status.
+        // (0x0070–0x0074 direct-write/LED acks must be encrypted too — LAN/BLE clients decrypt every response.)
         if (command != 0x0050 && command != 0x0043 && status != 0xFE && status != 0xFF) {
             uint8_t nonce[16];
             uint8_t auth_tag[12];
@@ -192,45 +196,8 @@ void sendResponse(uint8_t* response, uint8_t len) {
     if (len > 32) hexDump += " ...";
     writeSerial(hexDump, true);
 #ifdef TARGET_ESP32
-    if (wifiServerConnected && wifiClient.connected()) {
-        uint8_t tcpPacket[1024];
-        uint32_t pos = 0;
-        uint32_t lengthPos = pos;
-        pos += 2;
-        tcpPacket[pos++] = 0x01;
-        tcpPacket[pos++] = 0x00;
-        uint8_t responsePacketId = (len > 1) ? response[1] : 0x00;
-        tcpPacket[pos++] = responsePacketId;
-        memcpy(&tcpPacket[pos], response, len);
-        pos += len;
-        uint32_t dataLen = pos - 2;
-        uint16_t crc = calculateCRC16CCITT(&tcpPacket[2], dataLen);
-        tcpPacket[pos++] = crc & 0xFF;
-        tcpPacket[pos++] = (crc >> 8) & 0xFF;
-        uint16_t totalLength = pos;
-        tcpPacket[lengthPos] = totalLength & 0xFF;
-        tcpPacket[lengthPos + 1] = (totalLength >> 8) & 0xFF;
-        size_t bytesWritten = wifiClient.write(tcpPacket, pos);
-        if (bytesWritten == pos) {
-            writeSerial("TCP response sent (" + String(bytesWritten) + " bytes)", true);
-        } else {
-            writeSerial("ERROR: TCP response incomplete (expected " + String(pos) + ", wrote " + String(bytesWritten) + ")", true);
-        }
-    }
-    if (len <= MAX_RESPONSE_SIZE_LOCAL) {
-        uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE_LOCAL;
-        if (nextHead != responseQueueTail) {
-            memcpy(responseQueue[responseQueueHead].data, response, len);
-            responseQueue[responseQueueHead].len = len;
-            responseQueue[responseQueueHead].pending = true;
-            responseQueueHead = nextHead;
-            writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE_LOCAL) % RESPONSE_QUEUE_SIZE_LOCAL) + ")", true);
-        } else {
-            writeSerial("ERROR: Response queue full, dropping response", true);
-        }
-    } else {
-        writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE_LOCAL) + ")", true);
-    }
+    send_wifi_lan_frame(response, len);
+    esp32_queue_ble_notify_copy(response, len);
 #endif
 #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
@@ -244,7 +211,7 @@ void sendResponse(uint8_t* response, uint8_t len) {
         writeSerial(nrfHexDump, true);
         writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)", true);
         imageCharacteristic.notify(response, len);
-        delay(50);
+        delay(20);
     } else {
         writeSerial("ERROR: Cannot send BLE response - not connected or notifications not enabled", true);
         writeSerial("  Connected: " + String(Bluefruit.connected() ? "yes" : "no"), true);
@@ -375,7 +342,11 @@ void handleReadConfig() {
             offset += chunkSize;
             remaining -= chunkSize;
             chunkNumber++;
+#ifdef TARGET_ESP32
+            delay(1);
+#else
             delay(50);
+#endif
         }
     } else {
         uint8_t errorResponse[] = {0xFF, 0x40, 0x00, 0x00};
@@ -420,7 +391,11 @@ void handleWriteConfig(uint8_t* data, uint16_t len) {
     }
     uint8_t responseOk[] = {0x00, 0x41, 0x00, 0x00};
     uint8_t responseErr[] = {0xFF, 0x41, 0x00, 0x00};
-    sendResponse(saveConfig(data, len) ? responseOk : responseErr, 4);
+    bool ok = saveConfig(data, len);
+    if (ok) {
+        reloadConfigAfterSave();
+    }
+    sendResponse(ok ? responseOk : responseErr, 4);
 }
 
 void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
@@ -451,7 +426,11 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
     if (chunkedWriteState.receivedChunks >= chunkedWriteState.expectedChunks) {
         uint8_t ok[] = {0x00, 0x42, 0x00, 0x00};
         uint8_t err[] = {0xFF, 0x42, 0x00, 0x00};
-        sendResponse(saveConfig(chunkedWriteState.buffer, chunkedWriteState.receivedSize) ? ok : err, 4);
+        bool saved = saveConfig(chunkedWriteState.buffer, chunkedWriteState.receivedSize);
+        if (saved) {
+            reloadConfigAfterSave();
+        }
+        sendResponse(saved ? ok : err, 4);
         chunkedWriteState.active = false;
         chunkedWriteState.receivedSize = 0;
         chunkedWriteState.receivedChunks = 0;
@@ -459,126 +438,6 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         uint8_t ackResponse[] = {0x00, 0x42, 0x00, 0x00};
         sendResponse(ackResponse, sizeof(ackResponse));
     }
-}
-
-void sendConnectionNotification(uint8_t status) {
-#ifdef TARGET_ESP32
-    if (!wifiClient.connected()) return;
-    String deviceName = "OD" + getChipIdHex();
-    uint32_t timestamp = millis() / 1000;
-    uint8_t packet[1024];
-    uint32_t pos = 0;
-    uint32_t lengthPos = pos;
-    pos += 2;
-    packet[pos++] = 0x01;
-    packet[pos++] = 0x00;
-    packet[pos++] = 0x27;
-    memset(&packet[pos], 0, 32);
-    uint8_t nameLen = deviceName.length();
-    if (nameLen > 31) nameLen = 31;
-    memcpy(&packet[pos], deviceName.c_str(), nameLen);
-    pos += 32;
-    packet[pos++] = getFirmwareMajor();
-    packet[pos++] = getFirmwareMinor();
-    packet[pos++] = status;
-    packet[pos++] = timestamp & 0xFF;
-    packet[pos++] = (timestamp >> 8) & 0xFF;
-    packet[pos++] = (timestamp >> 16) & 0xFF;
-    packet[pos++] = (timestamp >> 24) & 0xFF;
-    memset(&packet[pos], 0, 25);
-    pos += 25;
-    uint32_t dataLen = pos - 2;
-    uint16_t crc = calculateCRC16CCITT(&packet[2], dataLen);
-    packet[pos++] = crc & 0xFF;
-    packet[pos++] = (crc >> 8) & 0xFF;
-    uint16_t totalLength = pos;
-    packet[lengthPos] = totalLength & 0xFF;
-    packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
-    wifiClient.write(packet, pos);
-#else
-    (void)status;
-#endif
-}
-
-void sendDisplayAnnouncement() {
-#ifdef TARGET_ESP32
-    if (!wifiClient.connected()) return;
-    uint8_t packet[1024];
-    uint32_t pos = 0;
-    uint32_t lengthPos = pos;
-    pos += 2;
-    packet[pos++] = 0x01;
-    packet[pos++] = 0x00;
-    packet[pos++] = 0x01;
-    packet[pos++] = 0x01;
-    uint16_t width = globalConfig.displays[0].pixel_width;
-    packet[pos++] = width & 0xFF;
-    packet[pos++] = (width >> 8) & 0xFF;
-    uint16_t height = globalConfig.displays[0].pixel_height;
-    packet[pos++] = height & 0xFF;
-    packet[pos++] = (height >> 8) & 0xFF;
-    packet[pos++] = globalConfig.displays[0].color_scheme;
-    uint16_t firmwareId = 0x0001;
-    packet[pos++] = firmwareId & 0xFF;
-    packet[pos++] = (firmwareId >> 8) & 0xFF;
-    uint16_t firmwareVersion = (getFirmwareMajor() << 8) | getFirmwareMinor();
-    packet[pos++] = firmwareVersion & 0xFF;
-    packet[pos++] = (firmwareVersion >> 8) & 0xFF;
-    uint16_t manufacturerId = globalConfig.manufacturer_data.manufacturer_id;
-    packet[pos++] = manufacturerId & 0xFF;
-    packet[pos++] = (manufacturerId >> 8) & 0xFF;
-    uint16_t modelId = 0x0001;
-    packet[pos++] = modelId & 0xFF;
-    packet[pos++] = (modelId >> 8) & 0xFF;
-    uint16_t maxCompressedSize = (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_ZIP) ? MAX_IMAGE_SIZE : 0;
-    packet[pos++] = maxCompressedSize & 0xFF;
-    packet[pos++] = (maxCompressedSize >> 8) & 0xFF;
-    uint8_t rotation = globalConfig.displays[0].rotation;
-    if (rotation > 3) rotation = 0;
-    packet[pos++] = rotation;
-    uint32_t dataLen = pos - 2;
-    uint16_t crc = calculateCRC16CCITT(&packet[2], dataLen);
-    packet[pos++] = crc & 0xFF;
-    packet[pos++] = (crc >> 8) & 0xFF;
-    uint16_t totalLength = pos;
-    packet[lengthPos] = totalLength & 0xFF;
-    packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
-    wifiClient.write(packet, pos);
-#endif
-}
-
-void sendImageRequest() {
-#ifdef TARGET_ESP32
-    if (!wifiClient.connected()) return;
-    wifiImageRequestPending = true;
-    wifiNextImageRequestTime = millis() + (wifiPollInterval * 1000);
-    uint8_t packet[1024];
-    uint32_t pos = 0;
-    uint32_t lengthPos = pos;
-    pos += 2;
-    packet[pos++] = 0x01;
-    packet[pos++] = 0x00;
-    packet[pos++] = 0x02;
-    packet[pos++] = 0x02;
-    float batteryVoltage = readBatteryVoltage();
-    uint8_t batteryPercent = 0xFF;
-    if (batteryVoltage > 0) {
-        if (batteryVoltage >= 4.2) batteryPercent = 100;
-        else if (batteryVoltage >= 3.0) batteryPercent = (uint8_t)(((batteryVoltage - 3.0) / 1.2) * 100);
-        else batteryPercent = 0;
-    }
-    packet[pos++] = batteryPercent;
-    int8_t rssi = (int8_t)WiFi.RSSI();
-    packet[pos++] = (uint8_t)rssi;
-    uint32_t dataLen = pos - 2;
-    uint16_t crc = calculateCRC16CCITT(&packet[2], dataLen);
-    packet[pos++] = crc & 0xFF;
-    packet[pos++] = (crc >> 8) & 0xFF;
-    uint16_t totalLength = pos;
-    packet[lengthPos] = totalLength & 0xFF;
-    packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
-    wifiClient.write(packet, pos);
-#endif
 }
 
 #ifdef TARGET_NRF
@@ -706,6 +565,10 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         case 0x0073:
             writeSerial("=== LED ACTIVATE COMMAND (0x0073) ===");
             handleLedActivate(data + 2, len - 2);
+            break;
+        case 0x0075:
+            writeSerial("=== BUZZER ACTIVATE COMMAND (0x0075) ===");
+            handleBuzzerActivate(data + 2, len - 2);
             break;
         case 0x0051:
             writeSerial("=== ENTER DFU MODE COMMAND (0x0051) ===");

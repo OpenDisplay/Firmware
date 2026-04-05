@@ -1,0 +1,12 @@
+{
+  "name": "Seeed_GFX",
+  "version": "2.0.3",
+  "description": "Vendored Seeed fork of TFT_eSPI (OpenDisplay runtime pins + BOARD_SCREEN_COMBO 528)",
+  "keywords": ["display", "epaper", "tft"],
+  "authors": [{ "name": "Seeed / Bodmer fork" }],
+  "frameworks": ["arduino"],
+  "platforms": "*",
+  "build": {
+    "includeDir": "."
+  }
+}

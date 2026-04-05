@@ -1,5 +1,7 @@
 #include "config_parser.h"
 #include "structs.h"
+
+static_assert(sizeof(struct WifiConfig) == 160, "wifi_config must match config.yaml (32+32+1+95)");
 #include "encryption_state.h"
 #include "encryption.h"
 #include <Arduino.h>
@@ -25,14 +27,6 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_XIAOINIT (1 << 1)
 #define DEVICE_FLAG_WS_PP_INIT (1 << 2)
 #endif
-#ifndef TRANSMISSION_MODE_RAW
-#define TRANSMISSION_MODE_RAW (1 << 0)
-#define TRANSMISSION_MODE_ZIP (1 << 1)
-#define TRANSMISSION_MODE_G5 (1 << 2)
-#define TRANSMISSION_MODE_DIRECT_WRITE (1 << 3)
-#define TRANSMISSION_MODE_CLEAR_ON_BOOT (1 << 7)
-#endif
-
 void writeSerial(String message, bool newLine = true);
 
 extern struct GlobalConfig globalConfig;
@@ -323,122 +317,136 @@ bool loadGlobalConfig(){
                     return false;
                 }
                 break;
-            case 0x26: // wifi_config
+            case 0x28: // touch_controller
+                if (globalConfig.touch_controller_count < 4 && offset + sizeof(struct TouchController) <= configLen - 2) {
+                    memcpy(&globalConfig.touch_controllers[globalConfig.touch_controller_count], &configData[offset], sizeof(struct TouchController));
+                    offset += sizeof(struct TouchController);
+                    globalConfig.touch_controller_count++;
+                } else if (globalConfig.touch_controller_count >= 4) {
+                    writeSerial("WARNING: Maximum touch_controller count reached, skipping");
+                    offset += sizeof(struct TouchController);
+                } else {
+                    writeSerial("ERROR: Not enough data for touch_controller");
+                    globalConfig.loaded = false;
+                    return false;
+                }
+                break;
+            case 0x29: // passive_buzzer
+                if (globalConfig.passive_buzzer_count < 4 && offset + sizeof(struct PassiveBuzzerConfig) <= configLen - 2) {
+                    memcpy(&globalConfig.passive_buzzers[globalConfig.passive_buzzer_count], &configData[offset], sizeof(struct PassiveBuzzerConfig));
+                    offset += sizeof(struct PassiveBuzzerConfig);
+                    globalConfig.passive_buzzer_count++;
+                } else if (globalConfig.passive_buzzer_count >= 4) {
+                    writeSerial("WARNING: Maximum passive_buzzer count reached, skipping");
+                    offset += sizeof(struct PassiveBuzzerConfig);
+                } else {
+                    writeSerial("ERROR: Not enough data for passive_buzzer");
+                    globalConfig.loaded = false;
+                    return false;
+                }
+                break;
+            case 0x26: // wifi_config (see struct WifiConfig)
                 {
-                    const uint16_t WIFI_CONFIG_SIZE = 162;
-                    if (offset + WIFI_CONFIG_SIZE <= configLen) {
-                        memcpy(wifiSsid, &configData[offset], 32);
-                        wifiSsid[32] = '\0';  // Ensure null termination
-                        uint8_t ssidLen = 0;
-                        while (ssidLen < 32 && wifiSsid[ssidLen] != '\0') ssidLen++;
-                        offset += 32;
-                        memcpy(wifiPassword, &configData[offset], 32);
-                        wifiPassword[32] = '\0';  // Ensure null termination
-                        uint8_t passwordLen = 0;
-                        while (passwordLen < 32 && wifiPassword[passwordLen] != '\0') passwordLen++;
-                        offset += 32;
-                        wifiEncryptionType = configData[offset++];
-                        #ifdef TARGET_ESP32
-                        // Parse server configuration from reserved bytes
-                        // First, read as string (like SSID)
-                        memcpy(wifiServerUrl, &configData[offset], 64);
-                        wifiServerUrl[64] = '\0';  // Ensure null termination
-                        
-                        // Check if it's stored as a string (has null terminator in first few bytes)
-                        // or as a 4-byte IP address (numeric format from config tool)
-                        bool isStringFormat = false;
-                        for (int i = 0; i < 64; i++) {
-                            if (wifiServerUrl[i] == '\0') {
-                                isStringFormat = true;
-                                break;
-                            }
-                            // If we find a non-printable character (except null), it's likely binary
-                            if (i > 0 && wifiServerUrl[i] < 32 && wifiServerUrl[i] != '\0') {
-                                break;
-                            }
-                        }
-                        
-                        // If first 4 bytes look like an IP address in numeric format (little-endian)
-                        // and there's no null terminator in first 5 bytes, convert to IP string
-                        // Check if bytes 0-3 are non-zero and byte 4 is null (indicating 4-byte format)
-                        if (!isStringFormat && wifiServerUrl[4] == '\0' && 
-                            (wifiServerUrl[0] != 0 || wifiServerUrl[1] != 0 || 
-                             wifiServerUrl[2] != 0 || wifiServerUrl[3] != 0)) {
-                            // The config tool stores IP as 32-bit integer in little-endian format
-                            // Bytes are: [byte0][byte1][byte2][byte3] = IP address
-                            // Convert 4-byte IP (stored as little-endian) to string format
-                            uint8_t ip[4];
-                            ip[0] = configData[offset];
-                            ip[1] = configData[offset + 1];
-                            ip[2] = configData[offset + 2];
-                            ip[3] = configData[offset + 3];
-                            snprintf(wifiServerUrl, 65, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-                            writeSerial("Converted numeric IP to string: \"" + String(wifiServerUrl) + "\"");
-                        } else if (!isStringFormat && wifiServerUrl[0] != '\0') {
-                            // Try to interpret as 32-bit integer (little-endian) and convert to IP
-                            uint32_t ipNum = (uint32_t)configData[offset] | 
-                                            ((uint32_t)configData[offset + 1] << 8) |
-                                            ((uint32_t)configData[offset + 2] << 16) |
-                                            ((uint32_t)configData[offset + 3] << 24);
-                            // Convert to IP string (interpret as big-endian IP address)
-                            uint8_t ip[4];
-                            ip[0] = (ipNum >> 24) & 0xFF;
-                            ip[1] = (ipNum >> 16) & 0xFF;
-                            ip[2] = (ipNum >> 8) & 0xFF;
-                            ip[3] = ipNum & 0xFF;
-                            snprintf(wifiServerUrl, 65, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-                            writeSerial("Converted 32-bit integer to IP string: \"" + String(wifiServerUrl) + "\"");
-                        }
-                        
-                        offset += 64;
-                        // Read port (2 bytes, network byte order)
-                        wifiServerPort = (configData[offset] << 8) | configData[offset + 1];
-                        offset += 2;
-                        
-                        // Check if server is configured (URL not empty and not "0.0.0.0")
-                        wifiServerConfigured = (wifiServerUrl[0] != '\0' && 
-                                               strcmp(wifiServerUrl, "0.0.0.0") != 0);
-                        if (wifiServerConfigured) {
-                            writeSerial("Server configured: YES");
-                            writeSerial("Server URL: \"" + String(wifiServerUrl) + "\"");
-                            writeSerial("Server Port: " + String(wifiServerPort));
-                        } else {
-                            writeSerial("Server configured: NO");
-                            if (wifiServerUrl[0] == '\0') {
-                                writeSerial("Reason: URL is empty");
-                            } else if (strcmp(wifiServerUrl, "0.0.0.0") == 0) {
-                                writeSerial("Reason: URL is \"0.0.0.0\"");
-                            }
-                        }
-                        offset += 29;  // Skip remaining reserved bytes
-                        #else
-                        offset += 95;  // Skip all reserved bytes on non-ESP32
-                        #endif
-                        wifiConfigured = true;
-                        writeSerial("=== WiFi Configuration Loaded ===");
-                        writeSerial("SSID: \"" + String(wifiSsid) + "\"");
-                        if (passwordLen > 0) {
-                            writeSerial("Password: \"" + String(wifiPassword) + "\"");
-                        } else {
-                            writeSerial("Password: (empty)");
-                        }
-                        String encTypeStr = "Unknown";
-                        switch(wifiEncryptionType) {
-                            case 0x00: encTypeStr = "None (Open)"; break;
-                            case 0x01: encTypeStr = "WEP"; break;
-                            case 0x02: encTypeStr = "WPA"; break;
-                            case 0x03: encTypeStr = "WPA2"; break;
-                            case 0x04: encTypeStr = "WPA3"; break;
-                        }
-                        writeSerial("Encryption Type: 0x" + String(wifiEncryptionType, HEX) + " (" + encTypeStr + ")");
-                        writeSerial("SSID length: " + String(ssidLen) + " bytes");
-                        writeSerial("Password length: " + String(passwordLen) + " bytes");
-                        writeSerial("WiFi configured: true");
-                    } else {
+                    if (offset + sizeof(struct WifiConfig) > configLen - 2) {
                         writeSerial("ERROR: Not enough data for wifi_config");
                         globalConfig.loaded = false;
                         return false;
                     }
+                    struct WifiConfig wc;
+                    memcpy(&wc, &configData[offset], sizeof(wc));
+                    offset += sizeof(wc);
+
+                    memcpy(wifiSsid, wc.ssid, sizeof(wc.ssid));
+                    wifiSsid[32] = '\0';
+                    uint8_t ssidLen = 0;
+                    while (ssidLen < 32 && wifiSsid[ssidLen] != '\0') ssidLen++;
+
+                    memcpy(wifiPassword, wc.password, sizeof(wc.password));
+                    wifiPassword[32] = '\0';
+                    uint8_t passwordLen = 0;
+                    while (passwordLen < 32 && wifiPassword[passwordLen] != '\0') passwordLen++;
+
+                    wifiEncryptionType = wc.encryption_type;
+
+#ifdef TARGET_ESP32
+                    memcpy(wifiServerUrl, wc.reserved, 64);
+                    wifiServerUrl[64] = '\0';
+
+                    bool isStringFormat = false;
+                    for (int i = 0; i < 64; i++) {
+                        if (wifiServerUrl[i] == '\0') {
+                            isStringFormat = true;
+                            break;
+                        }
+                        if (i > 0 && wifiServerUrl[i] < 32 && wifiServerUrl[i] != '\0') {
+                            break;
+                        }
+                    }
+
+                    if (!isStringFormat && wifiServerUrl[4] == '\0' &&
+                        (wifiServerUrl[0] != 0 || wifiServerUrl[1] != 0 ||
+                         wifiServerUrl[2] != 0 || wifiServerUrl[3] != 0)) {
+                        uint8_t ip[4];
+                        ip[0] = wc.reserved[0];
+                        ip[1] = wc.reserved[1];
+                        ip[2] = wc.reserved[2];
+                        ip[3] = wc.reserved[3];
+                        snprintf(wifiServerUrl, 65, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+                        writeSerial("Converted numeric IP to string: \"" + String(wifiServerUrl) + "\"");
+                    } else if (!isStringFormat && wifiServerUrl[0] != '\0') {
+                        uint32_t ipNum = (uint32_t)wc.reserved[0] |
+                                        ((uint32_t)wc.reserved[1] << 8) |
+                                        ((uint32_t)wc.reserved[2] << 16) |
+                                        ((uint32_t)wc.reserved[3] << 24);
+                        uint8_t ip[4];
+                        ip[0] = (ipNum >> 24) & 0xFF;
+                        ip[1] = (ipNum >> 16) & 0xFF;
+                        ip[2] = (ipNum >> 8) & 0xFF;
+                        ip[3] = ipNum & 0xFF;
+                        snprintf(wifiServerUrl, 65, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+                        writeSerial("Converted 32-bit integer to IP string: \"" + String(wifiServerUrl) + "\"");
+                    }
+
+                    wifiServerPort = (uint16_t)(((uint16_t)wc.reserved[64] << 8) | wc.reserved[65]);
+                    if (wifiServerPort == 0) {
+                        wifiServerPort = 2446;
+                    }
+
+                    wifiServerConfigured = (wifiServerUrl[0] != '\0' &&
+                                           strcmp(wifiServerUrl, "0.0.0.0") != 0);
+                    if (wifiServerConfigured) {
+                        writeSerial("Server configured: YES");
+                        writeSerial("Server URL: \"" + String(wifiServerUrl) + "\"");
+                        writeSerial("Server Port: " + String(wifiServerPort));
+                    } else {
+                        writeSerial("Server configured: NO");
+                        if (wifiServerUrl[0] == '\0') {
+                            writeSerial("Reason: URL is empty");
+                        } else if (strcmp(wifiServerUrl, "0.0.0.0") == 0) {
+                            writeSerial("Reason: URL is \"0.0.0.0\"");
+                        }
+                    }
+#endif
+                    wifiConfigured = true;
+                    writeSerial("=== WiFi Configuration Loaded ===");
+                    writeSerial("SSID: \"" + String(wifiSsid) + "\"");
+                    if (passwordLen > 0) {
+                        writeSerial("Password: \"" + String(wifiPassword) + "\"");
+                    } else {
+                        writeSerial("Password: (empty)");
+                    }
+                    String encTypeStr = "Unknown";
+                    switch (wifiEncryptionType) {
+                        case 0x00: encTypeStr = "None (Open)"; break;
+                        case 0x01: encTypeStr = "WEP"; break;
+                        case 0x02: encTypeStr = "WPA"; break;
+                        case 0x03: encTypeStr = "WPA2"; break;
+                        case 0x04: encTypeStr = "WPA3"; break;
+                    }
+                    writeSerial("Encryption Type: 0x" + String(wifiEncryptionType, HEX) + " (" + encTypeStr + ")");
+                    writeSerial("SSID length: " + String(ssidLen) + " bytes");
+                    writeSerial("Password length: " + String(passwordLen) + " bytes");
+                    writeSerial("WiFi configured: true");
                 }
                 break;
             case 0x27: // security_config
@@ -544,6 +552,8 @@ void printConfigSummary(){
     #endif
     writeSerial("  WS_PP_INIT flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_WS_PP_INIT) ? "enabled" : "disabled"));
     writeSerial("Power Pin: " + String(globalConfig.system_config.pwr_pin));
+    writeSerial("Power Pin 2: " + String(globalConfig.system_config.pwr_pin_2));
+    writeSerial("Power Pin 3: " + String(globalConfig.system_config.pwr_pin_3));
     writeSerial("");
     writeSerial("--- Manufacturer Data ---");
     writeSerial("Manufacturer ID: 0x" + String(globalConfig.manufacturer_data.manufacturer_id, HEX));
@@ -584,11 +594,12 @@ void printConfigSummary(){
         writeSerial("  Partial Update: " + String(globalConfig.displays[i].partial_update_support ? "Yes" : "No"));
         writeSerial("  Color Scheme: 0x" + String(globalConfig.displays[i].color_scheme, HEX));
         writeSerial("  Transmission Modes: 0x" + String(globalConfig.displays[i].transmission_modes, HEX));
-        writeSerial("    RAW: " + String((globalConfig.displays[i].transmission_modes & TRANSMISSION_MODE_RAW) ? "enabled" : "disabled"));
+        writeSerial("    ZIPXL: " + String((globalConfig.displays[i].transmission_modes & TRANSMISSION_MODE_ZIPXL) ? "enabled" : "disabled"));
         writeSerial("    ZIP: " + String((globalConfig.displays[i].transmission_modes & TRANSMISSION_MODE_ZIP) ? "enabled" : "disabled"));
         writeSerial("    G5: " + String((globalConfig.displays[i].transmission_modes & TRANSMISSION_MODE_G5) ? "enabled" : "disabled"));
         writeSerial("    DIRECT_WRITE: " + String((globalConfig.displays[i].transmission_modes & TRANSMISSION_MODE_DIRECT_WRITE) ? "enabled" : "disabled"));
         writeSerial("    CLEAR_ON_BOOT: " + String((globalConfig.displays[i].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT) ? "enabled" : "disabled"));
+        writeSerial("  Full update energy (mC): " + String(globalConfig.displays[i].full_update_mC));
         writeSerial("");
     }
     writeSerial("--- LED Configurations (" + String(globalConfig.led_count) + ") ---");
@@ -609,6 +620,7 @@ void printConfigSummary(){
         writeSerial("  Instance: " + String(globalConfig.sensors[i].instance_number));
         writeSerial("  Type: 0x" + String(globalConfig.sensors[i].sensor_type, HEX));
         writeSerial("  Bus ID: " + String(globalConfig.sensors[i].bus_id));
+        writeSerial("  I2C addr (7-bit) / MSD data start byte: " + String(globalConfig.sensors[i].i2c_addr_7bit) + " / " + String(globalConfig.sensors[i].msd_data_start_byte));
         writeSerial("");
     }
     writeSerial("--- Data Bus Configurations (" + String(globalConfig.data_bus_count) + ") ---");
@@ -647,6 +659,28 @@ void printConfigSummary(){
         writeSerial("  Invert: 0x" + String(globalConfig.binary_inputs[i].invert, HEX));
         writeSerial("  Pullups: 0x" + String(globalConfig.binary_inputs[i].pullups, HEX));
         writeSerial("  Pulldowns: 0x" + String(globalConfig.binary_inputs[i].pulldowns, HEX));
+        writeSerial("");
+    }
+    writeSerial("--- Touch Controllers (" + String(globalConfig.touch_controller_count) + ") ---");
+    for (int i = 0; i < globalConfig.touch_controller_count; i++) {
+        writeSerial("Touch " + String(i) + ":");
+        writeSerial("  Instance: " + String(globalConfig.touch_controllers[i].instance_number));
+        writeSerial("  IC type: " + String(globalConfig.touch_controllers[i].touch_ic_type));
+        writeSerial("  Bus ID: " + String(globalConfig.touch_controllers[i].bus_id));
+        writeSerial("  I2C addr (7-bit): 0x" + String(globalConfig.touch_controllers[i].i2c_addr_7bit, HEX));
+        writeSerial("  INT/RST pins: " + String(globalConfig.touch_controllers[i].int_pin) + " / " + String(globalConfig.touch_controllers[i].rst_pin));
+        writeSerial("  Display instance: " + String(globalConfig.touch_controllers[i].display_instance));
+        writeSerial("  Flags: 0x" + String(globalConfig.touch_controllers[i].flags, HEX));
+        writeSerial("  Poll ms / MSD start byte: " + String(globalConfig.touch_controllers[i].poll_interval_ms) + " / " + String(globalConfig.touch_controllers[i].touch_data_start_byte));
+        writeSerial("");
+    }
+    writeSerial("--- Passive buzzers (" + String(globalConfig.passive_buzzer_count) + ") ---");
+    for (int i = 0; i < globalConfig.passive_buzzer_count; i++) {
+        writeSerial("Buzzer " + String(i) + ":");
+        writeSerial("  Instance: " + String(globalConfig.passive_buzzers[i].instance_number));
+        writeSerial("  Drive / enable pin: " + String(globalConfig.passive_buzzers[i].drive_pin) + " / " + String(globalConfig.passive_buzzers[i].enable_pin));
+        writeSerial("  Flags: 0x" + String(globalConfig.passive_buzzers[i].flags, HEX));
+        writeSerial("  Duty %: " + String(globalConfig.passive_buzzers[i].duty_percent));
         writeSerial("");
     }
     writeSerial("=============================");

@@ -1,15 +1,54 @@
 #include "main.h"
+#ifdef TARGET_ESP32
+#include <esp_heap_caps.h>
+#endif
 #include "boot_screen.h"
 #include "communication.h"
 #include "device_control.h"
 #include "display_service.h"
+#include "touch_input.h"
 #include "encryption.h"
 
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
+#include <HardwareSerial.h>
+#ifndef OPENDISPLAY_LOG_UART_RX
+#define OPENDISPLAY_LOG_UART_RX 44
+#endif
+#ifndef OPENDISPLAY_LOG_UART_TX
+#define OPENDISPLAY_LOG_UART_TX 43
+#endif
+static HardwareSerial LogSerialPort(1);
+#endif
+
+#if defined(TARGET_NRF)
+static uint8_t s_compressedDataStorage[MAX_COMPRESSED_BUFFER_BYTES];
+uint8_t* compressedDataBuffer = s_compressedDataStorage;
+#elif defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY) && defined(BOARD_HAS_PSRAM)
+uint8_t* compressedDataBuffer = nullptr;
+#else
+static uint8_t s_compressedDataStorage[MAX_COMPRESSED_BUFFER_BYTES];
+uint8_t* compressedDataBuffer = s_compressedDataStorage;
+#endif
+
+void allocCompressedDataBuffer(void) {
+#if defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY) && defined(BOARD_HAS_PSRAM)
+    if (compressedDataBuffer) return;
+    compressedDataBuffer = (uint8_t*)heap_caps_malloc(MAX_COMPRESSED_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!compressedDataBuffer) {
+        compressedDataBuffer = (uint8_t*)heap_caps_malloc(MAX_COMPRESSED_BUFFER_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+#endif
+}
+
 void setup() {
-    #ifndef DISABLE_USB_SERIAL
+    #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
+    LogSerialPort.begin(115200, SERIAL_8N1, OPENDISPLAY_LOG_UART_RX, OPENDISPLAY_LOG_UART_TX);
+    delay(100);
+    #elif !defined(DISABLE_USB_SERIAL)
     Serial.begin(115200);
     delay(100);
     #endif
+    allocCompressedDataBuffer();
     writeSerial("=== FIRMWARE INFO ===");
     writeSerial("Firmware Version: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()));
     const char* shaCStr = SHA_STRING;
@@ -53,17 +92,33 @@ void setup() {
 #elif defined(TARGET_NRF)
     ble_nrf_advertising_start();
 #endif
-    writeSerial("BLE advertising started - waiting for connections...");
     #ifdef TARGET_ESP32
     initWiFi();
     #endif
     updatemsdata();
     initButtons();
+    initTouchInput();
     writeSerial("=== Setup completed successfully ===");
 }
 
 void loop() {
     #ifdef TARGET_ESP32
+    handleWiFiServer();
+    static uint32_t lastWiFiCheck = 0;
+    if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
+            wifiConnected = false;
+            if (wifiServerConnected) {
+                disconnectWiFiServer();
+            }
+        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
+            wifiConnected = true;
+            restartWiFiLanAfterReconnect();
+        }
+    }
     if (woke_from_deep_sleep && advertising_timeout_active) {
         if (pServer && pServer->getConnectedCount() > 0) {
             writeSerial("BLE connection established - switching to full mode");
@@ -92,67 +147,37 @@ void loop() {
         commandQueueTail = (commandQueueTail + 1) % COMMAND_QUEUE_SIZE;
         writeSerial("Command processed");
     }
-    if (responseQueueTail != responseQueueHead && pTxCharacteristic && pServer && pServer->getConnectedCount() > 0) {
-        writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
-        pTxCharacteristic->setValue(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
-        pTxCharacteristic->notify();
-        responseQueue[responseQueueTail].pending = false;
-        responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
-        writeSerial("Response sent successfully");
+    if (pTxCharacteristic && pServer && pServer->getConnectedCount() > 0) {
+        uint8_t bleDrain = 0;
+        while (responseQueueTail != responseQueueHead && bleDrain < 16) {
+            writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
+            pTxCharacteristic->setValue(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
+            pTxCharacteristic->notify();
+            responseQueue[responseQueueTail].pending = false;
+            responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
+            writeSerial("Response sent successfully");
+            bleDrain++;
+        }
     }
     if (directWriteActive && directWriteStartTime > 0) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
-        if (directWriteDuration > 120000) {  // 120 second timeout
+        if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
             writeSerial("ERROR: Direct write timeout (" + String(directWriteDuration) + " ms) - cleaning up stuck state");
             cleanupDirectWriteState(true);
         }
     }
     #ifdef TARGET_ESP32
-    handleWiFiServer();
-    if (wifiServerConnected && wifiClient.connected() && !wifiImageRequestPending) {
-        uint32_t now = millis();
-        bool timeToSend = false;
-        if (wifiNextImageRequestTime == 0) {
-            timeToSend = true;  // Send immediately
-        } else if (now >= wifiNextImageRequestTime) {
-            timeToSend = true;  // Time has come
-        } else if ((wifiNextImageRequestTime - now) > 0x7FFFFFFF) {
-            timeToSend = true;  // millis() overflow detected (wifiNextImageRequestTime is in the past)
-        }
-        if (timeToSend) {
-            writeSerial("Sending scheduled Image Request (poll_interval=" + String(wifiPollInterval) + "s)");
-            sendImageRequest();
-        }
-    }
-    static uint32_t lastWiFiCheck = 0;
-    if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
-        lastWiFiCheck = millis();
-        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
-            wifiConnected = false;
-            if (wifiServerConnected) {
-                disconnectWiFiServer();
-            }
-        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
-            wifiConnected = true;
-            // Reinitialize mDNS on reconnection
-            String deviceName = "OD" + getChipIdHex();
-            if (MDNS.begin(deviceName.c_str())) {
-                writeSerial("mDNS responder restarted: " + deviceName + ".local");
-            } else {
-                writeSerial("ERROR: Failed to restart mDNS responder");
-            }
-            // Attempt to reconnect to server via mDNS
-            discoverAndConnectWiFiServer();
-        }
-    }
+    const bool wifiLanSession = wifiInitialized && wifiServerConnected && wifiClient.connected();
+    #else
+    const bool wifiLanSession = false;
     #endif
-    bool bleActive = (commandQueueTail != commandQueueHead) || 
+    bool bleActive = (commandQueueTail != commandQueueHead) ||
                      (responseQueueTail != responseQueueHead) ||
-                     (pServer && pServer->getConnectedCount() > 0);
+                     (pServer && pServer->getConnectedCount() > 0) ||
+                     wifiLanSession;
     if (bleActive) {
-      // Check for button events in fast loop
+        processButtonEvents();
+        processTouchInput();
         delay(1);
     } else {
         if (!woke_from_deep_sleep && deep_sleep_count == 0 && globalConfig.power_option.power_mode == 1) {
@@ -177,6 +202,7 @@ void loop() {
         }
         updatemsdata();
         processButtonEvents();
+        processTouchInput();
         if(!bleActive)writeSerial("Loop end: " + String(millis() / 100));
     }
     #else
@@ -187,6 +213,8 @@ void loop() {
     else{
         idleDelay(500);
     }
+    processButtonEvents();
+    processTouchInput();
     writeSerial("Loop end: " + String(millis() / 100));
     #endif
 }
@@ -198,6 +226,7 @@ void idleDelay(uint32_t delayMs) {
     uint32_t remainingDelay = delayMs;
     while (remainingDelay > 0) {
         processButtonEvents();
+        processTouchInput();
         uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
         delay(chunkDelay);
         remainingDelay -= chunkDelay;
@@ -210,10 +239,12 @@ uint8_t pinToButtonIndex[64] = {0xFF};  // Map pin number to button index (max 6
 
 #ifdef TARGET_ESP32
 void minimalSetup() {
+    allocCompressedDataBuffer();
     writeSerial("=== Minimal Setup (Deep Sleep Wake) ===");
     full_config_init();
     initio();
     ble_init_esp32(true); // Update manufacturer data
+    initWiFi(false);
     writeSerial("=== BLE advertising started (minimal mode) ===");
     writeSerial("Advertising for 10 seconds, waiting for connection...");
     advertising_timeout_active = true;
@@ -222,10 +253,19 @@ void minimalSetup() {
 
 void fullSetupAfterConnection() {
     writeSerial("=== Full Setup After Connection ===");
-    memset(&bbep, 0, sizeof(BBEPDISP));
-    int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
-    writeSerial("Panel type: " + String(panelType));
-    bbepSetPanelType(&bbep, panelType);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (globalConfig.display_count > 0 && seeed_driver_used()) {
+        writeSerial("Panel: Seeed ED103 (bb_epaper not used)", true);
+        writeSerial("=== Full setup completed ===");
+        return;
+    }
+#endif
+    if (globalConfig.display_count > 0) {
+        memset(&bbep, 0, sizeof(BBEPDISP));
+        int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
+        writeSerial("Panel type: " + String(panelType));
+        bbepSetPanelType(&bbep, panelType);
+    }
     writeSerial("=== Full setup completed ===");
 }
 
@@ -268,7 +308,7 @@ void pwrmgm(bool onoff){
     uint8_t axp2101_bus_id = 0xFF;
     bool axp2101_found = false;
     for(uint8_t i = 0; i < globalConfig.sensor_count; i++){
-        if(globalConfig.sensors[i].sensor_type == 0x0003){
+        if(globalConfig.sensors[i].sensor_type == SENSOR_TYPE_AXP2101){
             axp2101_bus_id = globalConfig.sensors[i].bus_id;
             axp2101_found = true;
             break;
@@ -289,22 +329,40 @@ void pwrmgm(bool onoff){
             digitalWrite(48, HIGH);
         }
     }
-    if(onoff){
-        pinMode(globalConfig.displays[0].reset_pin, OUTPUT);
-        pinMode(globalConfig.displays[0].cs_pin, OUTPUT);
-        pinMode(globalConfig.displays[0].dc_pin, OUTPUT);
-        pinMode(globalConfig.displays[0].clk_pin, OUTPUT);
-        pinMode(globalConfig.displays[0].data_pin, OUTPUT);
-        delay(200);
-    }
-    else{
-        SPI.end();
-        Wire.end();
-        pinMode(globalConfig.displays[0].reset_pin, INPUT);
-        pinMode(globalConfig.displays[0].cs_pin, INPUT);
-        pinMode(globalConfig.displays[0].dc_pin, INPUT);
-        pinMode(globalConfig.displays[0].clk_pin, INPUT);
-        pinMode(globalConfig.displays[0].data_pin, INPUT);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    const bool seeed_driver_spi = seeed_driver_used();
+#else
+    const bool seeed_driver_spi = false;
+#endif
+    if (!seeed_driver_spi) {
+        if(onoff){
+            pinMode(globalConfig.displays[0].reset_pin, OUTPUT);
+            pinMode(globalConfig.displays[0].cs_pin, OUTPUT);
+            if (globalConfig.displays[0].dc_pin != 0xFF) {
+                pinMode(globalConfig.displays[0].dc_pin, OUTPUT);
+            }
+            pinMode(globalConfig.displays[0].clk_pin, OUTPUT);
+            pinMode(globalConfig.displays[0].data_pin, OUTPUT);
+            delay(200);
+        }
+        else{
+            SPI.end();
+            Wire.end();
+            pinMode(globalConfig.displays[0].reset_pin, INPUT);
+            pinMode(globalConfig.displays[0].cs_pin, INPUT);
+            if (globalConfig.displays[0].dc_pin != 0xFF) {
+                pinMode(globalConfig.displays[0].dc_pin, INPUT);
+            }
+            pinMode(globalConfig.displays[0].clk_pin, INPUT);
+            pinMode(globalConfig.displays[0].data_pin, INPUT);
+        }
+    } else {
+        if (onoff) {
+            delay(200);
+        } else {
+            SPI.end();
+            Wire.end();
+        }
     }
     if(globalConfig.system_config.pwr_pin != 0xFF){
     if(onoff){
@@ -321,7 +379,10 @@ void pwrmgm(bool onoff){
 }
 
 void writeSerial(String message, bool newLine){
-    #ifndef DISABLE_USB_SERIAL
+    #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
+    if (newLine) LogSerialPort.println(message);
+    else LogSerialPort.print(message);
+    #elif !defined(DISABLE_USB_SERIAL)
     if (newLine == true) Serial.println(message);
     else Serial.print(message);
     #endif
