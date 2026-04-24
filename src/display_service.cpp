@@ -186,6 +186,7 @@ int mapEpd(int id){
         case 0x003F: return EP31_240x320;
         case 0x0040: return EP75YR_800x480;
         case 0x0041: return EP_PANEL_UNDEFINED;
+        case 0x0049: return GDEM133T91_960x680;
         default: return EP_PANEL_UNDEFINED;
     }
 }
