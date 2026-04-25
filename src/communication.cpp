@@ -562,6 +562,9 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             writeSerial("=== DIRECT WRITE END COMMAND (0x0072) ===");
             handleDirectWriteEnd(data + 2, len - 2);
             break;
+        case 0x0076:
+            handlePartialWriteData(data + 2, len - 2);
+            break;
         case 0x0073:
             writeSerial("=== LED ACTIVATE COMMAND (0x0073) ===");
             handleLedActivate(data + 2, len - 2);
