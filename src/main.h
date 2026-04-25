@@ -49,16 +49,18 @@ using namespace Adafruit_LittleFS_Namespace;
 #define MAX_RESPONSE_DATA_SIZE 100  // Maximum data size in response buffer
 
 // BLE response codes (second byte only, first byte is always 0x00 for success, 0xFF for error)
-#define RESP_DIRECT_WRITE_START_ACK  0x70  // Direct write start acknowledgment
-#define RESP_DIRECT_WRITE_DATA_ACK   0x71  // Direct write data acknowledgment
-#define RESP_DIRECT_WRITE_END_ACK    0x72  // Direct write end acknowledgment
+#define RESP_DIRECT_WRITE_START_ACK       0x70  // Direct write start acknowledgment
+#define RESP_DIRECT_WRITE_DATA_ACK        0x71  // Direct write data acknowledgment
+#define RESP_DIRECT_WRITE_END_ACK         0x72  // Direct write end acknowledgment
 #define RESP_DIRECT_WRITE_REFRESH_SUCCESS 0x73  // Display refresh completed successfully
 #define RESP_DIRECT_WRITE_REFRESH_TIMEOUT 0x74  // Display refresh timed out
-#define RESP_DIRECT_WRITE_ERROR      0xFF  // Direct write error response
-#define RESP_CONFIG_READ             0x40  // Config read response
-#define RESP_CONFIG_WRITE             0x41  // Config write response
-#define RESP_CONFIG_CHUNK             0x42  // Config chunk response
-#define RESP_MSD_READ                 0x44  // MSD (Manufacturer Specific Data) read response
+#define RESP_PARTIAL_WRITE_DATA_ACK       0x76  // Partial image data acknowledgment
+#define RESP_DIRECT_WRITE_ERROR           0xFF  // Direct write error response
+#define RESP_CONFIG_READ                  0x40  // Config read response
+#define RESP_CONFIG_WRITE                 0x41  // Config write response
+#define RESP_CONFIG_CHUNK                 0x42  // Config chunk response
+#define RESP_MSD_READ                     0x44  // MSD (Manufacturer Specific Data) read response
+
 
 // Communication mode bit definitions (for system_config.communication_modes)
 #define COMM_MODE_BLE           (1 << 0)  // Bit 0: BLE transfer supported
@@ -186,10 +188,11 @@ bool directWriteBitplanes = false;  // True if using bitplanes (BWR/BWY - 2 plan
 bool directWritePlane2 = false;  // True when writing plane 2 (R/Y) for bitplanes
 uint32_t directWriteBytesWritten = 0;  // Total bytes written to current plane
 uint32_t directWriteDecompressedTotal = 0;  // Expected decompressed size
-uint16_t directWriteWidth = 0;  // Display width in pixels
-uint16_t directWriteHeight = 0;  // Display height in pixels
+uint16_t directWriteWidth = 0;  // Display width in pixels (authoritative for bounds-checking)
+uint16_t directWriteHeight = 0;  // Display height in pixels (authoritative for bounds-checking)
 uint32_t directWriteTotalBytes = 0;  // Total bytes expected per plane (for bitplanes) or total (for others)
 uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if supported)
+uint8_t directWriteDataKind = DATA_KIND_NONE;  // DATA_KIND_NONE/FULL/PARTIAL for this transfer
 
 // Direct write compressed mode: use same buffer as regular image upload
 uint32_t directWriteCompressedSize = 0;  // Total compressed size expected
@@ -261,6 +264,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteEnd(uint8_t* data = nullptr, uint16_t len = 0);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
+void handlePartialWriteData(uint8_t* data, uint16_t len);
 int mapEpd(int id);
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
@@ -305,6 +309,12 @@ bool encryptionInitialized = false;
 // RTC memory variables for deep sleep state tracking
 RTC_DATA_ATTR bool woke_from_deep_sleep = false;
 RTC_DATA_ATTR uint32_t deep_sleep_count = 0;
+
+// Framebuffer etag: 32-bit opaque identifier for the content currently on the
+// display. Persists across deep sleep. 0x00000000 means "not set".
+// Written by handleDirectWriteEnd() on success when the client supplies a
+// new_etag; cleared on transfer abort or when no new_etag is provided.
+RTC_DATA_ATTR uint32_t framebuffer_etag = 0;
 
 // Advertising timeout state variables
 bool advertising_timeout_active = false;

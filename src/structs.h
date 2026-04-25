@@ -280,4 +280,20 @@ struct SecurityConfig {
 #define SECURITY_FLAG_RESET_PIN_PULLUP    (1 << 4)
 #define SECURITY_FLAG_RESET_PIN_PULLDOWN  (1 << 5)
 
+// ---------------------------------------------------------------------------
+// Partial-rendering protocol constants (§1 of partial-rendering-plan.md)
+// ---------------------------------------------------------------------------
+
+// Error codes for partial-rendering NACK responses: {0xFF, opcode, error, 0x00}.
+// Mirror these values in py-opendisplay so the client can distinguish cases.
+#define ERR_ETAG_MISMATCH   0x01u  // 0x70: old_etag supplied but does not match stored etag
+#define ERR_MIXED_DATA      0x02u  // 0x76/0x71: mixed partial/full data in same transfer
+#define ERR_SEGMENT_OOB     0x03u  // 0x76: segment x+w > W or y+h > H
+
+// Transfer data-kind: tracks whether the current transfer has received full
+// (0x71) or partial (0x76) data. Lives only for the duration of one transfer.
+#define DATA_KIND_NONE      0u  // No data received yet
+#define DATA_KIND_FULL      1u  // Full-image data (0x71) in progress
+#define DATA_KIND_PARTIAL   2u  // Partial-segment data (0x76) in progress
+
 #endif
