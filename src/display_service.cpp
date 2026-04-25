@@ -55,9 +55,7 @@ extern uint8_t* compressedDataBuffer;
 extern uint8_t dictionaryBuffer[];
 extern uint8_t decompressionChunk[];
 
-#ifdef TARGET_ESP32
-extern uint32_t framebuffer_etag;
-#endif
+extern uint32_t displayed_etag;
 
 uint32_t max_compressed_image_rx_bytes(uint8_t tm) {
     if ((tm & TRANSMISSION_MODE_ZIP) == 0) return 0;
@@ -1188,18 +1186,16 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     bool isCompressedStart = (len >= 5);
     bool hasOldEtag = (len == 4);
 
-#ifdef TARGET_ESP32
     if (hasOldEtag) {
         uint32_t oldEtag = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
                            ((uint32_t)data[2] << 8)  |  (uint32_t)data[3];
-        if (framebuffer_etag == 0 || framebuffer_etag != oldEtag) {
-            framebuffer_etag = 0;
+        if (displayed_etag == 0 || displayed_etag != oldEtag) {
+            displayed_etag = 0;
             uint8_t errResponse[] = {0xFF, 0x70, ERR_ETAG_MISMATCH, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
             return;
         }
     }
-#endif
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
@@ -1271,9 +1267,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
 void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (!directWriteActive || len == 0) return;
     if (directWriteDataKind == DATA_KIND_PARTIAL) {
-#ifdef TARGET_ESP32
-        framebuffer_etag = 0;
-#endif
+        displayed_etag = 0;
         cleanupDirectWriteState(false);
         uint8_t errResponse[] = {0xFF, 0x71, ERR_MIXED_DATA, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
@@ -1342,15 +1336,11 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     delay(50);
     cleanupDirectWriteState(false);
     if (refreshSuccess) {
-#ifdef TARGET_ESP32
-        framebuffer_etag = hasNewEtag ? newEtag : 0;
-#endif
+        displayed_etag = hasNewEtag ? newEtag : 0;
         uint8_t refreshResponse[] = {0x00, 0x73};
         sendResponse(refreshResponse, sizeof(refreshResponse));
     } else {
-#ifdef TARGET_ESP32
-        framebuffer_etag = 0;
-#endif
+        displayed_etag = 0;
         uint8_t timeoutResponse[] = {0x00, 0x74};
         sendResponse(timeoutResponse, sizeof(timeoutResponse));
     }
@@ -1363,9 +1353,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
     if (!directWriteActive || len == 0) return;
 
     if (directWriteDataKind == DATA_KIND_FULL) {
-#ifdef TARGET_ESP32
-        framebuffer_etag = 0;
-#endif
+        displayed_etag = 0;
         cleanupDirectWriteState(false);
         uint8_t errResponse[] = {0xFF, 0x76, ERR_MIXED_DATA, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
@@ -1378,9 +1366,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
 
     while (offset < len) {
         if ((uint16_t)(len - offset) < 9) {
-#ifdef TARGET_ESP32
-            framebuffer_etag = 0;
-#endif
+            displayed_etag = 0;
             cleanupDirectWriteState(false);
             uint8_t errResponse[] = {0xFF, 0x76, ERR_SEGMENT_OOB, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
@@ -1396,9 +1382,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
 
         if ((uint32_t)segX + segW > directWriteWidth ||
             (uint32_t)segY + segH > directWriteHeight) {
-#ifdef TARGET_ESP32
-            framebuffer_etag = 0;
-#endif
+            displayed_etag = 0;
             cleanupDirectWriteState(false);
             uint8_t errResponse[] = {0xFF, 0x76, ERR_SEGMENT_OOB, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
@@ -1412,9 +1396,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
         else                        segBytes = (segPixels + 7) / 8;
 
         if ((uint32_t)(len - offset) < segBytes) {
-#ifdef TARGET_ESP32
-            framebuffer_etag = 0;
-#endif
+            displayed_etag = 0;
             cleanupDirectWriteState(false);
             uint8_t errResponse[] = {0xFF, 0x76, ERR_SEGMENT_OOB, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
