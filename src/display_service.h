@@ -29,6 +29,7 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
 void decompressDirectWriteData();
 void cleanupDirectWriteState(bool refreshDisplay);
 void handleDirectWriteEnd(uint8_t* data, uint16_t len);
+void handlePartialWriteData(uint8_t* data, uint16_t len);
 int getplane();
 int getBitsPerPixel();
 
