@@ -1178,24 +1178,7 @@ void cleanupDirectWriteState(bool refreshDisplay) {
 
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     if (directWriteActive) cleanupDirectWriteState(false);
-
-    // Payload disambiguation (§1.4): partial path is uncompressed only, so
-    //   len == 0          → uncompressed, no etag
-    //   len == 4          → uncompressed with old_etag (BE)
-    //   len >= 5          → compressed (4-byte size + data; no etag tail)
-    bool isCompressedStart = (len >= 5);
-    bool hasOldEtag = (len == 4);
-
-    if (hasOldEtag) {
-        uint32_t oldEtag = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
-                           ((uint32_t)data[2] << 8)  |  (uint32_t)data[3];
-        if (displayed_etag == 0 || displayed_etag != oldEtag) {
-            displayed_etag = 0;
-            uint8_t errResponse[] = {0xFF, 0x70, ERR_ETAG_MISMATCH, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
-            return;
-        }
-    }
+    bool isCompressedStart = (len >= 4);
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
@@ -1261,6 +1244,67 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
     }
     uint8_t ackResponse[] = {0x00, 0x70};
+    sendResponse(ackResponse, sizeof(ackResponse));
+}
+
+void handlePartialWriteStart(uint8_t* data, uint16_t len) {
+    if (directWriteActive) cleanupDirectWriteState(false);
+
+    if (len != 5 || data[0] != PARTIAL_WRITE_PROTOCOL_V1) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_VERSION, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+
+    uint32_t oldEtag = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
+                       ((uint32_t)data[3] << 8)  |  (uint32_t)data[4];
+    if (displayed_etag == 0 || displayed_etag != oldEtag) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_ETAG_MISMATCH, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        seeed_gfx_prepare_hardware();
+    }
+#endif
+    uint8_t colorScheme = globalConfig.displays[0].color_scheme;
+    directWriteBitplanes = (colorScheme == 1 || colorScheme == 2);
+    directWritePlane2 = false;
+    directWriteCompressed = false;
+    directWriteWidth = globalConfig.displays[0].pixel_width;
+    directWriteHeight = globalConfig.displays[0].pixel_height;
+    uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
+    if (directWriteBitplanes) directWriteTotalBytes = (pixels + 7) / 8;
+    else {
+        int bitsPerPixel = getBitsPerPixel();
+        if (bitsPerPixel == 4) directWriteTotalBytes = (pixels + 1) / 2;
+        else if (bitsPerPixel == 2) directWriteTotalBytes = (pixels + 3) / 4;
+        else directWriteTotalBytes = (pixels + 7) / 8;
+    }
+    directWriteActive = true;
+    directWriteBytesWritten = 0;
+    directWriteStartTime = millis();
+    if (displayPowerState) {
+        pwrmgm(false);
+        delay(50);
+    }
+    pwrmgm(true);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        seeed_gfx_direct_write_reset();
+    } else
+#endif
+    {
+        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+        bbepWakeUp(&bbep);
+        bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    }
+
+    uint8_t ackResponse[] = {0x00, 0x76};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
 
@@ -1346,16 +1390,24 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     }
 }
 
-// 0x76 partial image data: one or more segments, each
+// 0x77 partial image data: one or more segments, each
 // {x:u16BE, y:u16BE, w:u16BE, h:u16BE, flags:u8, pixels}.
 // flags bit 0 = plane select (0=PLANE_0 new, 1=PLANE_1 old); bits 1-7 reserved.
 void handlePartialWriteData(uint8_t* data, uint16_t len) {
     if (!directWriteActive || len == 0) return;
 
+    if (directWriteCompressed) {
+        displayed_etag = 0;
+        cleanupDirectWriteState(false);
+        uint8_t errResponse[] = {0xFF, 0x77, ERR_MIXED_DATA, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+
     if (directWriteDataKind == DATA_KIND_FULL) {
         displayed_etag = 0;
         cleanupDirectWriteState(false);
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_MIXED_DATA, 0x00};
+        uint8_t errResponse[] = {0xFF, 0x77, ERR_MIXED_DATA, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
         return;
     }
@@ -1368,7 +1420,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
         if ((uint16_t)(len - offset) < 9) {
             displayed_etag = 0;
             cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x76, ERR_SEGMENT_OOB, 0x00};
+            uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
             return;
         }
@@ -1384,7 +1436,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
             (uint32_t)segY + segH > directWriteHeight) {
             displayed_etag = 0;
             cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x76, ERR_SEGMENT_OOB, 0x00};
+            uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
             return;
         }
@@ -1398,7 +1450,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
         if ((uint32_t)(len - offset) < segBytes) {
             displayed_etag = 0;
             cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x76, ERR_SEGMENT_OOB, 0x00};
+            uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
             return;
         }
@@ -1411,6 +1463,6 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
         offset += (uint16_t)segBytes;
     }
 
-    uint8_t ackResponse[] = {0x00, 0x76};
+    uint8_t ackResponse[] = {0x00, 0x77};
     sendResponse(ackResponse, sizeof(ackResponse));
 }

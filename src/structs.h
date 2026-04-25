@@ -284,8 +284,12 @@ struct SecurityConfig {
 #define ERR_ETAG_MISMATCH   0x01u
 #define ERR_MIXED_DATA      0x02u
 #define ERR_SEGMENT_OOB     0x03u
+#define ERR_PARTIAL_VERSION 0x04u
 
-// Per-transfer data-kind tracking (0x71 vs 0x76).
+// Partial-rendering protocol.
+#define PARTIAL_WRITE_PROTOCOL_V1 0x01u
+
+// Per-transfer data-kind tracking (0x71 vs 0x77).
 #define DATA_KIND_NONE      0u
 #define DATA_KIND_FULL      1u
 #define DATA_KIND_PARTIAL   2u
