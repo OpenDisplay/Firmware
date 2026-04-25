@@ -1181,101 +1181,23 @@ void cleanupDirectWriteState(bool refreshDisplay) {
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     if (directWriteActive) cleanupDirectWriteState(false);
 
-    // Optional old_etag: if payload is at least 4 bytes longer than the base
-    // message (which for 0x70 has no required payload), the last 4 bytes are
-    // treated as a big-endian old_etag. Presence is determined purely by
-    // payload length; there is no flag byte or length prefix.
-    // Base 0x70 payload (uncompressed): 0 required bytes before etag.
-    // Base 0x70 payload (compressed):   4 bytes (decompressed total size).
-    // We check for old_etag at offset len-4 when len >= 4 AND the payload does
-    // not look like just a compressed-size prefix (compression uses exactly
-    // 4 bytes that are not an etag). We distinguish them: if len == 4 the
-    // payload IS the compressed size prefix (not an etag); if len > 4 and the
-    // last 4 bytes are after the compressed prefix, they are the etag. If len
-    // == 4 for an uncompressed transfer it means old_etag is present.
-    // Simpler: old_etag presence is signalled by having exactly 4 extra bytes
-    // beyond the base payload. Base payload for uncompressed = 0 bytes;
-    // base for compressed = 4 bytes. We detect compressed by checking if
-    // the display config has ZIP mode. But that logic is fragile.
-    //
-    // Decision: follow the plan literally — the only rule is "if the BLE-level
-    // payload length covers the etag bytes, it is present." We treat any
-    // payload of length >= 4 that is NOT just-4-bytes-in-a-compressed-transfer
-    // as possibly having an etag. The simplest and most robust rule: the etag
-    // occupies bytes [len-4 .. len-1] when len >= 4 AND the caller set
-    // directWriteCompressed = (len >= 4) — but we haven't computed that yet.
-    //
-    // Practical encoding per plan §1.4:
-    //   Uncompressed, no etag:  len == 0
-    //   Uncompressed, etag:     len == 4
-    //   Compressed, no etag:    len == 4  (decompressed size only)
-    //   Compressed, etag:       len == 8  (decompressed size + etag)
-    //   Compressed + inline:    len > 4   (decompressed size + data [+ etag])
-    //
-    // To resolve the ambiguity at len==4 we need to know if this is a
-    // compressed transfer. The compressed flag is signalled by len >= 4 in the
-    // original code. We keep that heuristic and treat old_etag as present only
-    // when: (a) uncompressed and len == 4, or (b) compressed and len == 8, or
-    // (c) compressed-with-inline and the last 4 bytes beyond the inline data
-    // would not be interpreted as pixel data (not detectable here).
-    //
-    // Simplest correct rule for the cases py-opendisplay actually sends:
-    //   - If len < 4: no etag, uncompressed.
-    //   - If len == 4: could be uncompressed+etag OR compressed+size only.
-    //     We cannot distinguish without a flag. However py-opendisplay will
-    //     always send the etag at the END, so:
-    //     compressed transfers: py sends {size[4], ...data..., etag[4]}
-    //       → len > 4 and last 4 bytes are etag when total = 4 + data + 4.
-    //     We detect compressed as len >= 4 (existing code). So at len == 4
-    //     exactly, it's either: uncompressed+etag OR compressed+size(no etag).
-    //
-    // Resolution: the spec says etag presence = payload length > base.
-    // The compressed "base" is 4 bytes. So: if len > 4, last 4 bytes = etag
-    // (regardless of compression). If len == 4, this is either
-    // uncompressed+etag (base=0, has etag) OR compressed+size (base=4, no etag).
-    // We use len > 4 as the etag-present condition for compressed transfers and
-    // len == 4 as etag-present for uncompressed.
-    // Distinguish: we check whether the config supports ZIP — same test the old
-    // code uses. If ZIP mode AND len >= 4, the first 4 bytes are the compressed
-    // size. Etag then present only if len >= 8, at bytes [4..7].
-    // If no ZIP AND len >= 4, etag present at bytes [0..3].
-
-    bool hasOldEtag = false;
-    uint32_t oldEtag = 0;
-    bool isCompressedStart = (len >= 4);  // mirror the existing heuristic
-
-    if (isCompressedStart) {
-        // Compressed transfer: base payload = 4-byte decompressed size.
-        // Etag (if present) appended after: bytes [4..7].
-        if (len >= 8) {
-            hasOldEtag = true;
-            oldEtag = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
-                      ((uint32_t)data[6] << 8)  | ((uint32_t)data[7]);
-        }
-    } else {
-        // Uncompressed transfer: base payload = 0 bytes.
-        // Etag (if present) = exactly 4 bytes.
-        if (len == 4) {
-            hasOldEtag = true;
-            oldEtag = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
-                      ((uint32_t)data[2] << 8)  | ((uint32_t)data[3]);
-        }
-    }
+    // Payload disambiguation (§1.4): partial path is uncompressed only, so
+    //   len == 0          → uncompressed, no etag
+    //   len == 4          → uncompressed with old_etag (BE)
+    //   len >= 5          → compressed (4-byte size + data; no etag tail)
+    bool isCompressedStart = (len >= 5);
+    bool hasOldEtag = (len == 4);
 
 #ifdef TARGET_ESP32
     if (hasOldEtag) {
-        writeSerial("Direct write start: old_etag present = 0x" + String(oldEtag, HEX), true);
+        uint32_t oldEtag = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                           ((uint32_t)data[2] << 8)  |  (uint32_t)data[3];
         if (framebuffer_etag == 0 || framebuffer_etag != oldEtag) {
-            writeSerial("ERROR: Etag mismatch (stored=0x" + String(framebuffer_etag, HEX) +
-                        ", received=0x" + String(oldEtag, HEX) + ") — aborting transfer", true);
             framebuffer_etag = 0;
             uint8_t errResponse[] = {0xFF, 0x70, ERR_ETAG_MISMATCH, 0x00};
             sendResponse(errResponse, sizeof(errResponse));
             return;
         }
-        writeSerial("Etag accepted (0x" + String(oldEtag, HEX) + ")", true);
-    } else {
-        writeSerial("Direct write start: no old_etag — full transfer path", true);
     }
 #endif
 
@@ -1288,7 +1210,6 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     directWriteBitplanes = (colorScheme == 1 || colorScheme == 2);
     directWritePlane2 = false;
     directWriteCompressed = isCompressedStart;
-    directWriteDataKind = DATA_KIND_NONE;
     directWriteWidth = globalConfig.displays[0].pixel_width;
     directWriteHeight = globalConfig.displays[0].pixel_height;
     uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
@@ -1310,13 +1231,8 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         directWriteCompressedBuffer = compressedDataBuffer;
         directWriteCompressedSize = 0;
         directWriteCompressedReceived = 0;
-        // Inline compressed data starts at byte 4. When old_etag is present
-        // (len >= 8), the last 4 bytes are the etag and must not be treated as
-        // compressed pixel data. Etag was already parsed above; exclude it here.
-        uint16_t inlineStart = 4;
-        uint16_t inlineEnd = hasOldEtag ? (len - 4) : len;
-        if (inlineEnd > inlineStart) {
-            uint32_t compressedDataLen = inlineEnd - inlineStart;
+        if (len > 4) {
+            uint32_t compressedDataLen = len - 4;
             uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
             if (compressedDataLen > cap) {
                 cleanupDirectWriteState(false);
@@ -1324,7 +1240,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
                 sendResponse(errorResponse, sizeof(errorResponse));
                 return;
             }
-            memcpy(directWriteCompressedBuffer, data + inlineStart, compressedDataLen);
+            memcpy(directWriteCompressedBuffer, data + 4, compressedDataLen);
             directWriteCompressedReceived = compressedDataLen;
         }
     }
@@ -1354,10 +1270,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
 
 void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (!directWriteActive || len == 0) return;
-    // Validate that we are not mixing full-image (0x71) data with a partial
-    // transfer (0x76) that has already started.
     if (directWriteDataKind == DATA_KIND_PARTIAL) {
-        writeSerial("ERROR: 0x71 full-image data received after 0x76 partial data — mixed transfer, aborting", true);
 #ifdef TARGET_ESP32
         framebuffer_etag = 0;
 #endif
@@ -1397,17 +1310,12 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     directWriteStartTime = 0;
     if (directWriteCompressed && directWriteCompressedReceived > 0) decompressDirectWriteData();
 
-    // Optional new_etag: present when payload is at least 5 bytes
-    // (1 byte refresh mode + 4 bytes etag, big-endian).
-    // If absent (len < 5), the stored etag is cleared (forces next transfer full).
+    // Optional new_etag tail: refresh_mode(1) + new_etag(4 BE) when len >= 5.
     bool hasNewEtag = (data != nullptr && len >= 5);
     uint32_t newEtag = 0;
     if (hasNewEtag) {
         newEtag = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
-                  ((uint32_t)data[3] << 8)  | ((uint32_t)data[4]);
-        writeSerial("Direct write end: new_etag = 0x" + String(newEtag, HEX), true);
-    } else {
-        writeSerial("Direct write end: no new_etag — clearing stored etag", true);
+                  ((uint32_t)data[3] << 8)  |  (uint32_t)data[4];
     }
 
     int refreshMode = REFRESH_FULL;
@@ -1434,62 +1342,27 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     delay(50);
     cleanupDirectWriteState(false);
     if (refreshSuccess) {
-        // Store or clear the framebuffer etag. On success, the display shows the
-        // content just uploaded; update the etag so the next partial transfer can
-        // verify it. If the client did not supply a new_etag, clear the stored
-        // value to force the next transfer to be a full image.
 #ifdef TARGET_ESP32
         framebuffer_etag = hasNewEtag ? newEtag : 0;
-        if (hasNewEtag) {
-            writeSerial("Framebuffer etag updated to 0x" + String(framebuffer_etag, HEX), true);
-        } else {
-            writeSerial("Framebuffer etag cleared (no new_etag supplied)", true);
-        }
 #endif
         uint8_t refreshResponse[] = {0x00, 0x73};
         sendResponse(refreshResponse, sizeof(refreshResponse));
     } else {
-        // Refresh failed or timed out — content on display is unknown; clear etag.
 #ifdef TARGET_ESP32
         framebuffer_etag = 0;
-        writeSerial("Framebuffer etag cleared (refresh failed/timeout)", true);
 #endif
         uint8_t timeoutResponse[] = {0x00, 0x74};
         sendResponse(timeoutResponse, sizeof(timeoutResponse));
     }
 }
 
-// ---------------------------------------------------------------------------
-// 0x76 — Partial image data handler
-//
-// Payload: one or more segments, each with the wire format:
-//   x      : uint16 BE
-//   y      : uint16 BE
-//   width  : uint16 BE
-//   height : uint16 BE
-//   flags  : uint8   (bit 0: plane select; bits 1-7 reserved, masked off)
-//   pixels : width * height * bytes_per_pixel bytes
-//
-// Validation:
-//   - Mixed data (0x71 already received this transfer) → abort, ERR_MIXED_DATA
-//   - x + width > W or y + height > H → abort, ERR_SEGMENT_OOB
-//
-// ACK: echoes {0x00, 0x76} after every accepted packet (same as 0x71 → 0x71).
-// There is no auto-end: the transfer always requires an explicit 0x72.
-// ---------------------------------------------------------------------------
+// 0x76 partial image data: one or more segments, each
+// {x:u16BE, y:u16BE, w:u16BE, h:u16BE, flags:u8, pixels}.
+// flags bit 0 = plane select (0=PLANE_0 new, 1=PLANE_1 old); bits 1-7 reserved.
 void handlePartialWriteData(uint8_t* data, uint16_t len) {
-    if (!directWriteActive) {
-        writeSerial("ERROR: 0x76 received but no transfer active (missing 0x70)", true);
-        return;
-    }
-    if (len == 0) {
-        writeSerial("ERROR: 0x76 received with empty payload — ignoring", true);
-        return;
-    }
+    if (!directWriteActive || len == 0) return;
 
-    // Reject if full-image data was already sent in this transfer.
     if (directWriteDataKind == DATA_KIND_FULL) {
-        writeSerial("ERROR: 0x76 partial data received after 0x71 full data — mixed transfer, aborting", true);
 #ifdef TARGET_ESP32
         framebuffer_etag = 0;
 #endif
@@ -1500,16 +1373,11 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
     }
     directWriteDataKind = DATA_KIND_PARTIAL;
 
-    writeSerial("=== PARTIAL WRITE DATA (0x76): " + String(len) + " bytes ===", true);
-
     int bitsPerPixel = getBitsPerPixel();
     uint16_t offset = 0;
 
     while (offset < len) {
-        // Minimum segment header = 9 bytes (x[2] + y[2] + w[2] + h[2] + flags[1])
         if ((uint16_t)(len - offset) < 9) {
-            writeSerial("ERROR: Incomplete segment header at offset " + String(offset) +
-                        " (remaining=" + String(len - offset) + ") — aborting", true);
 #ifdef TARGET_ESP32
             framebuffer_etag = 0;
 #endif
@@ -1523,20 +1391,11 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
         uint16_t segY = ((uint16_t)data[offset + 2] << 8) | data[offset + 3];
         uint16_t segW = ((uint16_t)data[offset + 4] << 8) | data[offset + 5];
         uint16_t segH = ((uint16_t)data[offset + 6] << 8) | data[offset + 7];
-        uint8_t  flags = data[offset + 8] & 0x01;  // mask reserved bits 1-7
+        uint8_t  flags = data[offset + 8] & 0x01;
         offset += 9;
 
-        writeSerial("Segment: x=" + String(segX) + " y=" + String(segY) +
-                    " w=" + String(segW) + " h=" + String(segH) +
-                    " plane=" + String(flags & 0x01 ? 1 : 0), true);
-
-        // Bounds check
         if ((uint32_t)segX + segW > directWriteWidth ||
             (uint32_t)segY + segH > directWriteHeight) {
-            writeSerial("ERROR: Segment OOB (x=" + String(segX) + "+w=" + String(segW) +
-                        " > W=" + String(directWriteWidth) + " or y=" + String(segY) +
-                        "+h=" + String(segH) + " > H=" + String(directWriteHeight) +
-                        ") — aborting", true);
 #ifdef TARGET_ESP32
             framebuffer_etag = 0;
 #endif
@@ -1546,7 +1405,6 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
             return;
         }
 
-        // Calculate pixel data length for this segment
         uint32_t segPixels = (uint32_t)segW * (uint32_t)segH;
         uint32_t segBytes;
         if (bitsPerPixel == 4)      segBytes = (segPixels + 1) / 2;
@@ -1554,8 +1412,6 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
         else                        segBytes = (segPixels + 7) / 8;
 
         if ((uint32_t)(len - offset) < segBytes) {
-            writeSerial("ERROR: Segment pixel data truncated (need=" + String(segBytes) +
-                        " have=" + String(len - offset) + ") — aborting", true);
 #ifdef TARGET_ESP32
             framebuffer_etag = 0;
 #endif
@@ -1565,9 +1421,7 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
             return;
         }
 
-        int plane = (flags & 0x01) ? PLANE_1 : PLANE_0;
-        writeSerial("Writing segment to plane " + String(plane), true);
-
+        int plane = flags ? PLANE_1 : PLANE_0;
         bbepSetAddrWindow(&bbep, segX, segY, segW, segH);
         bbepStartWrite(&bbep, plane);
         bbepWriteData(&bbep, data + offset, (int)segBytes);
@@ -1575,7 +1429,6 @@ void handlePartialWriteData(uint8_t* data, uint16_t len) {
         offset += (uint16_t)segBytes;
     }
 
-    writeSerial("Partial write data accepted (" + String(offset) + " bytes consumed)", true);
     uint8_t ackResponse[] = {0x00, 0x76};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
