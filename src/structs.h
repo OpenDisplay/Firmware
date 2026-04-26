@@ -285,9 +285,15 @@ struct SecurityConfig {
 #define ERR_MIXED_DATA      0x02u
 #define ERR_SEGMENT_OOB     0x03u
 #define ERR_PARTIAL_VERSION 0x04u
+#define ERR_SEGMENT_ALIGN   0x05u  // segment x or width not aligned to 8 pixels
 
 // Partial-rendering protocol.
 #define PARTIAL_WRITE_PROTOCOL_V1 0x01u
+
+// 0x77 partial segment flags.
+#define PARTIAL_SEGMENT_FLAG_PLANE1      0x01u
+#define PARTIAL_SEGMENT_FLAG_COMPRESSED  0x02u
+#define PARTIAL_SEGMENT_FLAG_RESERVED    0xFCu
 
 // Per-transfer data-kind tracking (0x71 vs 0x77).
 #define DATA_KIND_NONE      0u

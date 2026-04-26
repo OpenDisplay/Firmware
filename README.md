@@ -2,6 +2,9 @@
 
 Firmware and tools for BLE (Bluetooth Low Energy) based Open Display tags.
 
+Partial update wire details are documented in
+[docs/partial-update-protocol.md](docs/partial-update-protocol.md).
+
 ## Getting Started
 
 To quickly get started, visit the following resources:
