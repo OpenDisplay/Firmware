@@ -193,7 +193,7 @@ int mapEpd(int id){
         case 0x003F: return EP31_240x320;
         case 0x0040: return EP75YR_800x480;
         case 0x0041: return EP_PANEL_UNDEFINED;
-        case 0x0042: return GDEM133T91_960x680;
+        case 0x0042: return EP133_960x680;
         default: return EP_PANEL_UNDEFINED;
     }
 }
@@ -1391,7 +1391,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     {
         bbepRefresh(&bbep, refreshMode);
         refreshSuccess = waitforrefresh(60);
-        if (!(refreshMode == REFRESH_PARTIAL && bbep.type == GDEM133T91_960x680)) {
+        if (!(refreshMode == REFRESH_PARTIAL && bbep.type == EP133_960x680)) {
             bbepSleep(&bbep, 1);
         }
     }
@@ -1409,7 +1409,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
 }
 
 static void clear_partial_planes_for_gdem133(void) {
-    if (bbep.type != GDEM133T91_960x680) return;
+    if (bbep.type != EP133_960x680) return;
 
     const uint32_t total_bytes = ((uint32_t)bbep.native_width * (uint32_t)bbep.native_height) / 8;
     uint8_t white[64];
