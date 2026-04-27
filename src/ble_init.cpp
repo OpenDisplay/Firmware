@@ -24,6 +24,7 @@ void writeSerial(String message, bool newLine = true);
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLEAdvertising.h>
+#include <BLE2902.h>
 
 String getChipIdHex();
 void writeSerial(String message, bool newLine = true);
@@ -107,14 +108,16 @@ void ble_init_esp32(bool update_manufacturer_data) {
     }
     pServer->setCallbacks(&staticServerCallbacks);
     writeSerial("Server callbacks configured");
-    BLEUUID serviceUUID("00002446-0000-1000-8000-00805F9B34FB");
+    // Register the OpenDisplay UUID through its 16-bit alias so the ESP32 stack
+    // exposes it on the standard Bluetooth base UUID consistently across clients.
+    BLEUUID serviceUUID((uint16_t)0x2446);
     pService = pServer->createService(serviceUUID);
     if (pService == nullptr) {
         writeSerial("ERROR: Failed to create BLE service");
         return;
     }
     writeSerial("BLE service 0x2446 created successfully");
-    BLEUUID charUUID("00002446-0000-1000-8000-00805F9B34FB");
+    BLEUUID charUUID((uint16_t)0x2446);
     pTxCharacteristic = pService->createCharacteristic(
         charUUID,
         BLECharacteristic::PROPERTY_READ |
@@ -127,6 +130,8 @@ void ble_init_esp32(bool update_manufacturer_data) {
         return;
     }
     writeSerial("Characteristic created with properties: READ, NOTIFY, WRITE, WRITE_NR");
+    pTxCharacteristic->addDescriptor(new BLE2902());
+    writeSerial("CCCD descriptor added to characteristic");
     pTxCharacteristic->setCallbacks(&staticCharCallbacks);
     pRxCharacteristic = pTxCharacteristic;
     pService->start();
