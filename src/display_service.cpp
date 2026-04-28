@@ -1272,7 +1272,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     }
 #endif
 
-    if (len < 21 || data[0] != PARTIAL_WRITE_PROTOCOL_V1) {
+    if (len < 19 || data[0] != PARTIAL_WRITE_PROTOCOL_V1) {
         displayed_etag = 0;
         uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_VERSION, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
@@ -1286,19 +1286,11 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     uint16_t rectY    = ((uint16_t)data[9]  << 8) | data[10];
     uint16_t rectW    = ((uint16_t)data[11] << 8) | data[12];
     uint16_t rectH    = ((uint16_t)data[13] << 8) | data[14];
-    uint16_t spanPx   = ((uint16_t)data[15] << 8) | data[16];
     uint32_t uncompSize;
-    memcpy(&uncompSize, data + 17, 4);  // 4-byte LE
+    memcpy(&uncompSize, data + 15, 4);  // 4-byte LE
 
-    // Validate reserved flags (bits 5-15 must be 0; bits 0-4 are defined)
-    if (flags & 0xFFE0u) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_FLAGS, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
-        return;
-    }
-    uint8_t planeOrder = flags & 0x03u;
-    if (planeOrder == 0x02u || planeOrder == 0x03u) {
+    // Validate reserved flags. Only compressed and store-etag are defined.
+    if (flags & ~(PARTIAL_FLAG_COMPRESSED | PARTIAL_FLAG_STORE_ETAG)) {
         displayed_etag = 0;
         uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_FLAGS, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
@@ -1329,14 +1321,6 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     if ((rectX % pixPerByte) != 0 || (rectW % pixPerByte) != 0) {
         displayed_etag = 0;
         uint8_t errResponse[] = {0xFF, 0x76, ERR_RECT_ALIGN, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
-        return;
-    }
-
-    if (spanPx == 0 || (spanPx % pixPerByte) != 0 ||
-        (rectW % spanPx != 0 && spanPx % rectW != 0)) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_SPAN, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
         return;
     }
@@ -1393,7 +1377,6 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     partialCtx.y = rectY;
     partialCtx.width = rectW;
     partialCtx.height = rectH;
-    partialCtx.interleave_span_pixels = spanPx;
     partialCtx.logical_uncompressed_size = uncompSize;
     partialCtx.bits_per_pixel = (uint8_t)bpp;
     partialCtx.pixels_per_byte = pixPerByte;
@@ -1404,8 +1387,8 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     }
 
     // Process optional initial stream bytes before ACK
-    if (len > 21) {
-        uint16_t initLen = len - 21;
+    if (len > 19) {
+        uint16_t initLen = len - 19;
         if (isCompressed) {
             uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
             if (cap == 0 || initLen > cap) {
@@ -1415,10 +1398,10 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
                 sendResponse(errResponse, sizeof(errResponse));
                 return;
             }
-            memcpy(directWriteCompressedBuffer, data + 21, initLen);
+            memcpy(directWriteCompressedBuffer, data + 19, initLen);
             directWriteCompressedReceived = initLen;
         } else {
-            if (!partial_consume_bytes(data + 21, (uint32_t)initLen)) {
+            if (!partial_consume_bytes(data + 19, (uint32_t)initLen)) {
                 displayed_etag = 0;
                 cleanupDirectWriteState(false);
                 uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_STREAM, 0x00};
@@ -1652,54 +1635,22 @@ static void clear_partial_planes_to_white(void) {
 
 static void setup_phase(void) {
     uint32_t rect_pixels = (uint32_t)partialCtx.width * partialCtx.height;
-    uint32_t span_pixels = partialCtx.interleave_span_pixels;
-    uint32_t group_start_pixel = partialCtx.group_index * span_pixels;
+    uint8_t bpp = partialCtx.bits_per_pixel;
+    uint32_t rect_bytes;
+    if (bpp == 1)      rect_bytes = (rect_pixels + 7) / 8;
+    else if (bpp == 2) rect_bytes = (rect_pixels + 3) / 4;
+    else if (bpp == 4) rect_bytes = (rect_pixels + 1) / 2;
+    else               rect_bytes = rect_pixels;
 
-    if (group_start_pixel >= rect_pixels) {
+    if (partialCtx.phase > 1) {
         partialCtx.bytes_remaining_in_phase = 0;
         return;
     }
 
-    uint32_t group_pixels = span_pixels;
-    if (group_start_pixel + group_pixels > rect_pixels)
-        group_pixels = rect_pixels - group_start_pixel;
-
-    uint8_t bpp = partialCtx.bits_per_pixel;
-    uint32_t group_bytes;
-    if (bpp == 1)      group_bytes = (group_pixels + 7) / 8;
-    else if (bpp == 2) group_bytes = (group_pixels + 3) / 4;
-    else if (bpp == 4) group_bytes = (group_pixels + 1) / 2;
-    else               group_bytes = group_pixels;
-
-    uint16_t group_x, group_y, group_w, group_h;
-    uint16_t w = partialCtx.width;
-    if (span_pixels % w == 0) {
-        // Row-band: span covers whole rows
-        group_x = partialCtx.x;
-        group_y = partialCtx.y + (uint16_t)(group_start_pixel / w);
-        group_w = w;
-        group_h = (uint16_t)(group_pixels / w);
-    } else {
-        // Horizontal run within a row
-        group_x = partialCtx.x + (uint16_t)(group_start_pixel % w);
-        group_y = partialCtx.y + (uint16_t)(group_start_pixel / w);
-        group_w = (uint16_t)group_pixels;
-        group_h = 1;
-    }
-
-    // Determine plane: default (0b00) = phase 0 → PLANE_1 (old), phase 1 → PLANE_0 (new)
-    //                  new/old (0b01) = phase 0 → PLANE_0 (new), phase 1 → PLANE_1 (old)
-    uint8_t planeOrder = partialCtx.flags & 0x03u;
-    int plane;
-    if (planeOrder == 0x00u) {
-        plane = (partialCtx.phase == 0) ? PLANE_1 : PLANE_0;
-    } else {
-        plane = (partialCtx.phase == 0) ? PLANE_0 : PLANE_1;
-    }
-
-    bbepSetAddrWindow(&bbep, group_x, group_y, group_w, group_h);
+    int plane = (partialCtx.phase == 0) ? PLANE_1 : PLANE_0;
+    bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
     bbepStartWrite(&bbep, plane);
-    partialCtx.bytes_remaining_in_phase = group_bytes;
+    partialCtx.bytes_remaining_in_phase = rect_bytes;
 }
 
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
@@ -1717,24 +1668,15 @@ static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
 
         bbepWriteData(&bbep, data + offset, (int)can_consume);
 
-        // Track per-plane byte counts
-        uint8_t planeOrder = partialCtx.flags & 0x03u;
-        bool is_old_phase = (planeOrder == 0x00u) ? (partialCtx.phase == 0) : (partialCtx.phase == 1);
-        if (is_old_phase) partialCtx.old_plane_bytes_written += can_consume;
-        else              partialCtx.new_plane_bytes_written += can_consume;
+        if (partialCtx.phase == 0) partialCtx.old_plane_bytes_written += can_consume;
+        else                       partialCtx.new_plane_bytes_written += can_consume;
 
         partialCtx.bytes_remaining_in_phase -= can_consume;
         partialCtx.logical_bytes_written += can_consume;
         offset += can_consume;
 
         if (partialCtx.bytes_remaining_in_phase == 0) {
-            // Advance to next section
-            if (partialCtx.phase == 0) {
-                partialCtx.phase = 1;
-            } else {
-                partialCtx.phase = 0;
-                partialCtx.group_index++;
-            }
+            partialCtx.phase++;
         }
     }
     return true;

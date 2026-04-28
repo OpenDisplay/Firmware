@@ -18,7 +18,6 @@ Full uploads continue to use `0x70`, `0x71`, and `0x72`. `0x77` is unused.
 [flags:2 BE]
 [old_etag:4 BE]
 [x:2 BE][y:2 BE][width:2 BE][height:2 BE]
-[interleave_span_pixels:2 BE]
 [uncompressed_size:4 LE]
 [initial_stream_bytes...]
 ```
@@ -29,11 +28,9 @@ logical bytes. `uncompressed_size` is always `rect_bytes * 2`.
 Flags:
 
 ```text
-bits 0..1: plane order, 0 = old PLANE_1 then new PLANE_0
 bit 2: stream is zlib-compressed
 bit 3: 0x72 includes new_etag to store after successful refresh
-bit 4: keep panel awake hint
-bits 5..15: reserved, must be 0
+all other bits: reserved, must be 0
 ```
 
 The rectangle must be in bounds. `x` and `width` must be aligned to the active
@@ -42,19 +39,15 @@ packed-pixel byte boundary: 8 pixels for 1 bpp, 4 for 2 bpp, 2 for 4 bpp, and
 
 ## Stream Body
 
-The logical stream contains both old and new rectangle images. In the default
-plane order:
+The logical stream contains both old and new rectangle images in this order:
 
 ```text
-old group 0 bytes for PLANE_1
-new group 0 bytes for PLANE_0
-old group 1 bytes for PLANE_1
-new group 1 bytes for PLANE_0
-...
+old rectangle bytes for PLANE_1
+new rectangle bytes for PLANE_0
 ```
 
-`interleave_span_pixels` defines each group. Clients initially use row bands,
-usually `width * 8` pixels, so each group maps to a simple rectangle.
+Firmware writes the full old rectangle first, resets the address window to the
+same rectangle, then writes the full new rectangle.
 
 ## `0x71` Data
 
@@ -91,6 +84,5 @@ Known partial NACK error codes use `{0xFF, opcode, error, 0x00}`:
 0x05: rectangle alignment error
 0x06: unsupported or reserved flags
 0x07: uncompressed_size mismatch
-0x08: invalid interleave_span_pixels
-0x09: stream byte count or content error
+0x08: stream byte count or content error
 ```

@@ -288,8 +288,7 @@ struct SecurityConfig {
 #define ERR_RECT_ALIGN      0x05u  // rectangle x or width not aligned to byte boundary
 #define ERR_PARTIAL_FLAGS   0x06u  // unsupported or reserved flags set
 #define ERR_PARTIAL_SIZE    0x07u  // uncompressed_size does not match rectangle geometry
-#define ERR_PARTIAL_SPAN    0x08u  // invalid interleave_span_pixels
-#define ERR_PARTIAL_STREAM  0x09u  // stream byte count or content error
+#define ERR_PARTIAL_STREAM  0x08u  // stream byte count or content error
 
 // Partial-rendering protocol.
 #define PARTIAL_WRITE_PROTOCOL_V1 0x01u
@@ -312,14 +311,12 @@ struct PartialStreamContext {
     uint16_t y;
     uint16_t width;
     uint16_t height;
-    uint16_t interleave_span_pixels;
     uint32_t logical_uncompressed_size;
     uint32_t logical_bytes_written;
-    uint32_t group_index;
     uint32_t bytes_remaining_in_phase;
     uint32_t old_plane_bytes_written;
     uint32_t new_plane_bytes_written;
-    uint8_t phase;           // 0 = old image (PLANE_1), 1 = new image (PLANE_0)
+    uint8_t phase;           // 0 = old image (PLANE_1), 1 = new image (PLANE_0), 2 = complete
     uint8_t bits_per_pixel;
     uint8_t pixels_per_byte;
 };
