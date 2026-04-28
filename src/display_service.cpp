@@ -1130,6 +1130,8 @@ void updatemsdata(){
 }
 
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
+    // Compressed full-image 0x71 chunks are buffered as compressed bytes.
+    // uzlib is run once at 0x72, so we never keep a decompressed full image in RAM.
     if (!compressedDataBuffer) {
         cleanupDirectWriteState(false);
         uint8_t errorResponse[] = {0xFF, 0xFF};
@@ -1153,6 +1155,8 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
 }
 
 void decompressDirectWriteData() {
+    // Inflate the buffered compressed full-image stream and write each output
+    // chunk directly to the active panel write window.
     if (directWriteCompressedReceived == 0) return;
     struct uzlib_uncomp d;
     memset(&d, 0, sizeof(d));
@@ -1431,7 +1435,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
         bool isCompressed = (partialCtx.flags & PARTIAL_FLAG_COMPRESSED) != 0;
         if (isCompressed) {
             // Match compressed full-image uploads: collect the zlib stream
-            // across 0x76/0x71, then inflate and write at 0x72.
+            // across 0x76/0x71, then inflate at 0x72 through the partial sink.
             if (!directWriteCompressedBuffer) {
                 displayed_etag = 0;
                 cleanupDirectWriteState(false);
@@ -1448,6 +1452,8 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
             memcpy(directWriteCompressedBuffer + directWriteCompressedReceived, data, len);
             directWriteCompressedReceived += len;
         } else {
+            // Raw partial 0x71 data is already panel-plane data, so stream it
+            // immediately and let partial_consume_bytes() retarget planes.
             if (!partial_consume_bytes(data, (uint32_t)len)) {
                 send_direct_write_nack(0x71, ERR_PARTIAL_STREAM, true);
                 return;
@@ -1462,6 +1468,8 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
         handleDirectWriteCompressedData(data, len);
         return;
     }
+    // Raw full-image 0x71 data streams directly to the panel; only compressed
+    // mode needs the intermediate compressed buffer.
     uint32_t remainingBytes = (directWriteBytesWritten < directWriteTotalBytes) ? (directWriteTotalBytes - directWriteBytesWritten) : 0;
     uint16_t bytesToWrite = (len > remainingBytes) ? remainingBytes : len;
     if (bytesToWrite > 0) {
@@ -1646,6 +1654,10 @@ static void setup_phase(void) {
 }
 
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
+    // Partial streams are two controller-plane images concatenated:
+    // old image to PLANE_1, then new image to PLANE_0. This sink accepts raw
+    // or decompressed bytes, writes as much as fits in the current plane, then
+    // opens the same rectangle on the next plane and continues with no buffering.
     uint32_t offset = 0;
     while (offset < len) {
         if (partialCtx.bytes_remaining_in_phase == 0) {
@@ -1675,6 +1687,9 @@ static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
 }
 
 static bool decompress_partial_stream(void) {
+    // Like decompressDirectWriteData(), compressed partial uploads are inflated
+    // only at 0x72. The output chunks go through partial_consume_bytes() so the
+    // old/new plane boundary can retarget the panel write window mid-stream.
     if (!directWriteCompressedBuffer || directWriteCompressedReceived == 0) return false;
     struct uzlib_uncomp d;
     memset(&d, 0, sizeof(d));
