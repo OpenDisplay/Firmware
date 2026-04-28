@@ -92,6 +92,7 @@ static bool partial_consume_bytes(uint8_t* data, uint32_t len);
 static bool decompress_partial_stream(void);
 static uint32_t calc_rect_bytes(uint8_t bpp, uint32_t pixels);
 static bool should_sleep_after_refresh(int refreshMode);
+static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
 static PartialStreamContext partialCtx = {};
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define AXP2101_REG_POWER_STATUS 0x00
@@ -1186,10 +1187,7 @@ void cleanupDirectWriteState(bool refreshDisplay) {
 
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     if (partialCtx.active) {
-        displayed_etag = 0;
-        cleanupDirectWriteState(false);
-        uint8_t errResponse[] = {0xFF, 0x70, ERR_MIXED_DATA, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x70, ERR_MIXED_DATA, true);
         return;
     }
     if (directWriteActive) cleanupDirectWriteState(false);
@@ -1267,17 +1265,13 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_FLAGS, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
         return;
     }
 #endif
 
     if (len < 19 || data[0] != PARTIAL_WRITE_PROTOCOL_V1) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_VERSION, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x76, ERR_PARTIAL_VERSION, false);
         return;
     }
 
@@ -1293,16 +1287,12 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
     // Validate reserved flags. Only compressed and store-etag are defined.
     if (flags & ~(PARTIAL_FLAG_COMPRESSED | PARTIAL_FLAG_STORE_ETAG)) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_FLAGS, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
         return;
     }
 
     if (oldEtag == 0 || displayed_etag == 0 || displayed_etag != oldEtag) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_ETAG_MISMATCH, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x76, ERR_ETAG_MISMATCH, false);
         return;
     }
 
@@ -1314,24 +1304,18 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     if (rectW == 0 || rectH == 0 ||
         (uint32_t)rectX + rectW > dispW ||
         (uint32_t)rectY + rectH > dispH) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_RECT_OOB, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x76, ERR_RECT_OOB, false);
         return;
     }
 
     if ((rectX % pixPerByte) != 0 || (rectW % pixPerByte) != 0) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_RECT_ALIGN, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x76, ERR_RECT_ALIGN, false);
         return;
     }
 
     uint32_t rectBytes = calc_rect_bytes((uint8_t)bpp, (uint32_t)rectW * rectH);
     if (uncompSize != rectBytes * 2u) {
-        displayed_etag = 0;
-        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_SIZE, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
         return;
     }
 
@@ -1387,20 +1371,14 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
         if (isCompressed) {
             uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
             if (cap == 0 || initLen > cap) {
-                displayed_etag = 0;
-                cleanupDirectWriteState(false);
-                uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_STREAM, 0x00};
-                sendResponse(errResponse, sizeof(errResponse));
+                send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, true);
                 return;
             }
             memcpy(directWriteCompressedBuffer, data + 19, initLen);
             directWriteCompressedReceived = initLen;
         } else {
             if (!partial_consume_bytes(data + 19, (uint32_t)initLen)) {
-                displayed_etag = 0;
-                cleanupDirectWriteState(false);
-                uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_STREAM, 0x00};
-                sendResponse(errResponse, sizeof(errResponse));
+                send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, true);
                 return;
             }
         }
@@ -1427,20 +1405,14 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
             uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
             uint32_t newTotal = directWriteCompressedReceived + len;
             if (cap == 0 || newTotal > cap) {
-                displayed_etag = 0;
-                cleanupDirectWriteState(false);
-                uint8_t errResponse[] = {0xFF, 0x71, ERR_PARTIAL_STREAM, 0x00};
-                sendResponse(errResponse, sizeof(errResponse));
+                send_direct_write_nack(0x71, ERR_PARTIAL_STREAM, true);
                 return;
             }
             memcpy(directWriteCompressedBuffer + directWriteCompressedReceived, data, len);
             directWriteCompressedReceived += len;
         } else {
             if (!partial_consume_bytes(data, (uint32_t)len)) {
-                displayed_etag = 0;
-                cleanupDirectWriteState(false);
-                uint8_t errResponse[] = {0xFF, 0x71, ERR_PARTIAL_STREAM, 0x00};
-                sendResponse(errResponse, sizeof(errResponse));
+                send_direct_write_nack(0x71, ERR_PARTIAL_STREAM, true);
                 return;
             }
         }
@@ -1483,10 +1455,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         bool storeEtag = (partialCtx.flags & PARTIAL_FLAG_STORE_ETAG) != 0;
 
         if (isCompressed && !decompress_partial_stream()) {
-            displayed_etag = 0;
-            cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x72, ERR_PARTIAL_STREAM, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
+            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
             return;
         }
 
@@ -1496,18 +1465,12 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         if (partialCtx.logical_bytes_written != partialCtx.logical_uncompressed_size ||
             partialCtx.old_plane_bytes_written != rectBytes ||
             partialCtx.new_plane_bytes_written != rectBytes) {
-            displayed_etag = 0;
-            cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x72, ERR_PARTIAL_STREAM, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
+            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
             return;
         }
 
         if (storeEtag && (data == nullptr || len < 5)) {
-            displayed_etag = 0;
-            cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x72, ERR_PARTIAL_STREAM, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
+            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
             return;
         }
 
@@ -1719,4 +1682,11 @@ static bool should_sleep_after_refresh(int refreshMode) {
     // EP133 loses its partial-refresh state if it is slept immediately after a
     // partial refresh; keep it awake so the next delta can be applied.
     return !(refreshMode == REFRESH_PARTIAL && bbep.type == EP133_960x680);
+}
+
+static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState) {
+    displayed_etag = 0;
+    if (cleanupState) cleanupDirectWriteState(false);
+    uint8_t errResponse[] = {0xFF, opcode, error, 0x00};
+    sendResponse(errResponse, sizeof(errResponse));
 }

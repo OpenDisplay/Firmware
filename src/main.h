@@ -54,7 +54,6 @@ using namespace Adafruit_LittleFS_Namespace;
 #define RESP_DIRECT_WRITE_END_ACK    0x72  // Direct write end acknowledgment
 #define RESP_DIRECT_WRITE_REFRESH_SUCCESS 0x73  // Display refresh completed successfully
 #define RESP_DIRECT_WRITE_REFRESH_TIMEOUT 0x74  // Display refresh timed out
-#define RESP_PARTIAL_WRITE_START_ACK 0x76  // Partial image start acknowledgment
 #define RESP_DIRECT_WRITE_ERROR      0xFF  // Direct write error response
 #define RESP_CONFIG_READ             0x40  // Config read response
 #define RESP_CONFIG_WRITE             0x41  // Config write response
