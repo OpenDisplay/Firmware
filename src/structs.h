@@ -306,7 +306,6 @@ struct SecurityConfig {
 struct PartialStreamContext {
     bool active;
     uint16_t flags;
-    uint32_t old_etag;
     uint16_t x;
     uint16_t y;
     uint16_t width;
@@ -318,7 +317,6 @@ struct PartialStreamContext {
     uint32_t new_plane_bytes_written;
     uint8_t phase;           // 0 = old image (PLANE_1), 1 = new image (PLANE_0), 2 = complete
     uint8_t bits_per_pixel;
-    uint8_t pixels_per_byte;
 };
 
 #endif

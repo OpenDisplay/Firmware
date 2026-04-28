@@ -90,6 +90,8 @@ static void clear_partial_planes_to_white(void);
 static void setup_phase(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
 static bool decompress_partial_stream(void);
+static uint32_t calc_rect_bytes(uint8_t bpp, uint32_t pixels);
+static bool should_sleep_after_refresh(int refreshMode);
 static PartialStreamContext partialCtx = {};
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define AXP2101_REG_POWER_STATUS 0x00
@@ -1325,12 +1327,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
         return;
     }
 
-    uint32_t rectPixels = (uint32_t)rectW * rectH;
-    uint32_t rectBytes;
-    if (bpp == 1)      rectBytes = (rectPixels + 7) / 8;
-    else if (bpp == 2) rectBytes = (rectPixels + 3) / 4;
-    else if (bpp == 4) rectBytes = (rectPixels + 1) / 2;
-    else               rectBytes = rectPixels;
+    uint32_t rectBytes = calc_rect_bytes((uint8_t)bpp, (uint32_t)rectW * rectH);
     if (uncompSize != rectBytes * 2u) {
         displayed_etag = 0;
         uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_SIZE, 0x00};
@@ -1372,14 +1369,12 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     memset(&partialCtx, 0, sizeof(partialCtx));
     partialCtx.active = true;
     partialCtx.flags = flags;
-    partialCtx.old_etag = oldEtag;
     partialCtx.x = rectX;
     partialCtx.y = rectY;
     partialCtx.width = rectW;
     partialCtx.height = rectH;
     partialCtx.logical_uncompressed_size = uncompSize;
     partialCtx.bits_per_pixel = (uint8_t)bpp;
-    partialCtx.pixels_per_byte = pixPerByte;
 
     if (isCompressed) {
         directWriteCompressedBuffer = compressedDataBuffer;
@@ -1495,13 +1490,8 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
             return;
         }
 
-        uint32_t rectPixels = (uint32_t)partialCtx.width * partialCtx.height;
-        uint32_t rectBytes;
-        uint8_t bpp = partialCtx.bits_per_pixel;
-        if (bpp == 1)      rectBytes = (rectPixels + 7) / 8;
-        else if (bpp == 2) rectBytes = (rectPixels + 3) / 4;
-        else if (bpp == 4) rectBytes = (rectPixels + 1) / 2;
-        else               rectBytes = rectPixels;
+        uint32_t rectBytes = calc_rect_bytes(partialCtx.bits_per_pixel,
+                                             (uint32_t)partialCtx.width * partialCtx.height);
 
         if (partialCtx.logical_bytes_written != partialCtx.logical_uncompressed_size ||
             partialCtx.old_plane_bytes_written != rectBytes ||
@@ -1513,7 +1503,15 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
             return;
         }
 
-        bool hasNewEtag = storeEtag && data != nullptr && len >= 5;
+        if (storeEtag && (data == nullptr || len < 5)) {
+            displayed_etag = 0;
+            cleanupDirectWriteState(false);
+            uint8_t errResponse[] = {0xFF, 0x72, ERR_PARTIAL_STREAM, 0x00};
+            sendResponse(errResponse, sizeof(errResponse));
+            return;
+        }
+
+        bool hasNewEtag = storeEtag;
         uint32_t newEtag = 0;
         if (hasNewEtag) {
             newEtag = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
@@ -1535,7 +1533,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
 
         bbepRefresh(&bbep, refreshMode);
         bool refreshSuccess = waitforrefresh(60);
-        if (!(refreshMode == REFRESH_PARTIAL && bbep.type == EP133_960x680)) {
+        if (should_sleep_after_refresh(refreshMode)) {
             bbepSleep(&bbep, 1);
         }
         delay(50);
@@ -1563,7 +1561,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
                   ((uint32_t)data[3] << 8)  |  (uint32_t)data[4];
     }
 
-    int refreshMode = (directWriteDataKind == DATA_KIND_PARTIAL) ? REFRESH_PARTIAL : REFRESH_FULL;
+    int refreshMode = REFRESH_FULL;
     if (data != nullptr && len >= 1) {
         if (data[0] == 1) refreshMode = REFRESH_FAST;
         else if (data[0] == 2) refreshMode = REFRESH_PARTIAL;
@@ -1589,7 +1587,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     {
         bbepRefresh(&bbep, refreshMode);
         refreshSuccess = waitforrefresh(60);
-        if (!(refreshMode == REFRESH_PARTIAL && bbep.type == EP133_960x680)) {
+        if (should_sleep_after_refresh(refreshMode)) {
             bbepSleep(&bbep, 1);
         }
     }
@@ -1612,6 +1610,7 @@ static void clear_partial_planes_to_white(void) {
     // back to the full panel, so partial refresh may touch panel memory outside
     // the 0x76 dirty rectangle. Seed both planes with white first so untouched
     // areas refresh as white instead of stale or uninitialized RAM.
+    // This is controller RAM, not logical image bpp: each controller plane is 1 bpp.
     const uint32_t total_bytes = ((uint32_t)bbep.native_width * (uint32_t)bbep.native_height) / 8;
     uint8_t white[64];
     memset(white, 0xFF, sizeof(white));
@@ -1634,13 +1633,8 @@ static void clear_partial_planes_to_white(void) {
 }
 
 static void setup_phase(void) {
-    uint32_t rect_pixels = (uint32_t)partialCtx.width * partialCtx.height;
-    uint8_t bpp = partialCtx.bits_per_pixel;
-    uint32_t rect_bytes;
-    if (bpp == 1)      rect_bytes = (rect_pixels + 7) / 8;
-    else if (bpp == 2) rect_bytes = (rect_pixels + 3) / 4;
-    else if (bpp == 4) rect_bytes = (rect_pixels + 1) / 2;
-    else               rect_bytes = rect_pixels;
+    uint32_t rect_bytes = calc_rect_bytes(partialCtx.bits_per_pixel,
+                                          (uint32_t)partialCtx.width * partialCtx.height);
 
     if (partialCtx.phase > 1) {
         partialCtx.bytes_remaining_in_phase = 0;
@@ -1712,4 +1706,17 @@ static bool decompress_partial_stream(void) {
     return res == TINF_DONE &&
            partialCtx.logical_bytes_written == partialCtx.logical_uncompressed_size &&
            d.source == d.source_limit;
+}
+
+static uint32_t calc_rect_bytes(uint8_t bpp, uint32_t pixels) {
+    if (bpp == 1) return (pixels + 7) / 8;
+    if (bpp == 2) return (pixels + 3) / 4;
+    if (bpp == 4) return (pixels + 1) / 2;
+    return pixels;
+}
+
+static bool should_sleep_after_refresh(int refreshMode) {
+    // EP133 loses its partial-refresh state if it is slept immediately after a
+    // partial refresh; keep it awake so the next delta can be applied.
+    return !(refreshMode == REFRESH_PARTIAL && bbep.type == EP133_960x680);
 }
