@@ -86,10 +86,11 @@ void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
 bool bbepIsBusy(BBEPDISP *pBBEP);
 void flashLed(uint8_t color, uint8_t brightness);
-static void clear_partial_planes_for_gdem133(void);
-static bool write_partial_compressed_segment(uint8_t* data, uint16_t len, uint16_t* offset,
-                                             uint16_t segX, uint16_t segY, uint16_t segW,
-                                             uint16_t segH, uint32_t segBytes, int plane);
+static void clear_partial_planes_to_white(void);
+static void setup_phase(void);
+static bool partial_consume_bytes(uint8_t* data, uint32_t len);
+static bool decompress_partial_stream(void);
+static PartialStreamContext partialCtx = {};
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define AXP2101_REG_POWER_STATUS 0x00
 #define AXP2101_REG_DC_ONOFF_DVM_CTRL 0x80
@@ -1165,6 +1166,7 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteRefreshMode = 0;
     directWriteStartTime = 0;
     directWriteDataKind = DATA_KIND_NONE;
+    memset(&partialCtx, 0, sizeof(partialCtx));
     if (refreshDisplay && displayPowerState) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
         if (seeed_driver_used()) {
@@ -1181,6 +1183,13 @@ void cleanupDirectWriteState(bool refreshDisplay) {
 }
 
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
+    if (partialCtx.active) {
+        displayed_etag = 0;
+        cleanupDirectWriteState(false);
+        uint8_t errResponse[] = {0xFF, 0x70, ERR_MIXED_DATA, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
     if (directWriteActive) cleanupDirectWriteState(false);
     bool isCompressedStart = (len >= 4);
 
@@ -1254,63 +1263,169 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
 void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     if (directWriteActive) cleanupDirectWriteState(false);
 
-    if (len != 5 || data[0] != PARTIAL_WRITE_PROTOCOL_V1) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+    if (seeed_driver_used()) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_FLAGS, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+#endif
+
+    if (len < 21 || data[0] != PARTIAL_WRITE_PROTOCOL_V1) {
         displayed_etag = 0;
         uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_VERSION, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
         return;
     }
 
-    uint32_t oldEtag = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
-                       ((uint32_t)data[3] << 8)  |  (uint32_t)data[4];
-    if (displayed_etag == 0 || displayed_etag != oldEtag) {
+    uint16_t flags    = ((uint16_t)data[1] << 8) | data[2];
+    uint32_t oldEtag  = ((uint32_t)data[3] << 24) | ((uint32_t)data[4] << 16) |
+                        ((uint32_t)data[5] << 8)  |  (uint32_t)data[6];
+    uint16_t rectX    = ((uint16_t)data[7]  << 8) | data[8];
+    uint16_t rectY    = ((uint16_t)data[9]  << 8) | data[10];
+    uint16_t rectW    = ((uint16_t)data[11] << 8) | data[12];
+    uint16_t rectH    = ((uint16_t)data[13] << 8) | data[14];
+    uint16_t spanPx   = ((uint16_t)data[15] << 8) | data[16];
+    uint32_t uncompSize;
+    memcpy(&uncompSize, data + 17, 4);  // 4-byte LE
+
+    // Validate reserved flags (bits 5-15 must be 0; bits 0-4 are defined)
+    if (flags & 0xFFE0u) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_FLAGS, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+    uint8_t planeOrder = flags & 0x03u;
+    if (planeOrder == 0x02u || planeOrder == 0x03u) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_FLAGS, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+
+    if (oldEtag == 0 || displayed_etag == 0 || displayed_etag != oldEtag) {
         displayed_etag = 0;
         uint8_t errResponse[] = {0xFF, 0x76, ERR_ETAG_MISMATCH, 0x00};
         sendResponse(errResponse, sizeof(errResponse));
         return;
     }
 
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
-        seeed_gfx_prepare_hardware();
+    uint16_t dispW = globalConfig.displays[0].pixel_width;
+    uint16_t dispH = globalConfig.displays[0].pixel_height;
+    int bpp = getBitsPerPixel();
+    uint8_t pixPerByte = (bpp == 1) ? 8u : (bpp == 2) ? 4u : (bpp == 4) ? 2u : 1u;
+
+    if (rectW == 0 || rectH == 0 ||
+        (uint32_t)rectX + rectW > dispW ||
+        (uint32_t)rectY + rectH > dispH) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_RECT_OOB, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
     }
-#endif
-    uint8_t colorScheme = globalConfig.displays[0].color_scheme;
-    directWriteBitplanes = (colorScheme == 1 || colorScheme == 2);
-    directWritePlane2 = false;
-    directWriteCompressed = false;
-    directWriteWidth = globalConfig.displays[0].pixel_width;
-    directWriteHeight = globalConfig.displays[0].pixel_height;
-    uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
-    if (directWriteBitplanes) directWriteTotalBytes = (pixels + 7) / 8;
-    else {
-        int bitsPerPixel = getBitsPerPixel();
-        if (bitsPerPixel == 4) directWriteTotalBytes = (pixels + 1) / 2;
-        else if (bitsPerPixel == 2) directWriteTotalBytes = (pixels + 3) / 4;
-        else directWriteTotalBytes = (pixels + 7) / 8;
+
+    if ((rectX % pixPerByte) != 0 || (rectW % pixPerByte) != 0) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_RECT_ALIGN, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
     }
+
+    if (spanPx == 0 || (spanPx % pixPerByte) != 0 ||
+        (rectW % spanPx != 0 && spanPx % rectW != 0)) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_SPAN, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+
+    uint32_t rectPixels = (uint32_t)rectW * rectH;
+    uint32_t rectBytes;
+    if (bpp == 1)      rectBytes = (rectPixels + 7) / 8;
+    else if (bpp == 2) rectBytes = (rectPixels + 3) / 4;
+    else if (bpp == 4) rectBytes = (rectPixels + 1) / 2;
+    else               rectBytes = rectPixels;
+    if (uncompSize != rectBytes * 2u) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_SIZE, 0x00};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+
+    bool isCompressed = (flags & PARTIAL_FLAG_COMPRESSED) != 0;
+    if (isCompressed && !compressedDataBuffer) {
+        displayed_etag = 0;
+        uint8_t errResponse[] = {0xFF, 0xFF};
+        sendResponse(errResponse, sizeof(errResponse));
+        return;
+    }
+
+    // Hardware init
+    directWriteWidth = dispW;
+    directWriteHeight = dispH;
     directWriteActive = true;
-    directWriteBytesWritten = 0;
+    directWriteDataKind = DATA_KIND_PARTIAL;
     directWriteStartTime = millis();
     if (displayPowerState) {
         pwrmgm(false);
         delay(50);
     }
     pwrmgm(true);
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
-        seeed_gfx_direct_write_reset();
-    } else
-#endif
-    {
-        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
-        bbepWakeUp(&bbep);
-        if (bbep.pInitPart != NULL) {
-            bbepSendCMDSequence(&bbep, bbep.pInitPart);
+    bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin,
+               globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin,
+               globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+    bbepWakeUp(&bbep);
+    if (bbep.pInitPart != NULL) {
+        bbepSendCMDSequence(&bbep, bbep.pInitPart);
+    } else {
+        bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    }
+    clear_partial_planes_to_white();
+
+    // Initialize stream context
+    memset(&partialCtx, 0, sizeof(partialCtx));
+    partialCtx.active = true;
+    partialCtx.flags = flags;
+    partialCtx.old_etag = oldEtag;
+    partialCtx.x = rectX;
+    partialCtx.y = rectY;
+    partialCtx.width = rectW;
+    partialCtx.height = rectH;
+    partialCtx.interleave_span_pixels = spanPx;
+    partialCtx.logical_uncompressed_size = uncompSize;
+    partialCtx.bits_per_pixel = (uint8_t)bpp;
+    partialCtx.pixels_per_byte = pixPerByte;
+
+    if (isCompressed) {
+        directWriteCompressedBuffer = compressedDataBuffer;
+        directWriteCompressedReceived = 0;
+    }
+
+    // Process optional initial stream bytes before ACK
+    if (len > 21) {
+        uint16_t initLen = len - 21;
+        if (isCompressed) {
+            uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
+            if (cap == 0 || initLen > cap) {
+                displayed_etag = 0;
+                cleanupDirectWriteState(false);
+                uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_STREAM, 0x00};
+                sendResponse(errResponse, sizeof(errResponse));
+                return;
+            }
+            memcpy(directWriteCompressedBuffer, data + 21, initLen);
+            directWriteCompressedReceived = initLen;
         } else {
-            bbepSendCMDSequence(&bbep, bbep.pInitFull);
+            if (!partial_consume_bytes(data + 21, (uint32_t)initLen)) {
+                displayed_etag = 0;
+                cleanupDirectWriteState(false);
+                uint8_t errResponse[] = {0xFF, 0x76, ERR_PARTIAL_STREAM, 0x00};
+                sendResponse(errResponse, sizeof(errResponse));
+                return;
+            }
         }
-        clear_partial_planes_for_gdem133();
     }
 
     uint8_t ackResponse[] = {0x00, 0x76};
@@ -1320,10 +1435,39 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (!directWriteActive || len == 0) return;
     if (directWriteDataKind == DATA_KIND_PARTIAL) {
-        displayed_etag = 0;
-        cleanupDirectWriteState(false);
-        uint8_t errResponse[] = {0xFF, 0x71, ERR_MIXED_DATA, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
+        bool isCompressed = (partialCtx.flags & PARTIAL_FLAG_COMPRESSED) != 0;
+        if (isCompressed) {
+            // Match compressed full-image uploads: collect the zlib stream
+            // across 0x76/0x71, then inflate and write at 0x72.
+            if (!directWriteCompressedBuffer) {
+                displayed_etag = 0;
+                cleanupDirectWriteState(false);
+                uint8_t errResponse[] = {0xFF, 0xFF};
+                sendResponse(errResponse, sizeof(errResponse));
+                return;
+            }
+            uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
+            uint32_t newTotal = directWriteCompressedReceived + len;
+            if (cap == 0 || newTotal > cap) {
+                displayed_etag = 0;
+                cleanupDirectWriteState(false);
+                uint8_t errResponse[] = {0xFF, 0x71, ERR_PARTIAL_STREAM, 0x00};
+                sendResponse(errResponse, sizeof(errResponse));
+                return;
+            }
+            memcpy(directWriteCompressedBuffer + directWriteCompressedReceived, data, len);
+            directWriteCompressedReceived += len;
+        } else {
+            if (!partial_consume_bytes(data, (uint32_t)len)) {
+                displayed_etag = 0;
+                cleanupDirectWriteState(false);
+                uint8_t errResponse[] = {0xFF, 0x71, ERR_PARTIAL_STREAM, 0x00};
+                sendResponse(errResponse, sizeof(errResponse));
+                return;
+            }
+        }
+        uint8_t ackResponse[] = {0x00, 0x71};
+        sendResponse(ackResponse, sizeof(ackResponse));
         return;
     }
     directWriteDataKind = DATA_KIND_FULL;
@@ -1355,6 +1499,77 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
 void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     if (!directWriteActive) return;
     directWriteStartTime = 0;
+
+    if (directWriteDataKind == DATA_KIND_PARTIAL) {
+        bool isCompressed = (partialCtx.flags & PARTIAL_FLAG_COMPRESSED) != 0;
+        bool storeEtag = (partialCtx.flags & PARTIAL_FLAG_STORE_ETAG) != 0;
+
+        if (isCompressed && !decompress_partial_stream()) {
+            displayed_etag = 0;
+            cleanupDirectWriteState(false);
+            uint8_t errResponse[] = {0xFF, 0x72, ERR_PARTIAL_STREAM, 0x00};
+            sendResponse(errResponse, sizeof(errResponse));
+            return;
+        }
+
+        uint32_t rectPixels = (uint32_t)partialCtx.width * partialCtx.height;
+        uint32_t rectBytes;
+        uint8_t bpp = partialCtx.bits_per_pixel;
+        if (bpp == 1)      rectBytes = (rectPixels + 7) / 8;
+        else if (bpp == 2) rectBytes = (rectPixels + 3) / 4;
+        else if (bpp == 4) rectBytes = (rectPixels + 1) / 2;
+        else               rectBytes = rectPixels;
+
+        if (partialCtx.logical_bytes_written != partialCtx.logical_uncompressed_size ||
+            partialCtx.old_plane_bytes_written != rectBytes ||
+            partialCtx.new_plane_bytes_written != rectBytes) {
+            displayed_etag = 0;
+            cleanupDirectWriteState(false);
+            uint8_t errResponse[] = {0xFF, 0x72, ERR_PARTIAL_STREAM, 0x00};
+            sendResponse(errResponse, sizeof(errResponse));
+            return;
+        }
+
+        bool hasNewEtag = storeEtag && data != nullptr && len >= 5;
+        uint32_t newEtag = 0;
+        if (hasNewEtag) {
+            newEtag = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
+                      ((uint32_t)data[3] << 8)  |  (uint32_t)data[4];
+        }
+
+        // Default PARTIAL; allow FAST override; FULL → PARTIAL for partial streams
+        int refreshMode = REFRESH_PARTIAL;
+        if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
+
+        writeSerial(String("EPD partial refresh: ") +
+                    (refreshMode == REFRESH_FAST ? "FAST" : "PARTIAL") +
+                    " (mode=" + String(refreshMode) +
+                    ", rect=" + String(partialCtx.x) + "," + String(partialCtx.y) +
+                    " " + String(partialCtx.width) + "x" + String(partialCtx.height) + ")", true);
+        uint8_t ackResponse[] = {0x00, 0x72};
+        sendResponse(ackResponse, sizeof(ackResponse));
+        delay(20);
+
+        bbepRefresh(&bbep, refreshMode);
+        bool refreshSuccess = waitforrefresh(60);
+        if (!(refreshMode == REFRESH_PARTIAL && bbep.type == EP133_960x680)) {
+            bbepSleep(&bbep, 1);
+        }
+        delay(50);
+        cleanupDirectWriteState(false);
+
+        if (refreshSuccess) {
+            displayed_etag = hasNewEtag ? newEtag : 0;
+            uint8_t refreshResponse[] = {0x00, 0x73};
+            sendResponse(refreshResponse, sizeof(refreshResponse));
+        } else {
+            displayed_etag = 0;
+            uint8_t timeoutResponse[] = {0x00, 0x74};
+            sendResponse(timeoutResponse, sizeof(timeoutResponse));
+        }
+        return;
+    }
+
     if (directWriteCompressed && directWriteCompressedReceived > 0) decompressDirectWriteData();
 
     // Optional new_etag tail: refresh_mode(1) + new_etag(4 BE) when len >= 5.
@@ -1408,9 +1623,12 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     }
 }
 
-static void clear_partial_planes_for_gdem133(void) {
-    if (bbep.type != EP133_960x680) return;
-
+static void clear_partial_planes_to_white(void) {
+    // bb_epaper's partial refresh path runs the panel's partial init sequence
+    // inside bbepRefresh(). Some panel init sequences force the RAM window
+    // back to the full panel, so partial refresh may touch panel memory outside
+    // the 0x76 dirty rectangle. Seed both planes with white first so untouched
+    // areas refresh as white instead of stale or uninitialized RAM.
     const uint32_t total_bytes = ((uint32_t)bbep.native_width * (uint32_t)bbep.native_height) / 8;
     uint8_t white[64];
     memset(white, 0xFF, sizeof(white));
@@ -1432,168 +1650,124 @@ static void clear_partial_planes_for_gdem133(void) {
     }
 }
 
-static bool write_partial_compressed_segment(uint8_t* data, uint16_t len, uint16_t* offset,
-                                             uint16_t segX, uint16_t segY, uint16_t segW,
-                                             uint16_t segH, uint32_t segBytes, int plane) {
-    if (*offset >= len) return false;
+static void setup_phase(void) {
+    uint32_t rect_pixels = (uint32_t)partialCtx.width * partialCtx.height;
+    uint32_t span_pixels = partialCtx.interleave_span_pixels;
+    uint32_t group_start_pixel = partialCtx.group_index * span_pixels;
 
-    struct uzlib_uncomp d;
-    memset(&d, 0, sizeof(d));
-    d.source = data + *offset;
-    d.source_limit = data + len;
-    d.source_read_cb = NULL;
+    if (group_start_pixel >= rect_pixels) {
+        partialCtx.bytes_remaining_in_phase = 0;
+        return;
+    }
 
-    uzlib_init();
-    int hdr = uzlib_zlib_parse_header(&d);
-    if (hdr < 0) return false;
+    uint32_t group_pixels = span_pixels;
+    if (group_start_pixel + group_pixels > rect_pixels)
+        group_pixels = rect_pixels - group_start_pixel;
 
-    uint16_t window = 0x100 << hdr;
-    if (window > (uint16_t)(32 * 1024)) window = (uint16_t)(32 * 1024);
-    uzlib_uncompress_init(&d, dictionaryBuffer, window);
+    uint8_t bpp = partialCtx.bits_per_pixel;
+    uint32_t group_bytes;
+    if (bpp == 1)      group_bytes = (group_pixels + 7) / 8;
+    else if (bpp == 2) group_bytes = (group_pixels + 3) / 4;
+    else if (bpp == 4) group_bytes = (group_pixels + 1) / 2;
+    else               group_bytes = group_pixels;
 
-    bbepSetAddrWindow(&bbep, segX, segY, segW, segH);
+    uint16_t group_x, group_y, group_w, group_h;
+    uint16_t w = partialCtx.width;
+    if (span_pixels % w == 0) {
+        // Row-band: span covers whole rows
+        group_x = partialCtx.x;
+        group_y = partialCtx.y + (uint16_t)(group_start_pixel / w);
+        group_w = w;
+        group_h = (uint16_t)(group_pixels / w);
+    } else {
+        // Horizontal run within a row
+        group_x = partialCtx.x + (uint16_t)(group_start_pixel % w);
+        group_y = partialCtx.y + (uint16_t)(group_start_pixel / w);
+        group_w = (uint16_t)group_pixels;
+        group_h = 1;
+    }
+
+    // Determine plane: default (0b00) = phase 0 → PLANE_1 (old), phase 1 → PLANE_0 (new)
+    //                  new/old (0b01) = phase 0 → PLANE_0 (new), phase 1 → PLANE_1 (old)
+    uint8_t planeOrder = partialCtx.flags & 0x03u;
+    int plane;
+    if (planeOrder == 0x00u) {
+        plane = (partialCtx.phase == 0) ? PLANE_1 : PLANE_0;
+    } else {
+        plane = (partialCtx.phase == 0) ? PLANE_0 : PLANE_1;
+    }
+
+    bbepSetAddrWindow(&bbep, group_x, group_y, group_w, group_h);
     bbepStartWrite(&bbep, plane);
+    partialCtx.bytes_remaining_in_phase = group_bytes;
+}
 
-    uint32_t bytesWritten = 0;
-    int res = TINF_OK;
-    while (bytesWritten < segBytes) {
-        uint32_t remaining = segBytes - bytesWritten;
-        uint32_t chunk = remaining < 4096u ? remaining : 4096u;
-        d.dest_start = decompressionChunk;
-        d.dest = decompressionChunk;
-        d.dest_limit = decompressionChunk + chunk;
-        res = uzlib_uncompress_chksum(&d);
-        if (res < 0) return false;
-        size_t bytesOut = d.dest - d.dest_start;
-        if (bytesOut == 0 && res != TINF_DONE) return false;
-        if (bytesOut > remaining) return false;
-        if (bytesOut > 0) {
-            bbepWriteData(&bbep, decompressionChunk, (int)bytesOut);
-            bytesWritten += (uint32_t)bytesOut;
+static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
+    uint32_t offset = 0;
+    while (offset < len) {
+        if (partialCtx.bytes_remaining_in_phase == 0) {
+            setup_phase();
+            if (partialCtx.bytes_remaining_in_phase == 0)
+                return false;  // extra bytes beyond expected stream size
         }
-        if (res == TINF_DONE) break;
+
+        uint32_t can_consume = len - offset;
+        if (can_consume > partialCtx.bytes_remaining_in_phase)
+            can_consume = partialCtx.bytes_remaining_in_phase;
+
+        bbepWriteData(&bbep, data + offset, (int)can_consume);
+
+        // Track per-plane byte counts
+        uint8_t planeOrder = partialCtx.flags & 0x03u;
+        bool is_old_phase = (planeOrder == 0x00u) ? (partialCtx.phase == 0) : (partialCtx.phase == 1);
+        if (is_old_phase) partialCtx.old_plane_bytes_written += can_consume;
+        else              partialCtx.new_plane_bytes_written += can_consume;
+
+        partialCtx.bytes_remaining_in_phase -= can_consume;
+        partialCtx.logical_bytes_written += can_consume;
+        offset += can_consume;
+
+        if (partialCtx.bytes_remaining_in_phase == 0) {
+            // Advance to next section
+            if (partialCtx.phase == 0) {
+                partialCtx.phase = 1;
+            } else {
+                partialCtx.phase = 0;
+                partialCtx.group_index++;
+            }
+        }
     }
-
-    if (bytesWritten != segBytes) return false;
-
-    while (res != TINF_DONE) {
-        d.dest_start = decompressionChunk;
-        d.dest = decompressionChunk;
-        d.dest_limit = decompressionChunk + 1;
-        res = uzlib_uncompress_chksum(&d);
-        if (res < 0) return false;
-        if (d.dest != d.dest_start) return false;
-    }
-
-    uintptr_t consumed = (uintptr_t)(d.source - data);
-    if (consumed <= *offset || consumed > len) return false;
-    *offset = (uint16_t)consumed;
     return true;
 }
 
-// 0x77 partial image data: one or more segments, each
-// {x:u16BE, y:u16BE, w:u16BE, h:u16BE, flags:u8, payload}.
-// flags bit 0 = plane select (0=PLANE_0 new, 1=PLANE_1 old).
-// flags bit 1 = payload is one complete zlib stream. bits 2-7 reserved.
-void handlePartialWriteData(uint8_t* data, uint16_t len) {
-    if (!directWriteActive || len == 0) return;
-
-    if (directWriteCompressed) {
-        displayed_etag = 0;
-        cleanupDirectWriteState(false);
-        uint8_t errResponse[] = {0xFF, 0x77, ERR_MIXED_DATA, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
-        return;
-    }
-
-    if (directWriteDataKind == DATA_KIND_FULL) {
-        displayed_etag = 0;
-        cleanupDirectWriteState(false);
-        uint8_t errResponse[] = {0xFF, 0x77, ERR_MIXED_DATA, 0x00};
-        sendResponse(errResponse, sizeof(errResponse));
-        return;
-    }
-    directWriteDataKind = DATA_KIND_PARTIAL;
-
-    int bitsPerPixel = getBitsPerPixel();
-    uint16_t offset = 0;
-
-    while (offset < len) {
-        if ((uint16_t)(len - offset) < 9) {
-            displayed_etag = 0;
-            cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
-            return;
+static bool decompress_partial_stream(void) {
+    if (!directWriteCompressedBuffer || directWriteCompressedReceived == 0) return false;
+    struct uzlib_uncomp d;
+    memset(&d, 0, sizeof(d));
+    d.source = directWriteCompressedBuffer;
+    d.source_limit = directWriteCompressedBuffer + directWriteCompressedReceived;
+    d.source_read_cb = NULL;
+    uzlib_init();
+    int hdr = uzlib_zlib_parse_header(&d);
+    if (hdr < 0) return false;
+    uint16_t window = 0x100 << hdr;
+    if (window > (uint16_t)(32 * 1024)) window = (uint16_t)(32 * 1024);
+    uzlib_uncompress_init(&d, dictionaryBuffer, window);
+    int res;
+    do {
+        d.dest_start = decompressionChunk;
+        d.dest = decompressionChunk;
+        d.dest_limit = decompressionChunk + 4096;
+        res = uzlib_uncompress_chksum(&d);
+        size_t bytesOut = d.dest - d.dest_start;
+        if (bytesOut > 0) {
+            if (!partial_consume_bytes(decompressionChunk, (uint32_t)bytesOut)) return false;
         }
+        if (res < 0) return false;
+        if (partialCtx.logical_bytes_written > partialCtx.logical_uncompressed_size) return false;
+    } while (res == TINF_OK);
 
-        uint16_t segX = ((uint16_t)data[offset + 0] << 8) | data[offset + 1];
-        uint16_t segY = ((uint16_t)data[offset + 2] << 8) | data[offset + 3];
-        uint16_t segW = ((uint16_t)data[offset + 4] << 8) | data[offset + 5];
-        uint16_t segH = ((uint16_t)data[offset + 6] << 8) | data[offset + 7];
-        uint8_t  flags = data[offset + 8];
-        offset += 9;
-
-        if ((flags & PARTIAL_SEGMENT_FLAG_RESERVED) != 0) {
-            displayed_etag = 0;
-            cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
-            return;
-        }
-
-        // SSD16xx-class controllers stream 8 horizontal pixels per byte and
-        // bbepSetAddrWindow rounds the address-window X to a byte boundary.
-        // Reject misaligned X/W rather than silently corrupt the segment.
-        if (((segX | segW) & 0x07) != 0) {
-            displayed_etag = 0;
-            cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_ALIGN, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
-            return;
-        }
-
-        if ((uint32_t)segX + segW > directWriteWidth ||
-            (uint32_t)segY + segH > directWriteHeight) {
-            displayed_etag = 0;
-            cleanupDirectWriteState(false);
-            uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
-            sendResponse(errResponse, sizeof(errResponse));
-            return;
-        }
-
-        uint32_t segPixels = (uint32_t)segW * (uint32_t)segH;
-        uint32_t segBytes;
-        if (bitsPerPixel == 4)      segBytes = (segPixels + 1) / 2;
-        else if (bitsPerPixel == 2) segBytes = (segPixels + 3) / 4;
-        else                        segBytes = (segPixels + 7) / 8;
-
-        int plane = (flags & PARTIAL_SEGMENT_FLAG_PLANE1) ? PLANE_1 : PLANE_0;
-        if ((flags & PARTIAL_SEGMENT_FLAG_COMPRESSED) != 0) {
-            if (!write_partial_compressed_segment(data, len, &offset, segX, segY, segW, segH, segBytes, plane)) {
-                displayed_etag = 0;
-                cleanupDirectWriteState(false);
-                uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
-                sendResponse(errResponse, sizeof(errResponse));
-                return;
-            }
-        } else {
-            if ((uint32_t)(len - offset) < segBytes) {
-                displayed_etag = 0;
-                cleanupDirectWriteState(false);
-                uint8_t errResponse[] = {0xFF, 0x77, ERR_SEGMENT_OOB, 0x00};
-                sendResponse(errResponse, sizeof(errResponse));
-                return;
-            }
-
-            bbepSetAddrWindow(&bbep, segX, segY, segW, segH);
-            bbepStartWrite(&bbep, plane);
-            bbepWriteData(&bbep, data + offset, (int)segBytes);
-
-            offset += (uint16_t)segBytes;
-        }
-    }
-
-    uint8_t ackResponse[] = {0x00, 0x77};
-    sendResponse(ackResponse, sizeof(ackResponse));
+    return res == TINF_DONE &&
+           partialCtx.logical_bytes_written == partialCtx.logical_uncompressed_size &&
+           d.source == d.source_limit;
 }

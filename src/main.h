@@ -55,7 +55,6 @@ using namespace Adafruit_LittleFS_Namespace;
 #define RESP_DIRECT_WRITE_REFRESH_SUCCESS 0x73  // Display refresh completed successfully
 #define RESP_DIRECT_WRITE_REFRESH_TIMEOUT 0x74  // Display refresh timed out
 #define RESP_PARTIAL_WRITE_START_ACK 0x76  // Partial image start acknowledgment
-#define RESP_PARTIAL_WRITE_DATA_ACK  0x77  // Partial image data acknowledgment
 #define RESP_DIRECT_WRITE_ERROR      0xFF  // Direct write error response
 #define RESP_CONFIG_READ             0x40  // Config read response
 #define RESP_CONFIG_WRITE             0x41  // Config write response
@@ -192,7 +191,7 @@ uint16_t directWriteWidth = 0;  // Display width in pixels
 uint16_t directWriteHeight = 0;  // Display height in pixels
 uint32_t directWriteTotalBytes = 0;  // Total bytes expected per plane (for bitplanes) or total (for others)
 uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if supported)
-uint8_t directWriteDataKind = DATA_KIND_NONE;  // 0x71 (FULL) vs 0x77 (PARTIAL) tracking for current transfer
+uint8_t directWriteDataKind = DATA_KIND_NONE;  // DATA_KIND_FULL (0x71 after 0x70) vs DATA_KIND_PARTIAL (0x71 after 0x76)
 
 // Direct write compressed mode: use same buffer as regular image upload
 uint32_t directWriteCompressedSize = 0;  // Total compressed size expected
@@ -265,7 +264,6 @@ void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteEnd(uint8_t* data = nullptr, uint16_t len = 0);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
-void handlePartialWriteData(uint8_t* data, uint16_t len);
 int mapEpd(int id);
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
