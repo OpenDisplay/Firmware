@@ -303,15 +303,13 @@ struct SecurityConfig securityConfig = {0};
 EncryptionSession encryptionSession = {0};
 bool encryptionInitialized = false;
 
-#ifndef RTC_DATA_ATTR
-// nRF52 has no equivalent of ESP32 RTC slow RAM; the variable becomes a
-// regular global and resets on boot — partial-rendering then degrades to
-// always-full-upload, which is the safe fallback.
-#define RTC_DATA_ATTR
-#endif
-
+#ifdef TARGET_ESP32
 // 0x00000000 = "not set". Persists across deep sleep on ESP32.
 RTC_DATA_ATTR uint32_t displayed_etag = 0;
+#else
+// 0x00000000 = "not set". Non-ESP32 targets reset this on boot.
+uint32_t displayed_etag = 0;
+#endif
 
 #ifdef TARGET_ESP32
 // RTC memory variables for deep sleep state tracking
