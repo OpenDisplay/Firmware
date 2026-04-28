@@ -81,13 +81,12 @@ struct PartialStreamContext {
     uint16_t y;
     uint16_t width;
     uint16_t height;
-    uint32_t logical_uncompressed_size;
+    uint32_t expected_stream_size;
     uint32_t logical_bytes_written;
     uint32_t bytes_remaining_in_phase;
     uint32_t old_plane_bytes_written;
     uint32_t new_plane_bytes_written;
     uint8_t phase;           // 0 = old image (PLANE_1), 1 = new image (PLANE_0), 2 = complete
-    uint8_t bits_per_pixel;
 };
 
 uint32_t max_compressed_image_rx_bytes(uint8_t tm) {
@@ -123,7 +122,7 @@ static void clear_partial_planes_to_white(void);
 static void setup_phase(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
 static bool decompress_partial_stream(void);
-static uint32_t calc_rect_bytes(uint8_t bpp, uint32_t pixels);
+static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
 static bool should_sleep_after_refresh(int refreshMode);
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
 static PartialStreamContext partialCtx = {};
@@ -1331,8 +1330,6 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
     uint16_t dispW = globalConfig.displays[0].pixel_width;
     uint16_t dispH = globalConfig.displays[0].pixel_height;
-    int bpp = getBitsPerPixel();
-    uint8_t pixPerByte = (bpp == 1) ? 8u : (bpp == 2) ? 4u : (bpp == 4) ? 2u : 1u;
 
     if (rectW == 0 || rectH == 0 ||
         (uint32_t)rectX + rectW > dispW ||
@@ -1341,13 +1338,13 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
         return;
     }
 
-    if ((rectX % pixPerByte) != 0 || (rectW % pixPerByte) != 0) {
+    if ((rectX & 7u) != 0 || (rectW & 7u) != 0) {
         send_direct_write_nack(0x76, ERR_RECT_ALIGN, false);
         return;
     }
 
-    uint32_t rectBytes = calc_rect_bytes((uint8_t)bpp, (uint32_t)rectW * rectH);
-    if (uncompSize != rectBytes * 2u) {
+    uint32_t planeBytes = calc_controller_plane_bytes(rectW, rectH);
+    if (uncompSize != planeBytes * 2u) {
         send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
         return;
     }
@@ -1390,8 +1387,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     partialCtx.y = rectY;
     partialCtx.width = rectW;
     partialCtx.height = rectH;
-    partialCtx.logical_uncompressed_size = uncompSize;
-    partialCtx.bits_per_pixel = (uint8_t)bpp;
+    partialCtx.expected_stream_size = uncompSize;
 
     if (isCompressed) {
         directWriteCompressedBuffer = compressedDataBuffer;
@@ -1492,12 +1488,11 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
             return;
         }
 
-        uint32_t rectBytes = calc_rect_bytes(partialCtx.bits_per_pixel,
-                                             (uint32_t)partialCtx.width * partialCtx.height);
+        uint32_t planeBytes = calc_controller_plane_bytes(partialCtx.width, partialCtx.height);
 
-        if (partialCtx.logical_bytes_written != partialCtx.logical_uncompressed_size ||
-            partialCtx.old_plane_bytes_written != rectBytes ||
-            partialCtx.new_plane_bytes_written != rectBytes) {
+        if (partialCtx.logical_bytes_written != partialCtx.expected_stream_size ||
+            partialCtx.old_plane_bytes_written != planeBytes ||
+            partialCtx.new_plane_bytes_written != planeBytes) {
             send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
             return;
         }
@@ -1629,8 +1624,7 @@ static void clear_partial_planes_to_white(void) {
 }
 
 static void setup_phase(void) {
-    uint32_t rect_bytes = calc_rect_bytes(partialCtx.bits_per_pixel,
-                                          (uint32_t)partialCtx.width * partialCtx.height);
+    uint32_t plane_bytes = calc_controller_plane_bytes(partialCtx.width, partialCtx.height);
 
     if (partialCtx.phase > 1) {
         partialCtx.bytes_remaining_in_phase = 0;
@@ -1640,7 +1634,7 @@ static void setup_phase(void) {
     int plane = (partialCtx.phase == 0) ? PLANE_1 : PLANE_0;
     bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
     bbepStartWrite(&bbep, plane);
-    partialCtx.bytes_remaining_in_phase = rect_bytes;
+    partialCtx.bytes_remaining_in_phase = plane_bytes;
 }
 
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
@@ -1696,19 +1690,16 @@ static bool decompress_partial_stream(void) {
             if (!partial_consume_bytes(decompressionChunk, (uint32_t)bytesOut)) return false;
         }
         if (res < 0) return false;
-        if (partialCtx.logical_bytes_written > partialCtx.logical_uncompressed_size) return false;
+        if (partialCtx.logical_bytes_written > partialCtx.expected_stream_size) return false;
     } while (res == TINF_OK);
 
     return res == TINF_DONE &&
-           partialCtx.logical_bytes_written == partialCtx.logical_uncompressed_size &&
+           partialCtx.logical_bytes_written == partialCtx.expected_stream_size &&
            d.source == d.source_limit;
 }
 
-static uint32_t calc_rect_bytes(uint8_t bpp, uint32_t pixels) {
-    if (bpp == 1) return (pixels + 7) / 8;
-    if (bpp == 2) return (pixels + 3) / 4;
-    if (bpp == 4) return (pixels + 1) / 2;
-    return pixels;
+static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height) {
+    return ((uint32_t)(width + 7u) / 8u) * height;
 }
 
 static bool should_sleep_after_refresh(int refreshMode) {
