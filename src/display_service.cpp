@@ -69,6 +69,7 @@ static const uint8_t ERR_RECT_ALIGN = 0x05u;
 static const uint8_t ERR_PARTIAL_FLAGS = 0x06u;
 static const uint8_t ERR_PARTIAL_SIZE = 0x07u;
 static const uint8_t ERR_PARTIAL_STREAM = 0x08u;
+static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x09u;
 
 static const uint8_t PARTIAL_WRITE_PROTOCOL_V1 = 0x01u;
 static const uint16_t PARTIAL_FLAG_COMPRESSED = 0x0004u;
@@ -1330,6 +1331,13 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
     uint16_t dispW = globalConfig.displays[0].pixel_width;
     uint16_t dispH = globalConfig.displays[0].pixel_height;
+    if (getBitsPerPixel() != 1) {
+        // bb_epaper partial refresh support is effectively non-existent for
+        // 2bpp+ panels, and physical panels may not support that mode either.
+        // This protocol uses two 1bpp controller planes as old/new image memory.
+        send_direct_write_nack(0x76, ERR_PARTIAL_UNSUPPORTED, false);
+        return;
+    }
 
     if (rectW == 0 || rectH == 0 ||
         (uint32_t)rectX + rectW > dispW ||
