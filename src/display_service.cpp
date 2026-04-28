@@ -57,6 +57,39 @@ extern uint8_t decompressionChunk[];
 
 extern uint32_t displayed_etag;
 
+static const uint8_t DATA_KIND_NONE = 0u;
+static const uint8_t DATA_KIND_FULL = 1u;
+static const uint8_t DATA_KIND_PARTIAL = 2u;
+
+static const uint8_t ERR_ETAG_MISMATCH = 0x01u;
+static const uint8_t ERR_MIXED_DATA = 0x02u;
+static const uint8_t ERR_RECT_OOB = 0x03u;
+static const uint8_t ERR_PARTIAL_VERSION = 0x04u;
+static const uint8_t ERR_RECT_ALIGN = 0x05u;
+static const uint8_t ERR_PARTIAL_FLAGS = 0x06u;
+static const uint8_t ERR_PARTIAL_SIZE = 0x07u;
+static const uint8_t ERR_PARTIAL_STREAM = 0x08u;
+
+static const uint8_t PARTIAL_WRITE_PROTOCOL_V1 = 0x01u;
+static const uint16_t PARTIAL_FLAG_COMPRESSED = 0x0004u;
+static const uint16_t PARTIAL_FLAG_STORE_ETAG = 0x0008u;
+
+struct PartialStreamContext {
+    bool active;
+    uint16_t flags;
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+    uint32_t logical_uncompressed_size;
+    uint32_t logical_bytes_written;
+    uint32_t bytes_remaining_in_phase;
+    uint32_t old_plane_bytes_written;
+    uint32_t new_plane_bytes_written;
+    uint8_t phase;           // 0 = old image (PLANE_1), 1 = new image (PLANE_0), 2 = complete
+    uint8_t bits_per_pixel;
+};
+
 uint32_t max_compressed_image_rx_bytes(uint8_t tm) {
     if ((tm & TRANSMISSION_MODE_ZIP) == 0) return 0;
     if ((tm & TRANSMISSION_MODE_ZIPXL) != 0 &&

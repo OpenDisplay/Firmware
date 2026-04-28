@@ -190,7 +190,7 @@ uint16_t directWriteWidth = 0;  // Display width in pixels
 uint16_t directWriteHeight = 0;  // Display height in pixels
 uint32_t directWriteTotalBytes = 0;  // Total bytes expected per plane (for bitplanes) or total (for others)
 uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if supported)
-uint8_t directWriteDataKind = DATA_KIND_NONE;  // DATA_KIND_FULL (0x71 after 0x70) vs DATA_KIND_PARTIAL (0x71 after 0x76)
+uint8_t directWriteDataKind = 0;  // none; display_service.cpp tracks full vs partial 0x71 streams
 
 // Direct write compressed mode: use same buffer as regular image upload
 uint32_t directWriteCompressedSize = 0;  // Total compressed size expected

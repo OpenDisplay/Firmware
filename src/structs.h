@@ -280,43 +280,4 @@ struct SecurityConfig {
 #define SECURITY_FLAG_RESET_PIN_PULLUP    (1 << 4)
 #define SECURITY_FLAG_RESET_PIN_PULLDOWN  (1 << 5)
 
-// Partial-rendering NACK error codes ({0xFF, opcode, error, 0x00}).
-#define ERR_ETAG_MISMATCH   0x01u
-#define ERR_MIXED_DATA      0x02u
-#define ERR_RECT_OOB        0x03u
-#define ERR_PARTIAL_VERSION 0x04u
-#define ERR_RECT_ALIGN      0x05u  // rectangle x or width not aligned to byte boundary
-#define ERR_PARTIAL_FLAGS   0x06u  // unsupported or reserved flags set
-#define ERR_PARTIAL_SIZE    0x07u  // uncompressed_size does not match rectangle geometry
-#define ERR_PARTIAL_STREAM  0x08u  // stream byte count or content error
-
-// Partial-rendering protocol.
-#define PARTIAL_WRITE_PROTOCOL_V1 0x01u
-
-// 0x76 flags bitfield.
-#define PARTIAL_FLAG_COMPRESSED  0x0004u  // bit 2: stream is zlib-compressed
-#define PARTIAL_FLAG_STORE_ETAG  0x0008u  // bit 3: 0x72 includes new_etag; store after refresh
-
-// Per-transfer data-kind tracking.
-#define DATA_KIND_NONE      0u
-#define DATA_KIND_FULL      1u   // 0x71 carrying full-image data after 0x70
-#define DATA_KIND_PARTIAL   2u   // 0x71 carrying partial stream data after 0x76
-
-// Partial stream writer state (initialized by 0x76, consumed by 0x71, committed by 0x72).
-struct PartialStreamContext {
-    bool active;
-    uint16_t flags;
-    uint16_t x;
-    uint16_t y;
-    uint16_t width;
-    uint16_t height;
-    uint32_t logical_uncompressed_size;
-    uint32_t logical_bytes_written;
-    uint32_t bytes_remaining_in_phase;
-    uint32_t old_plane_bytes_written;
-    uint32_t new_plane_bytes_written;
-    uint8_t phase;           // 0 = old image (PLANE_1), 1 = new image (PLANE_0), 2 = complete
-    uint8_t bits_per_pixel;
-};
-
 #endif
