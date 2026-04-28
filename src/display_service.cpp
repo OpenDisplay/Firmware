@@ -124,7 +124,6 @@ static void setup_phase(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
 static bool decompress_partial_stream(void);
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
-static bool should_sleep_after_refresh(int refreshMode);
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
 static PartialStreamContext partialCtx = {};
 #define AXP2101_SLAVE_ADDRESS 0x34
@@ -1540,9 +1539,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
 
         bbepRefresh(&bbep, refreshMode);
         bool refreshSuccess = waitforrefresh(60);
-        if (should_sleep_after_refresh(refreshMode)) {
-            bbepSleep(&bbep, 1);
-        }
+        bbepSleep(&bbep, 1);
         delay(50);
         cleanupDirectWriteState(false);
 
@@ -1594,9 +1591,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     {
         bbepRefresh(&bbep, refreshMode);
         refreshSuccess = waitforrefresh(60);
-        if (should_sleep_after_refresh(refreshMode)) {
-            bbepSleep(&bbep, 1);
-        }
+        bbepSleep(&bbep, 1);
     }
     delay(50);
     cleanupDirectWriteState(false);
@@ -1723,12 +1718,6 @@ static bool decompress_partial_stream(void) {
 
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height) {
     return ((uint32_t)(width + 7u) / 8u) * height;
-}
-
-static bool should_sleep_after_refresh(int refreshMode) {
-    // EP133 loses its partial-refresh state if it is slept immediately after a
-    // partial refresh; keep it awake so the next delta can be applied.
-    return !(refreshMode == REFRESH_PARTIAL && bbep.type == EP133_960x680);
 }
 
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState) {
