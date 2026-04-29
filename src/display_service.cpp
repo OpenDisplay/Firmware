@@ -111,10 +111,12 @@ void bbepSleep(BBEPDISP *pBBEP, int iMode);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
+void bbepFill(BBEPDISP *pBBEP, uint8_t pattern);
 bool bbepIsBusy(BBEPDISP *pBBEP);
 void flashLed(uint8_t color, uint8_t brightness);
 static void cleanup_partial_write_state(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
+static void partial_prepare_panel_ram(void);
 static bool partial_prepare_logical_stream(void);
 static bool partial_write_to_panel(int refreshMode);
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
@@ -1379,6 +1381,8 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
         }
     }
 
+    partial_prepare_panel_ram();
+
     uint8_t ackResponse[] = {0x00, 0x76};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
@@ -1567,6 +1571,17 @@ static bool partial_prepare_logical_stream(void) {
     return true;
 }
 
+static void partial_prepare_panel_ram(void) {
+    writeSerial("EPD partial start: auto-fill panel RAM", true);
+    if (!displayPowerState) {
+        pwrmgm(true);
+    }
+    bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+    bbepWakeUp(&bbep);
+    bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    bbepFill(&bbep, 0xF7);
+}
+
 static bool partial_write_to_panel(int refreshMode) {
     if (!compressedDataBuffer) return false;
 
@@ -1580,14 +1595,12 @@ static bool partial_write_to_panel(int refreshMode) {
     writeSerial(String(partialCtx.height), false);
     writeSerial(")", true);
 
-    if (displayPowerState) {
-        pwrmgm(false);
-        delay(50);
+    if (!displayPowerState) {
+        pwrmgm(true);
+        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+        bbepWakeUp(&bbep);
+        bbepSendCMDSequence(&bbep, bbep.pInitFull);
     }
-    pwrmgm(true);
-    bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
-    bbepWakeUp(&bbep);
-    bbepSendCMDSequence(&bbep, bbep.pInitFull);
     bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
     if (partialCtx.store_etag) {
         bbepStartWrite(&bbep, PLANE_1);
