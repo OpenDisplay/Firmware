@@ -162,7 +162,7 @@ void sendResponse(uint8_t* response, uint8_t len) {
         uint16_t command = (response[0] << 8) | response[1];
         uint8_t status = (len >= 3) ? response[2] : 0x00;
         // Encrypt all authenticated responses except auth/version handshakes and FE/FF status.
-        // (0x0070–0x0074 direct-write/LED acks must be encrypted too — LAN/BLE clients decrypt every response.)
+        // Direct-write / partial-write / LED acks must be encrypted too; LAN/BLE clients decrypt every response.
         if (command != 0x0050 && command != 0x0043 && status != 0xFE && status != 0xFF) {
             uint8_t nonce[16];
             uint8_t auth_tag[12];
@@ -561,6 +561,9 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         case 0x0072:
             writeSerial("=== DIRECT WRITE END COMMAND (0x0072) ===");
             handleDirectWriteEnd(data + 2, len - 2);
+            break;
+        case 0x0076:
+            handlePartialWriteStart(data + 2, len - 2);
             break;
         case 0x0073:
             writeSerial("=== LED ACTIVATE COMMAND (0x0073) ===");
