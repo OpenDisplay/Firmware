@@ -108,7 +108,7 @@ void bbepSleep(BBEPDISP *pBBEP, int iMode);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
-void bbepFill(BBEPDISP *pBBEP, uint8_t pattern);
+void bbepFill(BBEPDISP *pBBEP, unsigned char ucColor, int iPlane);
 bool bbepIsBusy(BBEPDISP *pBBEP);
 void flashLed(uint8_t color, uint8_t brightness);
 static void cleanup_partial_write_state(void);
@@ -1576,7 +1576,8 @@ static void partial_prepare_panel_ram(void) {
     bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
     bbepWakeUp(&bbep);
     bbepSendCMDSequence(&bbep, bbep.pInitFull);
-    bbepFill(&bbep, 0xF7);
+    bbepFill(&bbep, BBEP_WHITE, PLANE_1);
+    bbepFill(&bbep, BBEP_WHITE, PLANE_0);
 }
 
 static bool partial_write_to_panel(int refreshMode) {
