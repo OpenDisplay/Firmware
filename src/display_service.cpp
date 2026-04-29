@@ -108,6 +108,7 @@ bool bbepIsBusy(BBEPDISP *pBBEP);
 void flashLed(uint8_t color, uint8_t brightness);
 static void cleanup_partial_write_state(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
+static bool partial_write_to_panel(void);
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
 static PartialStreamContext partialCtx = {};
@@ -1400,8 +1401,14 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         }
         uint8_t ackResponse[] = {0x00, 0x72};
         sendResponse(ackResponse, sizeof(ackResponse));
-        uint8_t validatedResponse[] = {0x00, 0x73};
-        sendResponse(validatedResponse, sizeof(validatedResponse));
+        bool refreshSuccess = partial_write_to_panel();
+        if (refreshSuccess) {
+            uint8_t validatedResponse[] = {0x00, 0x73};
+            sendResponse(validatedResponse, sizeof(validatedResponse));
+        } else {
+            uint8_t timeoutResponse[] = {0x00, 0x74};
+            sendResponse(timeoutResponse, sizeof(timeoutResponse));
+        }
         cleanup_partial_write_state();
         return;
     }
@@ -1462,6 +1469,40 @@ static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
     partialCtx.bytes_received += len;
     directWriteCompressedReceived = partialCtx.bytes_received;
     return true;
+}
+
+static bool partial_write_to_panel(void) {
+    if (!directWriteCompressedBuffer) return false;
+
+    writeSerial("EPD refresh: PARTIAL (raw rect ", false);
+    writeSerial(String(partialCtx.x), false);
+    writeSerial(",", false);
+    writeSerial(String(partialCtx.y), false);
+    writeSerial(" ", false);
+    writeSerial(String(partialCtx.width), false);
+    writeSerial("x", false);
+    writeSerial(String(partialCtx.height), false);
+    writeSerial(")", true);
+
+    if (displayPowerState) {
+        pwrmgm(false);
+        delay(50);
+    }
+    pwrmgm(true);
+    bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+    bbepWakeUp(&bbep);
+    bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
+    bbepStartWrite(&bbep, getplane());
+    bbepWriteData(&bbep, directWriteCompressedBuffer, partialCtx.expected_stream_size);
+    delay(20);
+    bbepRefresh(&bbep, REFRESH_PARTIAL);
+    bool refreshSuccess = waitforrefresh(60);
+    bbepSleep(&bbep, 1);
+    delay(50);
+    displayPowerState = false;
+    pwrmgm(false);
+    return refreshSuccess;
 }
 
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height) {
