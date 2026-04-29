@@ -56,6 +56,7 @@ extern uint8_t decompressionChunk[];
 
 extern uint32_t displayed_etag;
 
+static const uint8_t ERR_ETAG_MISMATCH = 0x01u;
 static const uint8_t ERR_RECT_OOB = 0x03u;
 static const uint8_t ERR_PARTIAL_VERSION = 0x04u;
 static const uint8_t ERR_RECT_ALIGN = 0x05u;
@@ -65,15 +66,21 @@ static const uint8_t ERR_PARTIAL_STREAM = 0x08u;
 static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x09u;
 
 static const uint8_t PARTIAL_WRITE_PROTOCOL_V1 = 0x01u;
+static const uint16_t PARTIAL_FLAG_COMPRESSED = 0x0004u;
+static const uint16_t PARTIAL_FLAG_STORE_ETAG = 0x0008u;
+static const uint16_t PARTIAL_ALLOWED_FLAGS = PARTIAL_FLAG_COMPRESSED | PARTIAL_FLAG_STORE_ETAG;
 
 struct PartialStreamContext {
     bool active;
+    bool compressed;
+    bool store_etag;
     uint16_t flags;
     uint16_t x;
     uint16_t y;
     uint16_t width;
     uint16_t height;
     uint32_t expected_stream_size;
+    uint32_t plane_size;
     uint32_t bytes_received;
 };
 
@@ -108,8 +115,10 @@ bool bbepIsBusy(BBEPDISP *pBBEP);
 void flashLed(uint8_t color, uint8_t brightness);
 static void cleanup_partial_write_state(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
-static bool partial_write_to_panel(void);
+static bool partial_prepare_logical_stream(void);
+static bool partial_write_to_panel(int refreshMode);
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
+static uint32_t parse_be_u32(const uint8_t* data);
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
 static PartialStreamContext partialCtx = {};
 #define AXP2101_SLAVE_ADDRESS 0x34
@@ -1281,8 +1290,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     }
 
     uint16_t flags    = ((uint16_t)data[1] << 8) | data[2];
-    uint32_t oldEtag  = ((uint32_t)data[3] << 24) | ((uint32_t)data[4] << 16) |
-                        ((uint32_t)data[5] << 8)  |  (uint32_t)data[6];
+    uint32_t oldEtag  = parse_be_u32(data + 3);
     uint16_t rectX    = ((uint16_t)data[7]  << 8) | data[8];
     uint16_t rectY    = ((uint16_t)data[9]  << 8) | data[10];
     uint16_t rectW    = ((uint16_t)data[11] << 8) | data[12];
@@ -1290,13 +1298,22 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     uint32_t uncompSize;
     memcpy(&uncompSize, data + 15, 4);  // 4-byte LE
 
-    // Step 1 accepts raw partial streams only. Compression and ETags are added later.
-    if (flags != 0) {
+    if ((flags & ~PARTIAL_ALLOWED_FLAGS) != 0) {
         send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
         return;
     }
 
-    (void)oldEtag;
+    if ((flags & PARTIAL_FLAG_COMPRESSED) != 0 &&
+        (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_ZIP) == 0) {
+        send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
+        return;
+    }
+
+    if ((flags & PARTIAL_FLAG_STORE_ETAG) != 0 &&
+        (oldEtag == 0 || oldEtag != displayed_etag)) {
+        send_direct_write_nack(0x76, ERR_ETAG_MISMATCH, false);
+        return;
+    }
 
     uint16_t dispW = globalConfig.displays[0].pixel_width;
     uint16_t dispH = globalConfig.displays[0].pixel_height;
@@ -1321,7 +1338,8 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     }
 
     uint32_t planeBytes = calc_controller_plane_bytes(rectW, rectH);
-    if (uncompSize != planeBytes) {
+    uint32_t expectedLogicalSize = ((flags & PARTIAL_FLAG_STORE_ETAG) != 0) ? planeBytes * 2u : planeBytes;
+    if (uncompSize != expectedLogicalSize) {
         send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
         return;
     }
@@ -1332,15 +1350,24 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
         return;
     }
 
+    uint32_t rxOffset = ((flags & PARTIAL_FLAG_COMPRESSED) != 0) ? uncompSize : 0u;
+    if (rxOffset >= MAX_COMPRESSED_BUFFER_BYTES) {
+        send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
+        return;
+    }
+
     memset(&partialCtx, 0, sizeof(partialCtx));
     partialCtx.active = true;
+    partialCtx.compressed = (flags & PARTIAL_FLAG_COMPRESSED) != 0;
+    partialCtx.store_etag = (flags & PARTIAL_FLAG_STORE_ETAG) != 0;
     partialCtx.flags = flags;
     partialCtx.x = rectX;
     partialCtx.y = rectY;
     partialCtx.width = rectW;
     partialCtx.height = rectH;
     partialCtx.expected_stream_size = uncompSize;
-    directWriteCompressedBuffer = compressedDataBuffer;
+    partialCtx.plane_size = planeBytes;
+    directWriteCompressedBuffer = compressedDataBuffer + rxOffset;
     directWriteCompressedReceived = 0;
 
     // Process optional initial stream bytes before ACK
@@ -1395,17 +1422,39 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
 
 void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     if (partialCtx.active) {
-        if (partialCtx.bytes_received != partialCtx.expected_stream_size) {
+        uint32_t newEtag = 0;
+        if (partialCtx.store_etag) {
+            if (data == nullptr || len < 5) {
+                send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
+                return;
+            }
+            newEtag = parse_be_u32(data + 1);
+            if (newEtag == 0) {
+                send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
+                return;
+            }
+        }
+        if (partialCtx.compressed) {
+            if (partialCtx.bytes_received == 0 || !partial_prepare_logical_stream()) {
+                send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
+                return;
+            }
+        } else if (partialCtx.bytes_received != partialCtx.expected_stream_size) {
             send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
             return;
         }
         uint8_t ackResponse[] = {0x00, 0x72};
         sendResponse(ackResponse, sizeof(ackResponse));
-        bool refreshSuccess = partial_write_to_panel();
+        int refreshMode = REFRESH_PARTIAL;
+        if (data != nullptr && len >= 1 && data[0] == REFRESH_FULL) refreshMode = REFRESH_FULL;
+        else if (data != nullptr && len >= 1 && data[0] == REFRESH_FAST) refreshMode = REFRESH_FAST;
+        bool refreshSuccess = partial_write_to_panel(refreshMode);
         if (refreshSuccess) {
+            if (partialCtx.store_etag) displayed_etag = newEtag;
             uint8_t validatedResponse[] = {0x00, 0x73};
             sendResponse(validatedResponse, sizeof(validatedResponse));
         } else {
+            if (partialCtx.store_etag) displayed_etag = 0;
             uint8_t timeoutResponse[] = {0x00, 0x74};
             sendResponse(timeoutResponse, sizeof(timeoutResponse));
         }
@@ -1433,6 +1482,9 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     sendResponse(ackResponse, sizeof(ackResponse));
     delay(20);
     bool refreshSuccess = false;
+    uint32_t newEtag = 0;
+    bool hasNewEtag = data != nullptr && len >= 5;
+    if (hasNewEtag) newEtag = parse_be_u32(data + 1);
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
         seeed_gfx_direct_refresh(refreshMode);
@@ -1448,9 +1500,11 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     delay(50);
     cleanupDirectWriteState(false);
     if (refreshSuccess) {
+        if (hasNewEtag && newEtag != 0) displayed_etag = newEtag;
         uint8_t refreshResponse[] = {0x00, 0x73};
         sendResponse(refreshResponse, sizeof(refreshResponse));
     } else {
+        if (hasNewEtag) displayed_etag = 0;
         uint8_t timeoutResponse[] = {0x00, 0x74};
         sendResponse(timeoutResponse, sizeof(timeoutResponse));
     }
@@ -1464,15 +1518,57 @@ static void cleanup_partial_write_state(void) {
 
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
     if (!directWriteCompressedBuffer) return false;
-    if (len > partialCtx.expected_stream_size - partialCtx.bytes_received) return false;
+    uint32_t rxLimit = partialCtx.compressed
+        ? (MAX_COMPRESSED_BUFFER_BYTES - partialCtx.expected_stream_size)
+        : partialCtx.expected_stream_size;
+    if (len > rxLimit - partialCtx.bytes_received) return false;
     memcpy(directWriteCompressedBuffer + partialCtx.bytes_received, data, len);
     partialCtx.bytes_received += len;
     directWriteCompressedReceived = partialCtx.bytes_received;
     return true;
 }
 
-static bool partial_write_to_panel(void) {
-    if (!directWriteCompressedBuffer) return false;
+static bool partial_prepare_logical_stream(void) {
+    if (!directWriteCompressedBuffer || !compressedDataBuffer) return false;
+    if (!partialCtx.compressed) return partialCtx.bytes_received == partialCtx.expected_stream_size;
+
+    struct uzlib_uncomp d;
+    memset(&d, 0, sizeof(d));
+    d.source = directWriteCompressedBuffer;
+    d.source_limit = directWriteCompressedBuffer + partialCtx.bytes_received;
+    d.source_read_cb = NULL;
+    uzlib_init();
+    int hdr = uzlib_zlib_parse_header(&d);
+    if (hdr < 0) return false;
+    uint16_t window = 0x100 << hdr;
+    if (window > (uint16_t)(32 * 1024)) window = (uint16_t)(32 * 1024);
+    uzlib_uncompress_init(&d, dictionaryBuffer, window);
+
+    uint32_t bytesOutTotal = 0;
+    int res;
+    do {
+        d.dest_start = decompressionChunk;
+        d.dest = decompressionChunk;
+        d.dest_limit = decompressionChunk + 4096;
+        res = uzlib_uncompress(&d);
+        size_t bytesOut = d.dest - d.dest_start;
+        if (bytesOut > 0) {
+            if (bytesOutTotal + bytesOut > partialCtx.expected_stream_size) return false;
+            memcpy(compressedDataBuffer + bytesOutTotal, decompressionChunk, bytesOut);
+            bytesOutTotal += bytesOut;
+        }
+    } while (res == TINF_OK && bytesOutTotal < partialCtx.expected_stream_size);
+
+    if (res != TINF_DONE) return false;
+    if (bytesOutTotal != partialCtx.expected_stream_size) return false;
+    directWriteCompressedBuffer = compressedDataBuffer;
+    directWriteCompressedReceived = bytesOutTotal;
+    partialCtx.bytes_received = bytesOutTotal;
+    return true;
+}
+
+static bool partial_write_to_panel(int refreshMode) {
+    if (!compressedDataBuffer) return false;
 
     writeSerial("EPD refresh: PARTIAL (raw rect ", false);
     writeSerial(String(partialCtx.x), false);
@@ -1493,10 +1589,18 @@ static bool partial_write_to_panel(void) {
     bbepWakeUp(&bbep);
     bbepSendCMDSequence(&bbep, bbep.pInitFull);
     bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
-    bbepStartWrite(&bbep, getplane());
-    bbepWriteData(&bbep, directWriteCompressedBuffer, partialCtx.expected_stream_size);
+    if (partialCtx.store_etag) {
+        bbepStartWrite(&bbep, PLANE_1);
+        bbepWriteData(&bbep, compressedDataBuffer, partialCtx.plane_size);
+        bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
+        bbepStartWrite(&bbep, PLANE_0);
+        bbepWriteData(&bbep, compressedDataBuffer + partialCtx.plane_size, partialCtx.plane_size);
+    } else {
+        bbepStartWrite(&bbep, getplane());
+        bbepWriteData(&bbep, compressedDataBuffer, partialCtx.expected_stream_size);
+    }
     delay(20);
-    bbepRefresh(&bbep, REFRESH_PARTIAL);
+    bbepRefresh(&bbep, refreshMode);
     bool refreshSuccess = waitforrefresh(60);
     bbepSleep(&bbep, 1);
     delay(50);
@@ -1507,6 +1611,11 @@ static bool partial_write_to_panel(void) {
 
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height) {
     return ((uint32_t)(width + 7u) / 8u) * height;
+}
+
+static uint32_t parse_be_u32(const uint8_t* data) {
+    return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+           ((uint32_t)data[2] << 8)  |  (uint32_t)data[3];
 }
 
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState) {
