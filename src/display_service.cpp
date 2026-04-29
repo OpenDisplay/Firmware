@@ -58,11 +58,11 @@ extern uint32_t displayed_etag;
 
 static const uint8_t ERR_ETAG_MISMATCH = 0x01u;
 static const uint8_t ERR_RECT_OOB = 0x03u;
-static const uint8_t ERR_RECT_ALIGN = 0x05u;
-static const uint8_t ERR_PARTIAL_FLAGS = 0x06u;
-static const uint8_t ERR_PARTIAL_SIZE = 0x07u;
-static const uint8_t ERR_PARTIAL_STREAM = 0x08u;
-static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x09u;
+static const uint8_t ERR_RECT_ALIGN = 0x04u;
+static const uint8_t ERR_PARTIAL_FLAGS = 0x05u;
+static const uint8_t ERR_PARTIAL_SIZE = 0x06u;
+static const uint8_t ERR_PARTIAL_STREAM = 0x07u;
+static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x08u;
 
 static const uint8_t PARTIAL_FLAG_COMPRESSED = 0x01u;
 static const uint8_t PARTIAL_ALLOWED_FLAGS = PARTIAL_FLAG_COMPRESSED;
