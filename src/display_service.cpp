@@ -58,23 +58,20 @@ extern uint32_t displayed_etag;
 
 static const uint8_t ERR_ETAG_MISMATCH = 0x01u;
 static const uint8_t ERR_RECT_OOB = 0x03u;
-static const uint8_t ERR_PARTIAL_VERSION = 0x04u;
 static const uint8_t ERR_RECT_ALIGN = 0x05u;
 static const uint8_t ERR_PARTIAL_FLAGS = 0x06u;
 static const uint8_t ERR_PARTIAL_SIZE = 0x07u;
 static const uint8_t ERR_PARTIAL_STREAM = 0x08u;
 static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x09u;
 
-static const uint8_t PARTIAL_WRITE_PROTOCOL_V1 = 0x01u;
-static const uint16_t PARTIAL_FLAG_COMPRESSED = 0x0004u;
-static const uint16_t PARTIAL_FLAG_STORE_ETAG = 0x0008u;
-static const uint16_t PARTIAL_ALLOWED_FLAGS = PARTIAL_FLAG_COMPRESSED | PARTIAL_FLAG_STORE_ETAG;
+static const uint8_t PARTIAL_FLAG_COMPRESSED = 0x01u;
+static const uint8_t PARTIAL_ALLOWED_FLAGS = PARTIAL_FLAG_COMPRESSED;
 
 struct PartialStreamContext {
     bool active;
     bool compressed;
     bool store_etag;
-    uint16_t flags;
+    uint8_t flags;
     uint16_t x;
     uint16_t y;
     uint16_t width;
@@ -121,6 +118,7 @@ static bool partial_prepare_logical_stream(void);
 static bool partial_write_to_panel(int refreshMode);
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
 static uint32_t parse_be_u32(const uint8_t* data);
+static uint32_t parse_be_u24(const uint8_t* data);
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
 static PartialStreamContext partialCtx = {};
 #define AXP2101_SLAVE_ADDRESS 0x34
@@ -1286,19 +1284,18 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     if (directWriteActive) cleanupDirectWriteState(false);
     if (partialCtx.active) cleanup_partial_write_state();
 
-    if (len < 19 || data[0] != PARTIAL_WRITE_PROTOCOL_V1) {
-        send_direct_write_nack(0x76, ERR_PARTIAL_VERSION, false);
+    if (len < 16) {
+        send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
         return;
     }
 
-    uint16_t flags    = ((uint16_t)data[1] << 8) | data[2];
-    uint32_t oldEtag  = parse_be_u32(data + 3);
-    uint16_t rectX    = ((uint16_t)data[7]  << 8) | data[8];
-    uint16_t rectY    = ((uint16_t)data[9]  << 8) | data[10];
-    uint16_t rectW    = ((uint16_t)data[11] << 8) | data[12];
-    uint16_t rectH    = ((uint16_t)data[13] << 8) | data[14];
-    uint32_t uncompSize;
-    memcpy(&uncompSize, data + 15, 4);  // 4-byte LE
+    uint8_t flags     = data[0];
+    uint32_t oldEtag  = parse_be_u32(data + 1);
+    uint16_t rectX    = ((uint16_t)data[5]  << 8) | data[6];
+    uint16_t rectY    = ((uint16_t)data[7]  << 8) | data[8];
+    uint16_t rectW    = ((uint16_t)data[9]  << 8) | data[10];
+    uint16_t rectH    = ((uint16_t)data[11] << 8) | data[12];
+    uint32_t uncompSize = parse_be_u24(data + 13);
 
     if ((flags & ~PARTIAL_ALLOWED_FLAGS) != 0) {
         send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
@@ -1311,8 +1308,8 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
         return;
     }
 
-    if ((flags & PARTIAL_FLAG_STORE_ETAG) != 0 &&
-        (oldEtag == 0 || oldEtag != displayed_etag)) {
+    bool useEtag = oldEtag != 0;
+    if (useEtag && oldEtag != displayed_etag) {
         send_direct_write_nack(0x76, ERR_ETAG_MISMATCH, false);
         return;
     }
@@ -1340,7 +1337,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     }
 
     uint32_t planeBytes = calc_controller_plane_bytes(rectW, rectH);
-    uint32_t expectedLogicalSize = ((flags & PARTIAL_FLAG_STORE_ETAG) != 0) ? planeBytes * 2u : planeBytes;
+    uint32_t expectedLogicalSize = useEtag ? planeBytes * 2u : planeBytes;
     if (uncompSize != expectedLogicalSize) {
         send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
         return;
@@ -1361,7 +1358,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     memset(&partialCtx, 0, sizeof(partialCtx));
     partialCtx.active = true;
     partialCtx.compressed = (flags & PARTIAL_FLAG_COMPRESSED) != 0;
-    partialCtx.store_etag = (flags & PARTIAL_FLAG_STORE_ETAG) != 0;
+    partialCtx.store_etag = useEtag;
     partialCtx.flags = flags;
     partialCtx.x = rectX;
     partialCtx.y = rectY;
@@ -1373,9 +1370,9 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     directWriteCompressedReceived = 0;
 
     // Process optional initial stream bytes before ACK
-    if (len > 19) {
-        uint16_t initLen = len - 19;
-        if (!partial_consume_bytes(data + 19, (uint32_t)initLen)) {
+    if (len > 16) {
+        uint16_t initLen = len - 16;
+        if (!partial_consume_bytes(data + 16, (uint32_t)initLen)) {
             send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, true);
             return;
         }
@@ -1629,6 +1626,10 @@ static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height) {
 static uint32_t parse_be_u32(const uint8_t* data) {
     return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
            ((uint32_t)data[2] << 8)  |  (uint32_t)data[3];
+}
+
+static uint32_t parse_be_u24(const uint8_t* data) {
+    return ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | (uint32_t)data[2];
 }
 
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState) {
