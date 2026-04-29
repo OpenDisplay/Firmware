@@ -1129,8 +1129,6 @@ void updatemsdata(){
 }
 
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
-    // Compressed full-image 0x71 chunks are buffered as compressed bytes.
-    // uzlib is run once at 0x72, so we never keep a decompressed full image in RAM.
     if (!compressedDataBuffer) {
         cleanupDirectWriteState(false);
         uint8_t errorResponse[] = {0xFF, 0xFF};
@@ -1154,8 +1152,6 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
 }
 
 void decompressDirectWriteData() {
-    // Inflate the buffered compressed full-image stream and write each output
-    // chunk directly to the active panel write window.
     if (directWriteCompressedReceived == 0) return;
     struct uzlib_uncomp d;
     memset(&d, 0, sizeof(d));
@@ -1204,8 +1200,6 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteTotalBytes = 0;
     directWriteRefreshMode = 0;
     directWriteStartTime = 0;
-    directWriteDataKind = DATA_KIND_NONE;
-    memset(&partialCtx, 0, sizeof(partialCtx));
     if (refreshDisplay && displayPowerState) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
         if (seeed_driver_used()) {
@@ -1222,13 +1216,7 @@ void cleanupDirectWriteState(bool refreshDisplay) {
 }
 
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
-    if (partialCtx.active) {
-        send_direct_write_nack(0x70, ERR_MIXED_DATA, true);
-        return;
-    }
     if (directWriteActive) cleanupDirectWriteState(false);
-    bool isCompressedStart = (len >= 4);
-
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
         seeed_gfx_prepare_hardware();
@@ -1237,7 +1225,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     uint8_t colorScheme = globalConfig.displays[0].color_scheme;
     directWriteBitplanes = (colorScheme == 1 || colorScheme == 2);
     directWritePlane2 = false;
-    directWriteCompressed = isCompressedStart;
+    directWriteCompressed = (len >= 4);
     directWriteWidth = globalConfig.displays[0].pixel_width;
     directWriteHeight = globalConfig.displays[0].pixel_height;
     uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
@@ -1430,45 +1418,10 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
 void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (!directWriteActive || len == 0) return;
-    if (directWriteDataKind == DATA_KIND_PARTIAL) {
-        bool isCompressed = (partialCtx.flags & PARTIAL_FLAG_COMPRESSED) != 0;
-        if (isCompressed) {
-            // Match compressed full-image uploads: collect the zlib stream
-            // across 0x76/0x71, then inflate at 0x72 through the partial sink.
-            if (!directWriteCompressedBuffer) {
-                displayed_etag = 0;
-                cleanupDirectWriteState(false);
-                uint8_t errResponse[] = {0xFF, 0xFF};
-                sendResponse(errResponse, sizeof(errResponse));
-                return;
-            }
-            uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
-            uint32_t newTotal = directWriteCompressedReceived + len;
-            if (cap == 0 || newTotal > cap) {
-                send_direct_write_nack(0x71, ERR_PARTIAL_STREAM, true);
-                return;
-            }
-            memcpy(directWriteCompressedBuffer + directWriteCompressedReceived, data, len);
-            directWriteCompressedReceived += len;
-        } else {
-            // Raw partial 0x71 data is already panel-plane data, so stream it
-            // immediately and let partial_consume_bytes() retarget planes.
-            if (!partial_consume_bytes(data, (uint32_t)len)) {
-                send_direct_write_nack(0x71, ERR_PARTIAL_STREAM, true);
-                return;
-            }
-        }
-        uint8_t ackResponse[] = {0x00, 0x71};
-        sendResponse(ackResponse, sizeof(ackResponse));
-        return;
-    }
-    directWriteDataKind = DATA_KIND_FULL;
     if (directWriteCompressed) {
         handleDirectWriteCompressedData(data, len);
         return;
     }
-    // Raw full-image 0x71 data streams directly to the panel; only compressed
-    // mode needs the intermediate compressed buffer.
     uint32_t remainingBytes = (directWriteBytesWritten < directWriteTotalBytes) ? (directWriteTotalBytes - directWriteBytesWritten) : 0;
     uint16_t bytesToWrite = (len > remainingBytes) ? remainingBytes : len;
     if (bytesToWrite > 0) {
@@ -1493,90 +1446,21 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
 void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     if (!directWriteActive) return;
     directWriteStartTime = 0;
-
-    if (directWriteDataKind == DATA_KIND_PARTIAL) {
-        bool isCompressed = (partialCtx.flags & PARTIAL_FLAG_COMPRESSED) != 0;
-        bool storeEtag = (partialCtx.flags & PARTIAL_FLAG_STORE_ETAG) != 0;
-
-        if (isCompressed && !decompress_partial_stream()) {
-            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
-            return;
-        }
-
-        uint32_t planeBytes = calc_controller_plane_bytes(partialCtx.width, partialCtx.height);
-
-        if (partialCtx.logical_bytes_written != partialCtx.expected_stream_size ||
-            partialCtx.old_plane_bytes_written != planeBytes ||
-            partialCtx.new_plane_bytes_written != planeBytes) {
-            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
-            return;
-        }
-
-        if (storeEtag && (data == nullptr || len < 5)) {
-            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
-            return;
-        }
-
-        bool hasNewEtag = storeEtag;
-        uint32_t newEtag = 0;
-        if (hasNewEtag) {
-            newEtag = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
-                      ((uint32_t)data[3] << 8)  |  (uint32_t)data[4];
-        }
-
-        // Default PARTIAL; allow FAST override; FULL → PARTIAL for partial streams
-        int refreshMode = REFRESH_PARTIAL;
-        if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
-
-        writeSerial(String("EPD partial refresh: ") +
-                    (refreshMode == REFRESH_FAST ? "FAST" : "PARTIAL") +
-                    " (mode=" + String(refreshMode) +
-                    ", rect=" + String(partialCtx.x) + "," + String(partialCtx.y) +
-                    " " + String(partialCtx.width) + "x" + String(partialCtx.height) + ")", true);
-        uint8_t ackResponse[] = {0x00, 0x72};
-        sendResponse(ackResponse, sizeof(ackResponse));
-        delay(20);
-
-        bbepRefresh(&bbep, refreshMode);
-        bool refreshSuccess = waitforrefresh(60);
-        bbepSleep(&bbep, 1);
-        delay(50);
-        cleanupDirectWriteState(false);
-
-        if (refreshSuccess) {
-            displayed_etag = hasNewEtag ? newEtag : 0;
-            uint8_t refreshResponse[] = {0x00, 0x73};
-            sendResponse(refreshResponse, sizeof(refreshResponse));
-        } else {
-            displayed_etag = 0;
-            uint8_t timeoutResponse[] = {0x00, 0x74};
-            sendResponse(timeoutResponse, sizeof(timeoutResponse));
-        }
-        return;
-    }
-
     if (directWriteCompressed && directWriteCompressedReceived > 0) decompressDirectWriteData();
-
-    // Optional new_etag tail: refresh_mode(1) + new_etag(4 BE) when len >= 5.
-    bool hasNewEtag = (data != nullptr && len >= 5);
-    uint32_t newEtag = 0;
-    if (hasNewEtag) {
-        newEtag = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
-                  ((uint32_t)data[3] << 8)  |  (uint32_t)data[4];
-    }
-
     int refreshMode = REFRESH_FULL;
-    if (data != nullptr && len >= 1) {
-        if (data[0] == 1) refreshMode = REFRESH_FAST;
-        else if (data[0] == 2) refreshMode = REFRESH_PARTIAL;
-        else refreshMode = REFRESH_FULL;
+    if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
+    writeSerial("EPD refresh: ", false);
+    writeSerial(refreshMode == REFRESH_FAST ? "FAST" : "FULL", false);
+    writeSerial(" (mode=", false);
+    writeSerial(String(refreshMode), false);
+    writeSerial(", end payload ", false);
+    if (data != nullptr && len > 0) {
+        writeSerial("0x", false);
+        writeSerial(String(data[0], HEX), false);
+    } else {
+        writeSerial("none (auto)", false);
     }
-    const char* refreshLabel = "FULL";
-    if (refreshMode == REFRESH_FAST) refreshLabel = "FAST";
-    else if (refreshMode == REFRESH_PARTIAL) refreshLabel = "PARTIAL";
-    writeSerial(String("EPD refresh: ") + refreshLabel + " (mode=" + String(refreshMode) +
-                ", end payload " + (data != nullptr && len > 0 ? ("0x" + String(data[0], HEX)) : String("none (auto)")) + ")",
-                true);
+    writeSerial(")", true);
     uint8_t ackResponse[] = {0x00, 0x72};
     sendResponse(ackResponse, sizeof(ackResponse));
     delay(20);
@@ -1596,11 +1480,9 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     delay(50);
     cleanupDirectWriteState(false);
     if (refreshSuccess) {
-        displayed_etag = hasNewEtag ? newEtag : 0;
         uint8_t refreshResponse[] = {0x00, 0x73};
         sendResponse(refreshResponse, sizeof(refreshResponse));
     } else {
-        displayed_etag = 0;
         uint8_t timeoutResponse[] = {0x00, 0x74};
         sendResponse(timeoutResponse, sizeof(timeoutResponse));
     }
