@@ -60,9 +60,8 @@ static const uint8_t ERR_ETAG_MISMATCH = 0x01u;
 static const uint8_t ERR_RECT_OOB = 0x03u;
 static const uint8_t ERR_RECT_ALIGN = 0x04u;
 static const uint8_t ERR_PARTIAL_FLAGS = 0x05u;
-static const uint8_t ERR_PARTIAL_SIZE = 0x06u;
-static const uint8_t ERR_PARTIAL_STREAM = 0x07u;
-static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x08u;
+static const uint8_t ERR_PARTIAL_STREAM = 0x06u;
+static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x07u;
 
 static const uint8_t PARTIAL_FLAG_COMPRESSED = 0x01u;
 static const uint8_t PARTIAL_ALLOWED_FLAGS = PARTIAL_FLAG_COMPRESSED;
@@ -1283,7 +1282,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     if (partialCtx.active) cleanup_partial_write_state();
 
     if (len < 17) {
-        send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
+        send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, false);
         return;
     }
 
@@ -1344,7 +1343,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
     uint32_t rxOffset = ((flags & PARTIAL_FLAG_COMPRESSED) != 0) ? expectedLogicalSize : 0u;
     if (rxOffset >= MAX_COMPRESSED_BUFFER_BYTES) {
-        send_direct_write_nack(0x76, ERR_PARTIAL_SIZE, false);
+        send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, false);
         return;
     }
 
