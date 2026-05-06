@@ -190,6 +190,7 @@ uint16_t directWriteWidth = 0;  // Display width in pixels
 uint16_t directWriteHeight = 0;  // Display height in pixels
 uint32_t directWriteTotalBytes = 0;  // Total bytes expected per plane (for bitplanes) or total (for others)
 uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if supported)
+uint8_t directWriteDataKind = 0;  // none; display_service.cpp tracks full vs partial 0x71 streams
 
 // Direct write compressed mode: use same buffer as regular image upload
 uint32_t directWriteCompressedSize = 0;  // Total compressed size expected
@@ -261,6 +262,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteEnd(uint8_t* data = nullptr, uint16_t len = 0);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
+void handlePartialWriteStart(uint8_t* data, uint16_t len);
 int mapEpd(int id);
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
@@ -300,6 +302,14 @@ uint8_t configReadResponseBuffer[128];
 struct SecurityConfig securityConfig = {0};
 EncryptionSession encryptionSession = {0};
 bool encryptionInitialized = false;
+
+#ifdef TARGET_ESP32
+// 0x00000000 = "not set". Persists across deep sleep on ESP32.
+RTC_DATA_ATTR uint32_t displayed_etag = 0;
+#else
+// 0x00000000 = "not set". Non-ESP32 targets reset this on boot.
+uint32_t displayed_etag = 0;
+#endif
 
 #ifdef TARGET_ESP32
 // RTC memory variables for deep sleep state tracking

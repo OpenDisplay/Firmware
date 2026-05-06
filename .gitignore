@@ -78,8 +78,8 @@ dkms.conf
 .gcc-flags.json
 .pio
 .vscode
+platformio.local.ini
 
 ### Other files
 .idea
-
 
