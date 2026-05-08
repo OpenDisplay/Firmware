@@ -10,7 +10,17 @@
 typedef struct {
     unsigned short table[16];
     unsigned short trans[288];
-} TINF_TREE;
+} TINF_LITERAL_TREE;
+
+typedef struct {
+    unsigned short table[16];
+    unsigned short trans[32];
+} TINF_DISTANCE_TREE;
+
+typedef struct {
+    unsigned short table[16];
+    unsigned short trans[19];
+} TINF_CODELEN_TREE;
 
 static const unsigned char length_bits[30] = {
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -108,10 +118,10 @@ typedef struct {
     uint8_t bfinal;
     uint8_t btype;
 
-    TINF_TREE ltree;
+    TINF_LITERAL_TREE ltree;
     union {
-        TINF_TREE dtree;
-        TINF_TREE cltree;
+        TINF_DISTANCE_TREE dtree;
+        TINF_CODELEN_TREE cltree;
     } tree;
 
     unsigned char lengths[288 + 32];
@@ -153,22 +163,33 @@ static void set_error(const char *error) {
     s.error = error;
 }
 
-static void build_tree(TINF_TREE *t, const unsigned char *lengths, unsigned int num) {
+static bool build_tree(unsigned short *table, unsigned short *trans, unsigned int trans_size, const unsigned char *lengths, unsigned int num) {
     unsigned short offs[16];
     unsigned int i, sum;
 
-    for (i = 0; i < 16; ++i) t->table[i] = 0;
-    for (i = 0; i < num; ++i) t->table[lengths[i]]++;
-    t->table[0] = 0;
+    for (i = 0; i < 16; ++i) table[i] = 0;
+    for (i = 0; i < num; ++i) {
+        if (lengths[i] >= TINF_ARRAY_SIZE(offs)) {
+            set_error("invalid huffman code length");
+            return false;
+        }
+        table[lengths[i]]++;
+    }
+    table[0] = 0;
 
     for (sum = 0, i = 0; i < 16; ++i) {
         offs[i] = sum;
-        sum += t->table[i];
+        sum += table[i];
+    }
+    if (sum > trans_size) {
+        set_error("huffman tree exceeds symbol storage");
+        return false;
     }
 
     for (i = 0; i < num; ++i) {
-        if (lengths[i]) t->trans[offs[lengths[i]]++] = i;
+        if (lengths[i]) trans[offs[lengths[i]]++] = i;
     }
+    return true;
 }
 
 static void build_fixed_trees(void) {
@@ -235,7 +256,7 @@ static int read_bits(unsigned int num, unsigned int base, unsigned int *value) {
     return 1;
 }
 
-static int decode_symbol(TINF_TREE *tree, int *symbol) {
+static int decode_symbol(const unsigned short *table, const unsigned short *trans, unsigned int trans_size, int *symbol) {
     if (!s.sym_active) {
         s.sym_active = true;
         s.sym_sum = 0;
@@ -249,21 +270,21 @@ static int decode_symbol(TINF_TREE *tree, int *symbol) {
         if (rc <= 0) return rc;
 
         s.sym_cur = 2 * s.sym_cur + (int)bit;
-        if (++s.sym_len == (int)TINF_ARRAY_SIZE(tree->table)) {
+        if (++s.sym_len == 16) {
             set_error("invalid huffman code");
             return -1;
         }
 
-        s.sym_sum += tree->table[s.sym_len];
-        s.sym_cur -= tree->table[s.sym_len];
+        s.sym_sum += table[s.sym_len];
+        s.sym_cur -= table[s.sym_len];
     } while (s.sym_cur >= 0);
 
     s.sym_sum += s.sym_cur;
-    if (s.sym_sum < 0 || s.sym_sum >= (int)TINF_ARRAY_SIZE(tree->trans)) {
+    if (s.sym_sum < 0 || s.sym_sum >= (int)trans_size) {
         set_error("invalid huffman symbol");
         return -1;
     }
-    *symbol = tree->trans[s.sym_sum];
+    *symbol = trans[s.sym_sum];
     s.sym_active = false;
     return 1;
 }
@@ -334,7 +355,7 @@ static int process_dynamic_trees(void) {
             s.dynamic_stage = DYN_BUILD_CLTREE;
             break;
         case DYN_BUILD_CLTREE:
-            build_tree(&s.tree.cltree, s.lengths, 19);
+            if (!build_tree(s.tree.cltree.table, s.tree.cltree.trans, TINF_ARRAY_SIZE(s.tree.cltree.trans), s.lengths, 19)) return -1;
             s.hlimit = s.hlit + s.hdist;
             s.dyn_num = 0;
             s.dynamic_stage = DYN_READ_LENGTHS;
@@ -342,7 +363,7 @@ static int process_dynamic_trees(void) {
             break;
         case DYN_READ_LENGTHS:
             while (s.dyn_num < s.hlimit) {
-                int rc = decode_symbol(&s.tree.cltree, &sym);
+                int rc = decode_symbol(s.tree.cltree.table, s.tree.cltree.trans, TINF_ARRAY_SIZE(s.tree.cltree.trans), &sym);
                 if (rc <= 0) return s.stage == ST_ERROR ? -1 : 0;
                 if (sym < 16) {
                     s.lengths[s.dyn_num++] = (unsigned char)sym;
@@ -390,8 +411,8 @@ static int process_dynamic_trees(void) {
                 set_error("dynamic tree missing end-of-block");
                 return -1;
             }
-            build_tree(&s.ltree, s.lengths, s.hlit);
-            build_tree(&s.tree.dtree, s.lengths + s.hlit, s.hdist);
+            if (!build_tree(s.ltree.table, s.ltree.trans, TINF_ARRAY_SIZE(s.ltree.trans), s.lengths, s.hlit)) return -1;
+            if (!build_tree(s.tree.dtree.table, s.tree.dtree.trans, TINF_ARRAY_SIZE(s.tree.dtree.trans), s.lengths + s.hlit, s.hdist)) return -1;
             s.dynamic_stage = DYN_HLIT;
             reset_code_readers();
             return 1;
@@ -432,15 +453,13 @@ static int process_stored_data(uint8_t *output, size_t capacity, size_t *produce
 }
 
 static int process_block_data(uint8_t *output, size_t capacity, size_t *produced) {
-    TINF_TREE *lt = &s.ltree;
-    TINF_TREE *dt = &s.tree.dtree;
     int sym;
 
     for (;;) {
         if (*produced >= capacity) return 2;
         switch (s.block_stage) {
         case BLK_SYMBOL: {
-            int rc = decode_symbol(lt, &sym);
+            int rc = decode_symbol(s.ltree.table, s.ltree.trans, TINF_ARRAY_SIZE(s.ltree.trans), &sym);
             if (rc <= 0) return rc;
             if (sym < 256) {
                 if (!put_output_byte((uint8_t)sym, output, capacity, produced)) return s.stage == ST_ERROR ? -1 : 2;
@@ -466,7 +485,7 @@ static int process_block_data(uint8_t *output, size_t capacity, size_t *produced
             s.block_stage = BLK_DIST_SYMBOL;
             break;
         case BLK_DIST_SYMBOL: {
-            int rc = decode_symbol(dt, &s.dist_sym);
+            int rc = decode_symbol(s.tree.dtree.table, s.tree.dtree.trans, TINF_ARRAY_SIZE(s.tree.dtree.trans), &s.dist_sym);
             if (rc <= 0) return rc;
             if (s.dist_sym < 0 || s.dist_sym >= 30) {
                 set_error("invalid distance symbol");
