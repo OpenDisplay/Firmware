@@ -10,7 +10,6 @@
 #include "communication.h"
 #include "encryption.h"
 #include "boot_screen.h"
-#include "compression_config.h"
 #include "uzlib.h"
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
 #include "display_seeed_gfx.h"

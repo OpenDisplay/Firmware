@@ -7,7 +7,7 @@
 #include "config_parser.h"
 #include "ble_init.h"
 #include "wifi_service.h"
-#include "compression_config.h"
+#include "display_service.h"
 
 #ifndef BUILD_VERSION
 #define BUILD_VERSION "0.0"

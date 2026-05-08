@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE 256
+
 bool seeed_driver_used(void);
 int mapEpd(int id);
 bool waitforrefresh(int timeout);
