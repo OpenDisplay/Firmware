@@ -26,7 +26,6 @@ void writeTextAndFill(const char* text);
 void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
-void decompressDirectWriteData();
 void cleanupDirectWriteState(bool refreshDisplay);
 void handleDirectWriteEnd(uint8_t* data, uint16_t len);
 void handlePartialWriteStart(uint8_t* data, uint16_t len);

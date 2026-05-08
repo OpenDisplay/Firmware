@@ -10,6 +10,7 @@
 #include "communication.h"
 #include "encryption.h"
 #include "boot_screen.h"
+#include "compression_config.h"
 #include "uzlib.h"
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
 #include "display_seeed_gfx.h"
@@ -37,9 +38,7 @@ extern bool connectionRequested;
 extern uint8_t mloopcounter;
 extern bool displayPowerState;
 extern uint32_t directWriteStartTime;
-extern uint8_t* directWriteCompressedBuffer;
 extern uint32_t directWriteCompressedReceived;
-extern uint32_t directWriteCompressedSize;
 extern uint8_t directWriteRefreshMode;
 extern uint32_t directWriteTotalBytes;
 extern uint16_t directWriteHeight;
@@ -50,9 +49,7 @@ extern bool directWritePlane2;
 extern bool directWriteBitplanes;
 extern bool directWriteCompressed;
 extern bool directWriteActive;
-extern uint8_t* compressedDataBuffer;
-extern uint8_t dictionaryBuffer[];
-extern uint8_t decompressionChunk[];
+extern uint8_t decompressionChunk[OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE];
 
 extern uint32_t displayed_etag;
 
@@ -78,6 +75,8 @@ struct PartialStreamContext {
     uint32_t expected_stream_size;
     uint32_t plane_size;
     uint32_t bytes_received;
+    uint32_t bytes_written;
+    uint8_t current_plane;
 };
 
 uint32_t max_compressed_image_rx_bytes(uint8_t tm) {
@@ -113,8 +112,10 @@ void flashLed(uint8_t color, uint8_t brightness);
 static void cleanup_partial_write_state(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
 static void partial_prepare_panel_ram(void);
-static bool partial_prepare_logical_stream(void);
 static bool partial_write_to_panel(int refreshMode);
+static bool partial_write_stream_bytes(uint8_t* data, uint32_t len);
+static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool final);
+static bool zlib_stream_to_partial_write(const uint8_t* data, uint32_t len, bool final);
 static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
 static uint32_t parse_be_u32(const uint8_t* data);
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
@@ -1121,60 +1122,19 @@ void updatemsdata(){
 }
 
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
-    if (!compressedDataBuffer) {
-        cleanupDirectWriteState(false);
-        uint8_t errorResponse[] = {0xFF, 0xFF};
-        sendResponse(errorResponse, sizeof(errorResponse));
-        return;
-    }
-    uint32_t newTotalSize = directWriteCompressedReceived + len;
-    uint32_t cap = (globalConfig.display_count > 0)
-        ? max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes)
-        : 0;
-    if (cap == 0 || newTotalSize > cap) {
+    uint32_t cap = (globalConfig.display_count > 0) ? max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes) : 0;
+    if (cap == 0 ||
+        directWriteCompressedReceived > cap ||
+        len > cap - directWriteCompressedReceived ||
+        !zlib_stream_to_direct_write(data, len, false)) {
         cleanupDirectWriteState(true);
         uint8_t errorResponse[] = {0xFF, 0xFF};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
-    memcpy(directWriteCompressedBuffer + directWriteCompressedReceived, data, len);
     directWriteCompressedReceived += len;
     uint8_t ackResponse[] = {0x00, 0x71};
     sendResponse(ackResponse, sizeof(ackResponse));
-}
-
-void decompressDirectWriteData() {
-    if (directWriteCompressedReceived == 0) return;
-    struct uzlib_uncomp d;
-    memset(&d, 0, sizeof(d));
-    d.source = directWriteCompressedBuffer;
-    d.source_limit = directWriteCompressedBuffer + directWriteCompressedReceived;
-    d.source_read_cb = NULL;
-    uzlib_init();
-    int hdr = uzlib_zlib_parse_header(&d);
-    if (hdr < 0) return;
-    uint16_t window = 0x100 << hdr;
-    if (window > (uint16_t)(32 * 1024)) window = (uint16_t)(32 * 1024);
-    uzlib_uncompress_init(&d, dictionaryBuffer, window);
-    int res;
-    do {
-        d.dest_start = decompressionChunk;
-        d.dest = decompressionChunk;
-        d.dest_limit = decompressionChunk + 4096;
-        res = uzlib_uncompress(&d);
-        size_t bytesOut = d.dest - d.dest_start;
-        if (bytesOut > 0) {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-            if (seeed_driver_used()) {
-                seeed_gfx_direct_write_chunk(decompressionChunk, (uint32_t)bytesOut);
-            } else
-#endif
-            {
-                bbepWriteData(&bbep, decompressionChunk, bytesOut);
-            }
-            directWriteBytesWritten += bytesOut;
-        }
-    } while (res == TINF_OK && directWriteBytesWritten < directWriteTotalBytes);
 }
 
 void cleanupDirectWriteState(bool refreshDisplay) {
@@ -1184,9 +1144,7 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWritePlane2 = false;
     directWriteBytesWritten = 0;
     directWriteCompressedReceived = 0;
-    directWriteCompressedSize = 0;
     directWriteDecompressedTotal = 0;
-    directWriteCompressedBuffer = nullptr;
     directWriteWidth = 0;
     directWriteHeight = 0;
     directWriteTotalBytes = 0;
@@ -1230,28 +1188,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         else directWriteTotalBytes = (pixels + 7) / 8;
     }
     if (directWriteCompressed) {
-        if (!compressedDataBuffer) {
-            cleanupDirectWriteState(false);
-            uint8_t errorResponse[] = {0xFF, 0xFF};
-            sendResponse(errorResponse, sizeof(errorResponse));
-            return;
-        }
         memcpy(&directWriteDecompressedTotal, data, 4);
-        directWriteCompressedBuffer = compressedDataBuffer;
-        directWriteCompressedSize = 0;
-        directWriteCompressedReceived = 0;
-        if (len > 4) {
-            uint32_t compressedDataLen = len - 4;
-            uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
-            if (compressedDataLen > cap) {
-                cleanupDirectWriteState(false);
-                uint8_t errorResponse[] = {0xFF, 0xFF};
-                sendResponse(errorResponse, sizeof(errorResponse));
-                return;
-            }
-            memcpy(directWriteCompressedBuffer, data + 4, compressedDataLen);
-            directWriteCompressedReceived = compressedDataLen;
-        }
     }
     directWriteActive = true;
     directWriteBytesWritten = 0;
@@ -1272,6 +1209,20 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         bbepSendCMDSequence(&bbep, bbep.pInitFull);
         bbepSetAddrWindow(&bbep, 0, 0, globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height);
         bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
+    }
+    if (directWriteCompressed) {
+        od_zlib_stream_reset(directWriteDecompressedTotal);
+        if (len > 4) {
+            uint32_t compressedDataLen = len - 4;
+            uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
+            if (compressedDataLen > cap || !zlib_stream_to_direct_write(data + 4, compressedDataLen, false)) {
+                cleanupDirectWriteState(false);
+                uint8_t errorResponse[] = {0xFF, 0xFF};
+                sendResponse(errorResponse, sizeof(errorResponse));
+                return;
+            }
+            directWriteCompressedReceived = compressedDataLen;
+        }
     }
     uint8_t ackResponse[] = {0x00, 0x70};
     sendResponse(ackResponse, sizeof(ackResponse));
@@ -1335,15 +1286,9 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     uint32_t planeBytes = calc_controller_plane_bytes(rectW, rectH);
     uint32_t expectedLogicalSize = planeBytes * 2u;
 
-    if (!compressedDataBuffer || expectedLogicalSize > MAX_COMPRESSED_BUFFER_BYTES) {
+    if (expectedLogicalSize == 0) {
         uint8_t errResponse[] = {0xFF, 0xFF};
         sendResponse(errResponse, sizeof(errResponse));
-        return;
-    }
-
-    uint32_t rxOffset = ((flags & PARTIAL_FLAG_COMPRESSED) != 0) ? expectedLogicalSize : 0u;
-    if (rxOffset >= MAX_COMPRESSED_BUFFER_BYTES) {
-        send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, false);
         return;
     }
 
@@ -1358,8 +1303,10 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     partialCtx.height = rectH;
     partialCtx.expected_stream_size = expectedLogicalSize;
     partialCtx.plane_size = planeBytes;
-    directWriteCompressedBuffer = compressedDataBuffer + rxOffset;
-    directWriteCompressedReceived = 0;
+    partialCtx.current_plane = 0xFF;
+
+    partial_prepare_panel_ram();
+    if (partialCtx.compressed) od_zlib_stream_reset(expectedLogicalSize);
 
     // Process optional initial stream bytes before ACK
     if (len > 17) {
@@ -1369,8 +1316,6 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
             return;
         }
     }
-
-    partial_prepare_panel_ram();
 
     uint8_t ackResponse[] = {0x00, 0x76};
     sendResponse(ackResponse, sizeof(ackResponse));
@@ -1420,11 +1365,11 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
             return;
         }
         if (partialCtx.compressed) {
-            if (partialCtx.bytes_received == 0 || !partial_prepare_logical_stream()) {
+            if (partialCtx.bytes_received == 0 || !zlib_stream_to_partial_write(nullptr, 0, true)) {
                 send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
                 return;
             }
-        } else if (partialCtx.bytes_received != partialCtx.expected_stream_size) {
+        } else if (partialCtx.bytes_written != partialCtx.expected_stream_size) {
             send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
             return;
         }
@@ -1448,7 +1393,12 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     }
     if (!directWriteActive) return;
     directWriteStartTime = 0;
-    if (directWriteCompressed && directWriteCompressedReceived > 0) decompressDirectWriteData();
+    if (directWriteCompressed && !zlib_stream_to_direct_write(nullptr, 0, true)) {
+        cleanupDirectWriteState(true);
+        uint8_t errorResponse[] = {0xFF, 0xFF};
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
     int refreshMode = REFRESH_FULL;
     if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
     writeSerial("EPD refresh: ", false);
@@ -1496,59 +1446,95 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
 }
 
 static void cleanup_partial_write_state(void) {
+    bool powerDown = partialCtx.active && displayPowerState;
     memset(&partialCtx, 0, sizeof(partialCtx));
-    directWriteCompressedBuffer = nullptr;
-    directWriteCompressedReceived = 0;
+    if (powerDown) {
+        bbepSleep(&bbep, 1);
+        delay(200);
+        displayPowerState = false;
+        pwrmgm(false);
+    }
 }
 
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
-    if (!directWriteCompressedBuffer) return false;
-    uint32_t rxLimit = partialCtx.compressed
-        ? (MAX_COMPRESSED_BUFFER_BYTES - partialCtx.expected_stream_size)
+    uint32_t limit = partialCtx.compressed
+        ? max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes)
         : partialCtx.expected_stream_size;
-    if (len > rxLimit - partialCtx.bytes_received) return false;
-    memcpy(directWriteCompressedBuffer + partialCtx.bytes_received, data, len);
+    if (limit == 0 || partialCtx.bytes_received > limit || len > limit - partialCtx.bytes_received) return false;
     partialCtx.bytes_received += len;
-    directWriteCompressedReceived = partialCtx.bytes_received;
-    return true;
+    if (partialCtx.compressed) return zlib_stream_to_partial_write(data, len, false);
+    return partial_write_stream_bytes(data, len);
 }
 
-static bool partial_prepare_logical_stream(void) {
-    if (!directWriteCompressedBuffer || !compressedDataBuffer) return false;
-    if (!partialCtx.compressed) return partialCtx.bytes_received == partialCtx.expected_stream_size;
+static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool final) {
+    od_zlib_status_t status = od_zlib_stream_push(data, len, final);
+    if (status == OD_ZLIB_STATUS_ERROR) {
+        writeSerial(String("zlib stream error: ") + od_zlib_stream_error(), true);
+        return false;
+    }
 
-    struct uzlib_uncomp d;
-    memset(&d, 0, sizeof(d));
-    d.source = directWriteCompressedBuffer;
-    d.source_limit = directWriteCompressedBuffer + partialCtx.bytes_received;
-    d.source_read_cb = NULL;
-    uzlib_init();
-    int hdr = uzlib_zlib_parse_header(&d);
-    if (hdr < 0) return false;
-    uint16_t window = 0x100 << hdr;
-    if (window > (uint16_t)(32 * 1024)) window = (uint16_t)(32 * 1024);
-    uzlib_uncompress_init(&d, dictionaryBuffer, window);
-
-    uint32_t bytesOutTotal = 0;
-    int res;
-    do {
-        d.dest_start = decompressionChunk;
-        d.dest = decompressionChunk;
-        d.dest_limit = decompressionChunk + 4096;
-        res = uzlib_uncompress(&d);
-        size_t bytesOut = d.dest - d.dest_start;
+    for (;;) {
+        size_t bytesOut = 0;
+        status = od_zlib_stream_poll(decompressionChunk, OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE, &bytesOut);
         if (bytesOut > 0) {
-            if (bytesOutTotal + bytesOut > partialCtx.expected_stream_size) return false;
-            memcpy(compressedDataBuffer + bytesOutTotal, decompressionChunk, bytesOut);
-            bytesOutTotal += bytesOut;
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+            if (seeed_driver_used()) {
+                seeed_gfx_direct_write_chunk(decompressionChunk, (uint32_t)bytesOut);
+            } else
+#endif
+            {
+                bbepWriteData(&bbep, decompressionChunk, bytesOut);
+            }
+            directWriteBytesWritten += (uint32_t)bytesOut;
+            if (directWriteBytesWritten > directWriteDecompressedTotal) return false;
         }
-    } while (res == TINF_OK && bytesOutTotal < partialCtx.expected_stream_size);
+        if (status == OD_ZLIB_STATUS_OUTPUT_READY) continue;
+        if (status == OD_ZLIB_STATUS_NEEDS_INPUT) return !final;
+        if (status == OD_ZLIB_STATUS_DONE) return directWriteBytesWritten == directWriteDecompressedTotal;
+        writeSerial(String("zlib stream error: ") + od_zlib_stream_error(), true);
+        return false;
+    }
+}
 
-    if (res != TINF_DONE) return false;
-    if (bytesOutTotal != partialCtx.expected_stream_size) return false;
-    directWriteCompressedBuffer = compressedDataBuffer;
-    directWriteCompressedReceived = bytesOutTotal;
-    partialCtx.bytes_received = bytesOutTotal;
+static bool zlib_stream_to_partial_write(const uint8_t* data, uint32_t len, bool final) {
+    od_zlib_status_t status = od_zlib_stream_push(data, len, final);
+    if (status == OD_ZLIB_STATUS_ERROR) {
+        writeSerial(String("partial zlib stream error: ") + od_zlib_stream_error(), true);
+        return false;
+    }
+
+    for (;;) {
+        size_t bytesOut = 0;
+        status = od_zlib_stream_poll(decompressionChunk, OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE, &bytesOut);
+        if (bytesOut > 0 && !partial_write_stream_bytes(decompressionChunk, (uint32_t)bytesOut)) return false;
+        if (status == OD_ZLIB_STATUS_OUTPUT_READY) continue;
+        if (status == OD_ZLIB_STATUS_NEEDS_INPUT) return !final;
+        if (status == OD_ZLIB_STATUS_DONE) return partialCtx.bytes_written == partialCtx.expected_stream_size;
+        writeSerial(String("partial zlib stream error: ") + od_zlib_stream_error(), true);
+        return false;
+    }
+}
+
+static bool partial_write_stream_bytes(uint8_t* data, uint32_t len) {
+    uint32_t offset = 0;
+    while (offset < len) {
+        if (partialCtx.bytes_written >= partialCtx.expected_stream_size) return false;
+
+        uint8_t targetPlane = partialCtx.bytes_written < partialCtx.plane_size ? PLANE_1 : PLANE_0;
+        if (partialCtx.current_plane != targetPlane) {
+            if (targetPlane == PLANE_0 && partialCtx.bytes_written != partialCtx.plane_size) return false;
+            bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
+            bbepStartWrite(&bbep, targetPlane);
+            partialCtx.current_plane = targetPlane;
+        }
+
+        uint32_t planeEnd = targetPlane == PLANE_1 ? partialCtx.plane_size : partialCtx.expected_stream_size;
+        uint32_t chunk = planeEnd - partialCtx.bytes_written;
+        if (chunk > len - offset) chunk = len - offset;
+        bbepWriteData(&bbep, data + offset, (int)chunk);
+        partialCtx.bytes_written += chunk;
+        offset += chunk;
+    }
     return true;
 }
 
@@ -1565,8 +1551,6 @@ static void partial_prepare_panel_ram(void) {
 }
 
 static bool partial_write_to_panel(int refreshMode) {
-    if (!compressedDataBuffer) return false;
-
     writeSerial("EPD refresh: PARTIAL (raw rect ", false);
     writeSerial(String(partialCtx.x), false);
     writeSerial(",", false);
@@ -1577,18 +1561,7 @@ static bool partial_write_to_panel(int refreshMode) {
     writeSerial(String(partialCtx.height), false);
     writeSerial(")", true);
 
-    if (!displayPowerState) {
-        pwrmgm(true);
-        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
-        bbepWakeUp(&bbep);
-        bbepSendCMDSequence(&bbep, bbep.pInitFull);
-    }
-    bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
-    bbepStartWrite(&bbep, PLANE_1);
-    bbepWriteData(&bbep, compressedDataBuffer, partialCtx.plane_size);
-    bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
-    bbepStartWrite(&bbep, PLANE_0);
-    bbepWriteData(&bbep, compressedDataBuffer + partialCtx.plane_size, partialCtx.plane_size);
+    if (partialCtx.bytes_written != partialCtx.expected_stream_size) return false;
     delay(20);
     bbepRefresh(&bbep, refreshMode);
     bool refreshSuccess = waitforrefresh(60);

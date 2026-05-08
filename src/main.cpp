@@ -1,7 +1,4 @@
 #include "main.h"
-#ifdef TARGET_ESP32
-#include <esp_heap_caps.h>
-#endif
 #include "boot_screen.h"
 #include "communication.h"
 #include "device_control.h"
@@ -20,26 +17,6 @@
 static HardwareSerial LogSerialPort(1);
 #endif
 
-#if defined(TARGET_NRF)
-static uint8_t s_compressedDataStorage[MAX_COMPRESSED_BUFFER_BYTES];
-uint8_t* compressedDataBuffer = s_compressedDataStorage;
-#elif defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY) && defined(BOARD_HAS_PSRAM)
-uint8_t* compressedDataBuffer = nullptr;
-#else
-static uint8_t s_compressedDataStorage[MAX_COMPRESSED_BUFFER_BYTES];
-uint8_t* compressedDataBuffer = s_compressedDataStorage;
-#endif
-
-void allocCompressedDataBuffer(void) {
-#if defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY) && defined(BOARD_HAS_PSRAM)
-    if (compressedDataBuffer) return;
-    compressedDataBuffer = (uint8_t*)heap_caps_malloc(MAX_COMPRESSED_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!compressedDataBuffer) {
-        compressedDataBuffer = (uint8_t*)heap_caps_malloc(MAX_COMPRESSED_BUFFER_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-#endif
-}
-
 void setup() {
     #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
     LogSerialPort.begin(115200, SERIAL_8N1, OPENDISPLAY_LOG_UART_RX, OPENDISPLAY_LOG_UART_TX);
@@ -48,7 +25,6 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     #endif
-    allocCompressedDataBuffer();
     writeSerial("=== FIRMWARE INFO ===");
     writeSerial("Firmware Version: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()));
     const char* shaCStr = SHA_STRING;
@@ -239,7 +215,6 @@ uint8_t pinToButtonIndex[64] = {0xFF};  // Map pin number to button index (max 6
 
 #ifdef TARGET_ESP32
 void minimalSetup() {
-    allocCompressedDataBuffer();
     writeSerial("=== Minimal Setup (Deep Sleep Wake) ===");
     full_config_init();
     initio();
