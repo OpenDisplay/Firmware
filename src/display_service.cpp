@@ -79,16 +79,6 @@ struct PartialStreamContext {
     uint8_t current_plane;
 };
 
-uint32_t max_compressed_image_rx_bytes(uint8_t tm) {
-    if ((tm & TRANSMISSION_MODE_ZIP) == 0) return 0;
-    if ((tm & TRANSMISSION_MODE_ZIPXL) != 0 &&
-        MAX_COMPRESSED_BUFFER_BYTES > (54u * 1024u)) {
-        return MAX_COMPRESSED_BUFFER_BYTES;
-    }
-    uint32_t stdlim = 54u * 1024u;
-    return stdlim < MAX_COMPRESSED_BUFFER_BYTES ? stdlim : MAX_COMPRESSED_BUFFER_BYTES;
-}
-
 #ifdef TARGET_ESP32
 extern BLEAdvertisementData* advertisementData;
 extern BLEServer* pServer;
@@ -223,6 +213,7 @@ int mapEpd(int id){
         case 0x003F: return EP31_240x320;
         case 0x0040: return EP75YR_800x480;
         case 0x0041: return EP_PANEL_UNDEFINED;
+        case 0x0042: return EP133_960x680;
         default: return EP_PANEL_UNDEFINED;
     }
 }
@@ -1122,11 +1113,13 @@ void updatemsdata(){
 }
 
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
-    uint32_t cap = (globalConfig.display_count > 0) ? max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes) : 0;
-    if (cap == 0 ||
-        directWriteCompressedReceived > cap ||
-        len > cap - directWriteCompressedReceived ||
-        !zlib_stream_to_direct_write(data, len, false)) {
+    if (len > UINT32_MAX - directWriteCompressedReceived) {
+        cleanupDirectWriteState(true);
+        uint8_t errorResponse[] = {0xFF, 0xFF};
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
+    if (!zlib_stream_to_direct_write(data, len, false)) {
         cleanupDirectWriteState(true);
         uint8_t errorResponse[] = {0xFF, 0xFF};
         sendResponse(errorResponse, sizeof(errorResponse));
@@ -1188,7 +1181,19 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         else directWriteTotalBytes = (pixels + 7) / 8;
     }
     if (directWriteCompressed) {
+        if ((globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_ZIP) == 0) {
+            cleanupDirectWriteState(false);
+            uint8_t errorResponse[] = {0xFF, 0xFF};
+            sendResponse(errorResponse, sizeof(errorResponse));
+            return;
+        }
         memcpy(&directWriteDecompressedTotal, data, 4);
+        if (directWriteDecompressedTotal != directWriteTotalBytes) {
+            cleanupDirectWriteState(false);
+            uint8_t errorResponse[] = {0xFF, 0xFF};
+            sendResponse(errorResponse, sizeof(errorResponse));
+            return;
+        }
     }
     directWriteActive = true;
     directWriteBytesWritten = 0;
@@ -1214,8 +1219,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         od_zlib_stream_reset(directWriteDecompressedTotal);
         if (len > 4) {
             uint32_t compressedDataLen = len - 4;
-            uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
-            if (compressedDataLen > cap || !zlib_stream_to_direct_write(data + 4, compressedDataLen, false)) {
+            if (!zlib_stream_to_direct_write(data + 4, compressedDataLen, false)) {
                 cleanupDirectWriteState(false);
                 uint8_t errorResponse[] = {0xFF, 0xFF};
                 sendResponse(errorResponse, sizeof(errorResponse));
@@ -1457,10 +1461,14 @@ static void cleanup_partial_write_state(void) {
 }
 
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
-    uint32_t limit = partialCtx.compressed
-        ? max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes)
-        : partialCtx.expected_stream_size;
-    if (limit == 0 || partialCtx.bytes_received > limit || len > limit - partialCtx.bytes_received) return false;
+    if (partialCtx.compressed) {
+        if (len > UINT32_MAX - partialCtx.bytes_received) return false;
+    } else {
+        if (partialCtx.bytes_received > partialCtx.expected_stream_size ||
+            len > partialCtx.expected_stream_size - partialCtx.bytes_received) {
+            return false;
+        }
+    }
     partialCtx.bytes_received += len;
     if (partialCtx.compressed) return zlib_stream_to_partial_write(data, len, false);
     return partial_write_stream_bytes(data, len);
@@ -1486,11 +1494,18 @@ static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool 
                 bbepWriteData(&bbep, decompressionChunk, bytesOut);
             }
             directWriteBytesWritten += (uint32_t)bytesOut;
-            if (directWriteBytesWritten > directWriteDecompressedTotal) return false;
+            if (directWriteBytesWritten > directWriteDecompressedTotal) {
+                return false;
+            }
         }
         if (status == OD_ZLIB_STATUS_OUTPUT_READY) continue;
         if (status == OD_ZLIB_STATUS_NEEDS_INPUT) return !final;
-        if (status == OD_ZLIB_STATUS_DONE) return directWriteBytesWritten == directWriteDecompressedTotal;
+        if (status == OD_ZLIB_STATUS_DONE) {
+            if (directWriteBytesWritten != directWriteDecompressedTotal) {
+                return false;
+            }
+            return true;
+        }
         writeSerial(String("zlib stream error: ") + od_zlib_stream_error(), true);
         return false;
     }

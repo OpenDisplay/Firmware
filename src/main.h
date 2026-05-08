@@ -185,7 +185,7 @@ uint16_t directWriteHeight = 0;  // Display height in pixels
 uint32_t directWriteTotalBytes = 0;  // Total bytes expected per plane (for bitplanes) or total (for others)
 uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if supported)
 uint8_t directWriteDataKind = 0;  // none; display_service.cpp tracks full vs partial 0x71 streams
-uint32_t directWriteCompressedReceived = 0;  // Total compressed bytes received for sanity limits
+uint32_t directWriteCompressedReceived = 0;  // Total compressed bytes received for diagnostics/overflow guard
 
 uint32_t directWriteStartTime = 0;  // Timestamp when direct write started (for timeout detection)
 bool displayPowerState = false;  // Track display power state (true = powered on, false = powered off)

@@ -4,8 +4,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-uint32_t max_compressed_image_rx_bytes(uint8_t transmission_modes);
-
 bool seeed_driver_used(void);
 int mapEpd(int id);
 bool waitforrefresh(int timeout);
