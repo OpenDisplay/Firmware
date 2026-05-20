@@ -8,6 +8,7 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <string.h>
+#include "ble_init.h"
 
 #ifndef COMMAND_QUEUE_SIZE
 #define COMMAND_QUEUE_SIZE 5
@@ -29,6 +30,9 @@ extern uint8_t rebootFlag;
 
 void updatemsdata();
 void cleanupDirectWriteState(bool refreshDisplay);
+void touchResumeAfterEpdRefresh(void);
+extern volatile bool epdRefreshInProgress;
+extern bool directWriteActive;
 
 class MyBLEServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -37,16 +41,15 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
         updatemsdata();
     }
     void onDisconnect(BLEServer* pServer) {
+        (void)pServer;
         writeSerial("=== BLE CLIENT DISCONNECTED (ESP32) ===");
-        cleanupDirectWriteState(true);
-        writeSerial("Waiting before restarting advertising...");
-        delay(500);
-        if (pServer->getConnectedCount() == 0) {
-            BLEDevice::startAdvertising();
-            writeSerial("Advertising restarted");
-        } else {
-            writeSerial("not restarting advertising");
+        if (epdRefreshInProgress) {
+            writeSerial("EPD refresh in progress — deferring cleanup/advertising to main loop");
+        } else if (directWriteActive) {
+            cleanupDirectWriteState(true);
+            touchResumeAfterEpdRefresh();
         }
+        bleRestartAdvertisingPending = true;
     }
 };
 

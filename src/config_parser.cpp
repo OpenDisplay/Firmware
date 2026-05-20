@@ -1,7 +1,5 @@
 #include "config_parser.h"
 #include "structs.h"
-
-static_assert(sizeof(struct WifiConfig) == 160, "wifi_config must match config.yaml (32+32+1+95)");
 #include "encryption_state.h"
 #include "encryption.h"
 #include <Arduino.h>

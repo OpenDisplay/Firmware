@@ -123,8 +123,13 @@ void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
 extern uint8_t* compressedDataBuffer;
 void allocCompressedDataBuffer(void);
 
+#ifdef TARGET_ESP32
+uint8_t* decompressionChunk = nullptr;
+uint8_t* dictionaryBuffer = nullptr;
+#else
 uint8_t decompressionChunk[DECOMP_CHUNK_SIZE];
 uint8_t dictionaryBuffer[MAX_DICT_SIZE];
+#endif
 uint8_t bleResponseBuffer[94];
 uint8_t mloopcounter = 0;
 uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection

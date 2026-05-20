@@ -10,6 +10,7 @@
 #include "communication.h"
 #include "encryption.h"
 #include "boot_screen.h"
+#include "touch_input.h"
 #include "uzlib.h"
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
 #include "display_seeed_gfx.h"
@@ -24,6 +25,7 @@ extern "C" {
 
 #ifdef TARGET_ESP32
 #include <BLEDevice.h>
+#include "ble_init.h"
 #include "wifi_service.h"
 #endif
 
@@ -50,9 +52,15 @@ extern bool directWritePlane2;
 extern bool directWriteBitplanes;
 extern bool directWriteCompressed;
 extern bool directWriteActive;
+volatile bool epdRefreshInProgress = false;
 extern uint8_t* compressedDataBuffer;
+#if defined(TARGET_ESP32)
+extern uint8_t* dictionaryBuffer;
+extern uint8_t* decompressionChunk;
+#else
 extern uint8_t dictionaryBuffer[];
 extern uint8_t decompressionChunk[];
+#endif
 
 uint32_t max_compressed_image_rx_bytes(uint8_t tm) {
     if ((tm & TRANSMISSION_MODE_ZIP) == 0) return 0;
@@ -295,19 +303,47 @@ void initDataBuses(){
     writeSerial("=== Data Bus Initialization Complete ===", true);
 }
 
+#ifdef TARGET_ESP32
+static bool s_wire_open_display_ready = false;
+static int8_t s_wire_sda_pin = -1;
+static int8_t s_wire_scl_pin = -1;
+static uint32_t s_wire_clock_hz = 0;
+#endif
+
+void invalidateOpenDisplayWire(void) {
+#ifdef TARGET_ESP32
+    s_wire_open_display_ready = false;
+#endif
+}
+
 void initOrRestoreWireForOpenDisplay(void) {
 #ifdef TARGET_ESP32
     if (globalConfig.data_bus_count > 0) {
         const struct DataBus& bus = globalConfig.data_buses[0];
         if (bus.bus_type == 0x01 && bus.pin_1 != 0xFF && bus.pin_2 != 0xFF) {
             uint32_t hz = bus.bus_speed_hz ? bus.bus_speed_hz : 100000u;
-            Wire.begin((int)bus.pin_2, (int)bus.pin_1);
+            int sda = (int)bus.pin_2;
+            int scl = (int)bus.pin_1;
+            if (s_wire_open_display_ready && s_wire_sda_pin == sda && s_wire_scl_pin == scl &&
+                s_wire_clock_hz == hz) {
+                return;
+            }
+            Wire.begin(sda, scl);
             Wire.setClock(hz);
+            s_wire_sda_pin = (int8_t)sda;
+            s_wire_scl_pin = (int8_t)scl;
+            s_wire_clock_hz = hz;
+            s_wire_open_display_ready = true;
             return;
         }
     }
-#endif
+    if (!s_wire_open_display_ready) {
+        Wire.begin();
+        s_wire_open_display_ready = true;
+    }
+#else
     Wire.begin();
+#endif
 }
 
 void initio(){
@@ -928,12 +964,16 @@ void initDisplay(){
         if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
             writeBootScreenWithQr();
             writeSerial("EPD refresh: FULL (boot, Seeed)", true);
+            touchSuspendForEpdRefresh();
             seeed_gfx_full_update();
             waitforrefresh(60);
             seeed_gfx_sleep_after_refresh();
             delay(200);
+            pwrmgm(false);
+            touchResumeAfterEpdRefresh();
+        } else {
+            pwrmgm(false);
         }
-        pwrmgm(false);
     } else
 #endif
     {
@@ -950,12 +990,16 @@ void initDisplay(){
         if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
             writeBootScreenWithQr();
             writeSerial("EPD refresh: FULL (boot)", true);
+            touchSuspendForEpdRefresh();
             bbepRefresh(&bbep, REFRESH_FULL);
             waitforrefresh(60);
             bbepSleep(&bbep, 1);
             delay(200);
+            pwrmgm(false);
+            touchResumeAfterEpdRefresh();
+        } else {
+            pwrmgm(false);
         }
-        pwrmgm(false);
     }
     }
     else{
@@ -1109,6 +1153,7 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
 
 void decompressDirectWriteData() {
     if (directWriteCompressedReceived == 0) return;
+    if (!dictionaryBuffer || !decompressionChunk) return;
     struct uzlib_uncomp d;
     memset(&d, 0, sizeof(d));
     d.source = directWriteCompressedBuffer;
@@ -1172,7 +1217,10 @@ void cleanupDirectWriteState(bool refreshDisplay) {
 }
 
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
-    if (directWriteActive) cleanupDirectWriteState(false);
+    if (directWriteActive) {
+        cleanupDirectWriteState(false);
+    }
+    touchSuspendForEpdRefresh();
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
         seeed_gfx_prepare_hardware();
@@ -1195,6 +1243,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     if (directWriteCompressed) {
         if (!compressedDataBuffer) {
             cleanupDirectWriteState(false);
+            touchResumeAfterEpdRefresh();
             uint8_t errorResponse[] = {0xFF, 0xFF};
             sendResponse(errorResponse, sizeof(errorResponse));
             return;
@@ -1208,6 +1257,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
             uint32_t cap = max_compressed_image_rx_bytes(globalConfig.displays[0].transmission_modes);
             if (compressedDataLen > cap) {
                 cleanupDirectWriteState(false);
+                touchResumeAfterEpdRefresh();
                 uint8_t errorResponse[] = {0xFF, 0xFF};
                 sendResponse(errorResponse, sizeof(errorResponse));
                 return;
@@ -1279,6 +1329,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     uint8_t ackResponse[] = {0x00, 0x72};
     sendResponse(ackResponse, sizeof(ackResponse));
     delay(20);
+    epdRefreshInProgress = true;
     bool refreshSuccess = false;
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
@@ -1292,8 +1343,13 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         refreshSuccess = waitforrefresh(60);
         bbepSleep(&bbep, 1);
     }
+    epdRefreshInProgress = false;
     delay(50);
     cleanupDirectWriteState(false);
+    touchResumeAfterEpdRefresh();
+#ifdef TARGET_ESP32
+    esp32_restart_ble_advertising();
+#endif
     if (refreshSuccess) {
         uint8_t refreshResponse[] = {0x00, 0x73};
         sendResponse(refreshResponse, sizeof(refreshResponse));

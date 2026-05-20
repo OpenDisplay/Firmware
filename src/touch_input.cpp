@@ -13,6 +13,9 @@
 
 extern struct GlobalConfig globalConfig;
 extern uint8_t dynamicreturndata[11];
+#ifdef TARGET_ESP32
+extern bool directWriteActive;
+#endif
 void updatemsdata(void);
 void writeSerial(String message, bool newLine = true);
 
@@ -28,6 +31,11 @@ static_assert(sizeof(TouchController) == 32, "TouchController must be 32 bytes f
 #define GT911_STATUS_BUFFER_READY 0x80u
 #define GT911_MAX_CONTACTS 5u
 /* MSD byte0 low nibble: GT911 contact count 1–5 while touching; 6 = released (last x,y in bytes 1–4; high nibble = last track id). 0 = never touched (5-byte block cleared). */
+#define GT911_I2C_RETRIES 3
+#define GT911_I2C_RETRY_DELAY_US 500
+#define TOUCH_I2C_FAIL_BACKOFF_MS 100
+#define TOUCH_PROCESS_MIN_INTERVAL_MS 100
+#define TOUCH_I2C_FAIL_DISABLE_THRESHOLD 5
 
 #ifndef TOUCH_DEBUG
 #define TOUCH_DEBUG 1
@@ -44,12 +52,68 @@ struct TouchRuntime {
     uint8_t last_id;
     uint32_t last_poll_ms;
     uint32_t last_i2c_warn_ms;
+    uint32_t last_i2c_fail_ms;
     uint8_t touch_latched;
+    uint8_t i2c_fail_streak;
+    uint8_t disabled;
 };
 
 static TouchRuntime s_touch_rt[4];
+static uint32_t s_last_touch_process_ms = 0;
+static uint8_t s_epd_refresh_suspend = 0;
+
+static void gt911_drain_wire(void) {
+    while (Wire.available()) {
+        (void)Wire.read();
+    }
+}
+
+static bool gt911_read_reg_once(uint8_t addr7, uint16_t reg, uint8_t* buf, uint8_t len, bool reg_high_first, bool repeated_start) {
+    Wire.beginTransmission(addr7);
+    if (reg_high_first) {
+        Wire.write((uint8_t)(reg >> 8));
+        Wire.write((uint8_t)(reg & 0xFFu));
+    } else {
+        Wire.write((uint8_t)(reg & 0xFFu));
+        Wire.write((uint8_t)(reg >> 8));
+    }
+    if (Wire.endTransmission(repeated_start ? false : true) != 0) {
+        return false;
+    }
+    size_t n = Wire.requestFrom((int)addr7, (int)len);
+    if (n != (size_t)len) {
+        return false;
+    }
+    for (uint8_t i = 0; i < len; i++) {
+        buf[i] = (uint8_t)Wire.read();
+    }
+    return true;
+}
 
 static volatile uint8_t s_touch_irq_mask = 0;
+
+static void touch_disable_controller(uint8_t idx, TouchController* tc, TouchRuntime* rt, const char* reason) {
+    if (rt->disabled) {
+        return;
+    }
+    rt->disabled = 1;
+    rt->ok = 0;
+    if (rt->int_irq_attached && tc->int_pin != 0xFF) {
+        int irq_num = digitalPinToInterrupt(tc->int_pin);
+        if (irq_num >= 0) {
+            detachInterrupt(irq_num);
+        }
+        rt->int_irq_attached = 0;
+        s_touch_irq_mask &= (uint8_t)~(1u << idx);
+    }
+    writeSerial("Touch[" + String(idx) + "]: disabled (" + String(reason) + ")", true);
+}
+
+void touchSuspendForEpdRefresh(void) {
+    if (s_epd_refresh_suspend < 255) {
+        s_epd_refresh_suspend++;
+    }
+}
 
 static void TOUCH_ISR_ATTR touch_isr_0(void) {
     s_touch_irq_mask |= 1u << 0;
@@ -90,43 +154,42 @@ static void attach_touch_int(uint8_t idx, uint8_t pin) {
     s_touch_rt[idx].int_irq_attached = 1;
 }
 
-static const uint32_t TOUCH_I2C_WARN_INTERVAL_MS = 3000;
-
 static bool gt911_write_reg(uint8_t addr7, uint16_t reg, const uint8_t* buf, uint8_t len, bool reg_high_first) {
-    Wire.beginTransmission(addr7);
-    if (reg_high_first) {
-        Wire.write((uint8_t)(reg >> 8));
-        Wire.write((uint8_t)(reg & 0xFFu));
-    } else {
-        Wire.write((uint8_t)(reg & 0xFFu));
-        Wire.write((uint8_t)(reg >> 8));
+    for (uint8_t attempt = 0; attempt < GT911_I2C_RETRIES; attempt++) {
+        Wire.beginTransmission(addr7);
+        if (reg_high_first) {
+            Wire.write((uint8_t)(reg >> 8));
+            Wire.write((uint8_t)(reg & 0xFFu));
+        } else {
+            Wire.write((uint8_t)(reg & 0xFFu));
+            Wire.write((uint8_t)(reg >> 8));
+        }
+        for (uint8_t i = 0; i < len; i++) {
+            Wire.write(buf[i]);
+        }
+        if (Wire.endTransmission() == 0) {
+            return true;
+        }
+        gt911_drain_wire();
+        delayMicroseconds(GT911_I2C_RETRY_DELAY_US);
     }
-    for (uint8_t i = 0; i < len; i++) {
-        Wire.write(buf[i]);
-    }
-    return Wire.endTransmission() == 0;
+    return false;
 }
 
 static bool gt911_read_reg(uint8_t addr7, uint16_t reg, uint8_t* buf, uint8_t len, bool reg_high_first) {
-    Wire.beginTransmission(addr7);
-    if (reg_high_first) {
-        Wire.write((uint8_t)(reg >> 8));
-        Wire.write((uint8_t)(reg & 0xFFu));
-    } else {
-        Wire.write((uint8_t)(reg & 0xFFu));
-        Wire.write((uint8_t)(reg >> 8));
+    for (uint8_t attempt = 0; attempt < GT911_I2C_RETRIES; attempt++) {
+        if (gt911_read_reg_once(addr7, reg, buf, len, reg_high_first, true)) {
+            return true;
+        }
+        gt911_drain_wire();
+        delayMicroseconds(GT911_I2C_RETRY_DELAY_US);
+        if (gt911_read_reg_once(addr7, reg, buf, len, reg_high_first, false)) {
+            return true;
+        }
+        gt911_drain_wire();
+        delayMicroseconds(GT911_I2C_RETRY_DELAY_US);
     }
-    if (Wire.endTransmission(false) != 0) {
-        return false;
-    }
-    size_t n = Wire.requestFrom((int)addr7, (int)len);
-    if (n != (size_t)len) {
-        return false;
-    }
-    for (uint8_t i = 0; i < len; i++) {
-        buf[i] = (uint8_t)Wire.read();
-    }
-    return true;
+    return false;
 }
 
 static bool gt911_product_id_match(const uint8_t* id) {
@@ -251,6 +314,60 @@ static void gt911_clear_status(uint8_t addr7, bool reg_high_first) {
     gt911_write_reg(addr7, GT911_REG_STATUS, &z, 1, reg_high_first);
 }
 
+static bool touch_reinit_gt911(uint8_t idx, TouchController* tc, TouchRuntime* rt) {
+    if (tc->touch_ic_type != TOUCH_IC_GT911 || !touch_bus_ok(tc)) {
+        return false;
+    }
+    if (tc->touch_data_start_byte > 6u) {
+        return false;
+    }
+    uint8_t addr = gt911_resolve_and_init(tc, rt);
+    if (addr == 0) {
+        rt->ok = 0;
+        return false;
+    }
+    rt->addr7 = addr;
+    rt->ok = 1;
+    rt->disabled = 0;
+    rt->i2c_fail_streak = 0;
+    rt->last_i2c_fail_ms = 0;
+    rt->last_i2c_warn_ms = 0;
+    rt->touch_latched = 0;
+    gt911_clear_status(addr, rt->reg_high_first != 0);
+    if (tc->int_pin != 0xFF) {
+        gt911_int_wake_before_irq(tc);
+        if (!rt->int_irq_attached) {
+            attach_touch_int(idx, tc->int_pin);
+        }
+    }
+    return true;
+}
+
+void touchResumeAfterEpdRefresh(void) {
+    if (s_epd_refresh_suspend == 0) {
+        return;
+    }
+    s_epd_refresh_suspend--;
+    if (s_epd_refresh_suspend != 0) {
+        return;
+    }
+    invalidateOpenDisplayWire();
+    initOrRestoreWireForOpenDisplay();
+    delay(GT911_POST_RESET_SETTLE_MS);
+    for (uint8_t i = 0; i < globalConfig.touch_controller_count; i++) {
+        TouchController* tc = &globalConfig.touch_controllers[i];
+        TouchRuntime* rt = &s_touch_rt[i];
+        if (tc->touch_ic_type != TOUCH_IC_GT911 || rt->disabled) {
+            continue;
+        }
+        if (touch_reinit_gt911(i, tc, rt)) {
+            writeSerial("Touch[" + String(i) + "]: reinit OK after EPD @0x" + String(rt->addr7, HEX), true);
+        } else {
+            writeSerial("Touch[" + String(i) + "]: reinit failed after EPD refresh", true);
+        }
+    }
+}
+
 static void apply_touch_map(const TouchController* t, uint16_t* x, uint16_t* y) {
     if (t->flags & TOUCH_FLAG_SWAP_XY) {
         uint16_t tmp = *x;
@@ -317,36 +434,29 @@ void initTouchInput(void) {
             writeSerial("Touch[" + String(i) + "]: touch_data_start_byte must be 0–6 (5-byte window)", true);
             continue;
         }
-        uint8_t addr = gt911_resolve_and_init(tc, rt);
-        if (addr == 0) {
+        if (!touch_reinit_gt911(i, tc, rt)) {
             writeSerial("Touch[" + String(i) + "]: init failed", true);
             continue;
         }
-        rt->addr7 = addr;
-        rt->ok = 1;
-        gt911_clear_status(addr, rt->reg_high_first != 0);
         {
             const bool rh = rt->reg_high_first != 0;
             uint16_t xres = 0;
             uint16_t yres = 0;
             uint8_t inf[12];
-            if (gt911_read_reg(addr, GT911_REG_PID, inf, sizeof(inf), rh)) {
+            if (gt911_read_reg(rt->addr7, GT911_REG_PID, inf, sizeof(inf), rh)) {
                 xres = (uint16_t)inf[6] | ((uint16_t)inf[7] << 8);
                 yres = (uint16_t)inf[8] | ((uint16_t)inf[9] << 8);
             }
-            writeSerial("Touch[" + String(i) + "]: GT911 @0x" + String(addr, HEX) + " " + String(rh ? "BE" : "LE") +
+            writeSerial("Touch[" + String(i) + "]: GT911 @0x" + String(rt->addr7, HEX) + " " + String(rh ? "BE" : "LE") +
                         " " + String(xres) + "x" + String(yres) + (tc->int_pin != 0xFF ? " INT+poll" : " poll"), true);
         }
-        if (tc->int_pin != 0xFF) {
-            gt911_int_wake_before_irq(tc);
 #if TOUCH_DEBUG
+        if (tc->int_pin != 0xFF && rt->int_irq_attached) {
             writeSerial("Touch[" + String(i) + "]: INT GPIO " + String(tc->int_pin) + " FALLING", true);
-#endif
-            attach_touch_int(i, tc->int_pin);
-            if (!rt->int_irq_attached) {
-                writeSerial("Touch[" + String(i) + "]: INT attach failed — polling only", true);
-            }
+        } else if (tc->int_pin != 0xFF) {
+            writeSerial("Touch[" + String(i) + "]: INT attach failed — polling only", true);
         }
+#endif
         rt->last_poll_ms = millis();
     }
 }
@@ -365,15 +475,27 @@ bool touch_input_gpio_is_touch_int(uint8_t pin) {
 }
 
 void processTouchInput(void) {
+    if (globalConfig.touch_controller_count == 0) {
+        return;
+    }
+#ifdef TARGET_ESP32
+    if (directWriteActive || s_epd_refresh_suspend > 0) {
+        return;
+    }
+#endif
     uint32_t now = millis();
+    if ((uint32_t)(now - s_last_touch_process_ms) < TOUCH_PROCESS_MIN_INTERVAL_MS) {
+        return;
+    }
+    s_last_touch_process_ms = now;
     for (uint8_t i = 0; i < globalConfig.touch_controller_count; i++) {
         TouchController* tc = &globalConfig.touch_controllers[i];
         TouchRuntime* rt = &s_touch_rt[i];
-        if (tc->touch_ic_type != TOUCH_IC_GT911 || !rt->ok) {
+        if (tc->touch_ic_type != TOUCH_IC_GT911 || !rt->ok || rt->disabled) {
             continue;
         }
 
-        uint8_t interval = tc->poll_interval_ms ? tc->poll_interval_ms : 25;
+        uint8_t interval = tc->poll_interval_ms ? tc->poll_interval_ms : TOUCH_PROCESS_MIN_INTERVAL_MS;
         const bool irq_mode = (rt->int_irq_attached != 0);
         bool from_irq = false;
         bool line_low = false;
@@ -382,6 +504,10 @@ void processTouchInput(void) {
         if (irq_mode) {
             bool edge = (s_touch_irq_mask & (1u << i)) != 0;
             line_low = (digitalRead(tc->int_pin) == LOW);
+            if (line_low && rt->i2c_fail_streak > 0 &&
+                (uint32_t)(now - rt->last_i2c_fail_ms) < TOUCH_I2C_FAIL_BACKOFF_MS) {
+                line_low = false;
+            }
             timed_poll = (uint32_t)(now - rt->last_poll_ms) >= interval;
             want_read = edge || timed_poll || line_low;
             if (!want_read) {
@@ -402,12 +528,19 @@ void processTouchInput(void) {
         const bool rh = rt->reg_high_first != 0;
         uint8_t st = 0;
         if (!gt911_read_reg(rt->addr7, GT911_REG_STATUS, &st, 1, rh)) {
-            if ((uint32_t)(now - rt->last_i2c_warn_ms) >= TOUCH_I2C_WARN_INTERVAL_MS) {
-                rt->last_i2c_warn_ms = now;
+            if (rt->i2c_fail_streak < 255) {
+                rt->i2c_fail_streak++;
+            }
+            rt->last_i2c_fail_ms = now;
+            if (rt->i2c_fail_streak >= TOUCH_I2C_FAIL_DISABLE_THRESHOLD) {
+                touch_disable_controller(i, tc, rt, "too many I2C read failures");
+            } else if (rt->i2c_fail_streak == 1) {
                 writeSerial("Touch[" + String(i) + "]: I2C read fail (status reg 0x814E, addr 0x" + String(rt->addr7, HEX) + ")", true);
             }
+            rt->last_poll_ms = now;
             continue;
         }
+        rt->i2c_fail_streak = 0;
 
         if ((st & GT911_STATUS_BUFFER_READY) == 0) {
             if (!from_irq && !line_low) {
@@ -430,9 +563,12 @@ void processTouchInput(void) {
         if (n > 0) {
             uint8_t p[8];
             if (!gt911_read_reg(rt->addr7, GT911_REG_POINT1, p, 8, rh)) {
-                if ((uint32_t)(now - rt->last_i2c_warn_ms) >= TOUCH_I2C_WARN_INTERVAL_MS) {
-                    rt->last_i2c_warn_ms = now;
-                    writeSerial("Touch[" + String(i) + "]: I2C read fail (point1 @0x814F, addr 0x" + String(rt->addr7, HEX) + ")", true);
+                if (rt->i2c_fail_streak < 255) {
+                    rt->i2c_fail_streak++;
+                }
+                rt->last_i2c_fail_ms = now;
+                if (rt->i2c_fail_streak >= TOUCH_I2C_FAIL_DISABLE_THRESHOLD) {
+                    touch_disable_controller(i, tc, rt, "too many I2C read failures");
                 }
                 continue;
             }
