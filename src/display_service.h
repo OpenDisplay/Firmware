@@ -16,6 +16,8 @@ void initio();
 void initDataBuses();
 /** Re-apply I2C from data_bus[0] when set; else Wire.begin(). Call before TCON/touch on shared bus. */
 void initOrRestoreWireForOpenDisplay(void);
+/** Call after Wire.end() so the next touch/sensor access re-inits the bus. */
+void invalidateOpenDisplayWire(void);
 void scanI2CDevices();
 void initSensors();
 void initAXP2101(uint8_t busId);
@@ -28,6 +30,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
 void cleanupDirectWriteState(bool refreshDisplay);
 void handleDirectWriteEnd(uint8_t* data, uint16_t len);
+extern volatile bool epdRefreshInProgress;
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
 int getplane();
 int getBitsPerPixel();

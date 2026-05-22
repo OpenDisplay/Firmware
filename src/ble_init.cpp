@@ -93,6 +93,28 @@ void ble_init() {
 #endif
 
 #ifdef TARGET_ESP32
+volatile bool bleRestartAdvertisingPending = false;
+
+void esp32_restart_ble_advertising(void) {
+    if (pServer == nullptr) {
+        bleRestartAdvertisingPending = true;
+        return;
+    }
+    if (pServer->getConnectedCount() > 0) {
+        bleRestartAdvertisingPending = false;
+        return;
+    }
+    if (epdRefreshInProgress) {
+        bleRestartAdvertisingPending = true;
+        return;
+    }
+    bleRestartAdvertisingPending = false;
+    delay(100);
+    BLEDevice::startAdvertising();
+    updatemsdata();
+    writeSerial("BLE advertising restarted");
+}
+
 void ble_init_esp32(bool update_manufacturer_data) {
     writeSerial("=== Initializing ESP32 BLE ===");
     String deviceName = "OD" + getChipIdHex();

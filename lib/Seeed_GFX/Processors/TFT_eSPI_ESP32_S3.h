@@ -213,7 +213,14 @@ SPI3_HOST = 2
 ////////////////////////////////////////////////////////////////////////////////////////
 // Define the CS (TFT chip select) pin drive code
 ////////////////////////////////////////////////////////////////////////////////////////
-#ifndef TFT_CS
+#if defined(OPENDISPLAY_SEEED_GFX_RUNTIME_PINS)
+  #include "OpenDisplay/opendisplay_runtime_pins.h"
+  #ifndef TFT_CS
+    #define TFT_CS -1  // Keep DMA code happy
+  #endif
+  #define CS_L do { if (opnd_seeed_runtime_cs >= 0) digitalWrite(opnd_seeed_runtime_cs, LOW); } while (0)
+  #define CS_H do { if (opnd_seeed_runtime_cs >= 0) digitalWrite(opnd_seeed_runtime_cs, HIGH); } while (0)
+#elif !defined(TFT_CS)
   #define TFT_CS -1  // Keep DMA code happy
   #define CS_L       // No macro allocated so it generates no code
   #define CS_H       // No macro allocated so it generates no code

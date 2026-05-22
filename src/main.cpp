@@ -5,6 +5,7 @@
 #include "display_service.h"
 #include "touch_input.h"
 #include "encryption.h"
+#include "ble_init.h"
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
 #include <HardwareSerial.h>
@@ -135,6 +136,9 @@ void loop() {
             bleDrain++;
         }
     }
+    if (bleRestartAdvertisingPending) {
+        esp32_restart_ble_advertising();
+    }
     if (directWriteActive && directWriteStartTime > 0) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
         if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
@@ -150,6 +154,8 @@ void loop() {
     bool bleActive = (commandQueueTail != commandQueueHead) ||
                      (responseQueueTail != responseQueueHead) ||
                      (pServer && pServer->getConnectedCount() > 0) ||
+                     bleRestartAdvertisingPending ||
+                     epdRefreshInProgress ||
                      wifiLanSession;
     if (bleActive) {
         processButtonEvents();
@@ -298,6 +304,7 @@ void pwrmgm(bool onoff){
             writeSerial("Powering down AXP2101 PMIC...");
             powerDownAXP2101();
             Wire.end();
+            invalidateOpenDisplayWire();
             pinMode(47, OUTPUT);
             digitalWrite(47, HIGH);
             pinMode(48, OUTPUT);
@@ -323,6 +330,7 @@ void pwrmgm(bool onoff){
         else{
             SPI.end();
             Wire.end();
+            invalidateOpenDisplayWire();
             pinMode(globalConfig.displays[0].reset_pin, INPUT);
             pinMode(globalConfig.displays[0].cs_pin, INPUT);
             if (globalConfig.displays[0].dc_pin != 0xFF) {
@@ -337,6 +345,7 @@ void pwrmgm(bool onoff){
         } else {
             SPI.end();
             Wire.end();
+            invalidateOpenDisplayWire();
         }
     }
     if(globalConfig.system_config.pwr_pin != 0xFF){
