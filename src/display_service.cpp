@@ -215,7 +215,8 @@ int mapEpd(int id){
         case 0x003F: return EP31_240x320;
         case 0x0040: return EP75YR_800x480;
         case 0x0041: return EP_PANEL_UNDEFINED;
-        case 0x0042: return EP133_960x680;
+        // bb_epaper 2.1.9 does not define the 13.3" EP133 panel yet.
+        case 0x0042: return EP_PANEL_UNDEFINED;
         default: return EP_PANEL_UNDEFINED;
     }
 }
