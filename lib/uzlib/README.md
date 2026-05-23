@@ -83,9 +83,14 @@ The inflater is stateful and not reentrant. It keeps a single global state
 object and avoids allocating a full compressed image buffer or a full
 decompressed image buffer.
 
-On ESP32 builds the LZ77 history window is allocated from the heap when the
-stream is reset, which keeps large backwards-compatible windows out of static
-DRAM. Other targets keep the window in static storage.
+`OPENDISPLAY_ZLIB_USE_HEAP_WINDOW` controls where the LZ77 history window lives:
+
+- `0` keeps the window in static storage.
+- `1` allocates the window from the heap when the stream is reset.
+
+Current ESP32 targets set `OPENDISPLAY_ZLIB_USE_HEAP_WINDOW=1`, which keeps
+large backwards-compatible windows out of static DRAM. The nRF52840 target sets
+it to `0` for deterministic static allocation.
 
 `OPENDISPLAY_ZLIB_WINDOW_BITS` controls the history window size and defaults to
 `9` (`512` bytes). Valid values are `9..15`. Increasing it permits streams

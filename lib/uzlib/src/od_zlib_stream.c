@@ -8,10 +8,12 @@
 
 #define TINF_ARRAY_SIZE(arr) (sizeof(arr) / sizeof(*(arr)))
 
-#if defined(TARGET_ESP32)
-#define OPENDISPLAY_ZLIB_DYNAMIC_WINDOW 1
-#else
-#define OPENDISPLAY_ZLIB_DYNAMIC_WINDOW 0
+#ifndef OPENDISPLAY_ZLIB_USE_HEAP_WINDOW
+#define OPENDISPLAY_ZLIB_USE_HEAP_WINDOW 0
+#endif
+
+#if OPENDISPLAY_ZLIB_USE_HEAP_WINDOW != 0 && OPENDISPLAY_ZLIB_USE_HEAP_WINDOW != 1
+#error "OPENDISPLAY_ZLIB_USE_HEAP_WINDOW must be 0 or 1"
 #endif
 
 typedef struct {
@@ -152,7 +154,7 @@ typedef struct {
     int length_sym;
     int dist_sym;
 
-#if OPENDISPLAY_ZLIB_DYNAMIC_WINDOW
+#if OPENDISPLAY_ZLIB_USE_HEAP_WINDOW
     uint8_t *window;
 #else
     uint8_t window[OPENDISPLAY_ZLIB_WINDOW_SIZE];
@@ -168,7 +170,7 @@ typedef struct {
 } od_zlib_stream_state_t;
 
 static od_zlib_stream_state_t s;
-#if OPENDISPLAY_ZLIB_DYNAMIC_WINDOW
+#if OPENDISPLAY_ZLIB_USE_HEAP_WINDOW
 static uint8_t *s_window;
 #endif
 
@@ -559,13 +561,13 @@ static int process_trailer(void) {
 }
 
 void od_zlib_stream_reset(uint32_t expected_output_size) {
-#if OPENDISPLAY_ZLIB_DYNAMIC_WINDOW
+#if OPENDISPLAY_ZLIB_USE_HEAP_WINDOW
     if (s_window == NULL) {
         s_window = (uint8_t *)malloc(OPENDISPLAY_ZLIB_WINDOW_SIZE);
     }
 #endif
     memset(&s, 0, sizeof(s));
-#if OPENDISPLAY_ZLIB_DYNAMIC_WINDOW
+#if OPENDISPLAY_ZLIB_USE_HEAP_WINDOW
     if (s_window == NULL) {
         s.initialized = true;
         set_error("zlib history window allocation failed");
