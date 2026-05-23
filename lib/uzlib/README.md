@@ -79,9 +79,13 @@ It intentionally rejects:
 
 ## Memory Model
 
-The inflater is stateful and not reentrant. It keeps a single static state
-object, including the LZ77 history window, so it avoids allocating a full
-compressed image buffer or a full decompressed image buffer.
+The inflater is stateful and not reentrant. It keeps a single global state
+object and avoids allocating a full compressed image buffer or a full
+decompressed image buffer.
+
+On ESP32 builds the LZ77 history window is allocated from the heap when the
+stream is reset, which keeps large backwards-compatible windows out of static
+DRAM. Other targets keep the window in static storage.
 
 `OPENDISPLAY_ZLIB_WINDOW_BITS` controls the history window size and defaults to
 `9` (`512` bytes). Valid values are `9..15`. Increasing it permits streams
