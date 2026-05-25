@@ -218,7 +218,7 @@ bool writeBootScreenWithQr() {
     char nameLine[16];
     snprintf(nameLine, sizeof(nameLine), "OD%s", last6.c_str());
     char fwLine[16];
-    snprintf(fwLine, sizeof(fwLine), "FW:%d.%d", getFirmwareMajor(), getFirmwareMinor());
+    snprintf(fwLine, sizeof(fwLine), "FW:O %u.%u", (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor());
     const char* domainLine = "OPENDISPLAY.ORG";
     char keyHex[33];
     bytesToHex(&payload[5], 16, keyHex, sizeof(keyHex));

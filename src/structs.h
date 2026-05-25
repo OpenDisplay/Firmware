@@ -123,7 +123,7 @@ struct LedConfig {
 } __attribute__((packed));
 
 // 0x29: passive_buzzer (repeatable, max 4 instances)
-// Frequency in 0x0075 payload: 0 = silence/rest; 1–255 maps linearly to firmware-defined Hz range (not stored in config).
+// Frequency in 0x0077 payload: 0 = silence/rest; 1–255 maps linearly to firmware-defined Hz range (not stored in config).
 #define BUZZER_FLAG_ENABLE_ACTIVE_HIGH (1u << 0)
 
 struct PassiveBuzzerConfig {

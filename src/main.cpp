@@ -111,6 +111,7 @@ void setup() {
 }
 
 void loop() {
+    processLedFlash();
     #ifdef TARGET_ESP32
     handleWiFiServer();
     static uint32_t lastWiFiCheck = 0;
@@ -241,6 +242,7 @@ void idleDelay(uint32_t delayMs) {
     while (remainingDelay > 0) {
         processButtonEvents();
         processTouchInput();
+        processLedFlash();
         uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
         delay(chunkDelay);
         remainingDelay -= chunkDelay;

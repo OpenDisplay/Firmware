@@ -94,19 +94,19 @@ void initPassiveBuzzers(void) {
 
 void handleBuzzerActivate(uint8_t* data, uint16_t len) {
     if (len < 3) {
-        uint8_t err[] = {0xFF, 0x75, 0x01, 0x00};
+        uint8_t err[] = {0xFF, 0x77, 0x01, 0x00};
         sendResponse(err, sizeof(err));
         return;
     }
     uint8_t inst = data[0];
     if (inst >= globalConfig.passive_buzzer_count) {
-        uint8_t err[] = {0xFF, 0x75, 0x02, 0x00};
+        uint8_t err[] = {0xFF, 0x77, 0x02, 0x00};
         sendResponse(err, sizeof(err));
         return;
     }
     PassiveBuzzerConfig* b = &globalConfig.passive_buzzers[inst];
     if (b->drive_pin == 0xFF) {
-        uint8_t err[] = {0xFF, 0x75, 0x03, 0x00};
+        uint8_t err[] = {0xFF, 0x77, 0x03, 0x00};
         sendResponse(err, sizeof(err));
         return;
     }
@@ -117,7 +117,7 @@ void handleBuzzerActivate(uint8_t* data, uint16_t len) {
     }
     uint8_t pattern_count = data[2];
     if (pattern_count == 0) {
-        uint8_t err[] = {0xFF, 0x75, 0x04, 0x00};
+        uint8_t err[] = {0xFF, 0x77, 0x04, 0x00};
         sendResponse(err, sizeof(err));
         return;
     }
@@ -125,21 +125,21 @@ void handleBuzzerActivate(uint8_t* data, uint16_t len) {
     uint16_t scan = 3;
     for (uint8_t pi = 0; pi < pattern_count; pi++) {
         if (scan >= len) {
-            uint8_t err[] = {0xFF, 0x75, 0x05, 0x00};
+            uint8_t err[] = {0xFF, 0x77, 0x05, 0x00};
             sendResponse(err, sizeof(err));
             return;
         }
         uint8_t nsteps = data[scan++];
         uint32_t need = (uint32_t)nsteps * 2u;
         if (scan + need > len) {
-            uint8_t err[] = {0xFF, 0x75, 0x05, 0x00};
+            uint8_t err[] = {0xFF, 0x77, 0x05, 0x00};
             sendResponse(err, sizeof(err));
             return;
         }
         scan = (uint16_t)(scan + need);
     }
     if (scan != len) {
-        uint8_t err[] = {0xFF, 0x75, 0x06, 0x00};
+        uint8_t err[] = {0xFF, 0x77, 0x06, 0x00};
         sendResponse(err, sizeof(err));
         return;
     }
@@ -165,6 +165,6 @@ void handleBuzzerActivate(uint8_t* data, uint16_t len) {
     buzzer_set_enable(b, false);
     buzzer_drive_off(b);
 
-    uint8_t ok[] = {0x00, 0x75, 0x00, 0x00};
+    uint8_t ok[] = {0x00, 0x77, 0x00, 0x00};
     sendResponse(ok, sizeof(ok));
 }

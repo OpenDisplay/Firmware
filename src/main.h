@@ -9,7 +9,7 @@
 #include "wifi_service.h"
 
 #ifndef BUILD_VERSION
-#define BUILD_VERSION "0.0"
+#define BUILD_VERSION "1.0"
 #endif
 #ifndef SHA
 #define SHA ""
@@ -244,8 +244,9 @@ void handleButtonPress(uint8_t buttonIndex);
 void processButtonEvents();  // Process button events and update BLE data
 void idleDelay(uint32_t delayMs);  // Non-blocking delay that processes buttons at 100ms intervals
 void flashLed(uint8_t color, uint8_t brightness);  // Flash LED with color and brightness
-void ledFlashLogic();  // LED flashing logic with pattern support (runs indefinitely)
+void processLedFlash();  // Advance async LED flash state machine
 void handleLedActivate(uint8_t* data, uint16_t len);  // Handle LED activation command
+void handleLedStop(uint8_t* data, uint16_t len);  // Stop running LED flash sequence
 #ifdef TARGET_ESP32
 void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler (IRAM_ATTR in implementation)
 #else
