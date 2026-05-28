@@ -113,22 +113,6 @@ void setup() {
 void loop() {
     processLedFlash();
     #ifdef TARGET_ESP32
-    handleWiFiServer();
-    static uint32_t lastWiFiCheck = 0;
-    if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
-        lastWiFiCheck = millis();
-        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
-            wifiConnected = false;
-            if (wifiServerConnected) {
-                disconnectWiFiServer();
-            }
-        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
-            wifiConnected = true;
-            restartWiFiLanAfterReconnect();
-        }
-    }
     if (woke_from_deep_sleep && advertising_timeout_active) {
         if (pServer && pServer->getConnectedCount() > 0) {
             writeSerial("BLE connection established - switching to full mode");
@@ -177,6 +161,24 @@ void loop() {
         if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
             writeSerial("ERROR: Direct write timeout (" + String(directWriteDuration) + " ms) - cleaning up stuck state");
             cleanupDirectWriteState(true);
+        }
+    }
+    // WiFi handling runs after BLE queue processing to avoid blocking
+    // BLE command responses (moved from top of loop in v1.6 fix).
+    handleWiFiServer();
+    static uint32_t lastWiFiCheck = 0;
+    if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
+            wifiConnected = false;
+            if (wifiServerConnected) {
+                disconnectWiFiServer();
+            }
+        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
+            wifiConnected = true;
+            restartWiFiLanAfterReconnect();
         }
     }
     #ifdef TARGET_ESP32
