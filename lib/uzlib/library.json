@@ -1,0 +1,10 @@
+{
+  "name": "uzlib",
+  "version": "0.0.0-opendisplay",
+  "description": "Vendored uzlib inflater snapshot for OpenDisplay firmware",
+  "license": "Zlib",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src"
+  }
+}

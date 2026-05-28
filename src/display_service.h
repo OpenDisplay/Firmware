@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-uint32_t max_compressed_image_rx_bytes(uint8_t transmission_modes);
+#define OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE 256
 
 bool seeed_driver_used(void);
 int mapEpd(int id);
@@ -28,7 +28,6 @@ void writeTextAndFill(const char* text);
 void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
-void decompressDirectWriteData();
 void cleanupDirectWriteState(bool refreshDisplay);
 void handleDirectWriteEnd(uint8_t* data, uint16_t len);
 extern volatile bool epdRefreshInProgress;

@@ -7,6 +7,7 @@
 #include "config_parser.h"
 #include "ble_init.h"
 #include "wifi_service.h"
+#include "display_service.h"
 
 #ifndef BUILD_VERSION
 #define BUILD_VERSION "1.0"
@@ -31,9 +32,6 @@ using namespace Adafruit_LittleFS_Namespace;
 
 #include <Wire.h>
 
-#define DECOMP_CHUNK 512
-#define DECOMP_CHUNK_SIZE 4096
-#define MAX_DICT_SIZE 32768
 #define MAX_BLOCKS 64
 // Text rendering constants
 #define FONT_CHAR_WIDTH 16  // 7 font columns + 1 blank column, each doubled (8*2)
@@ -120,16 +118,7 @@ void bbepSendCMDSequence(BBEPDISP *pBBEP, const uint8_t *pSeq);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
 
-extern uint8_t* compressedDataBuffer;
-void allocCompressedDataBuffer(void);
-
-#ifdef TARGET_ESP32
-uint8_t* decompressionChunk = nullptr;
-uint8_t* dictionaryBuffer = nullptr;
-#else
-uint8_t decompressionChunk[DECOMP_CHUNK_SIZE];
-uint8_t dictionaryBuffer[MAX_DICT_SIZE];
-#endif
+uint8_t decompressionChunk[OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE];
 uint8_t bleResponseBuffer[94];
 uint8_t mloopcounter = 0;
 uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection
@@ -196,11 +185,8 @@ uint16_t directWriteHeight = 0;  // Display height in pixels
 uint32_t directWriteTotalBytes = 0;  // Total bytes expected per plane (for bitplanes) or total (for others)
 uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if supported)
 uint8_t directWriteDataKind = 0;  // none; display_service.cpp tracks full vs partial 0x71 streams
+uint32_t directWriteCompressedReceived = 0;  // Total compressed bytes received for diagnostics/overflow guard
 
-// Direct write compressed mode: use same buffer as regular image upload
-uint32_t directWriteCompressedSize = 0;  // Total compressed size expected
-uint32_t directWriteCompressedReceived = 0;  // Total compressed bytes received
-uint8_t* directWriteCompressedBuffer = nullptr;  // Points at compressedDataBuffer when compressed direct-write is active
 uint32_t directWriteStartTime = 0;  // Timestamp when direct write started (for timeout detection)
 bool displayPowerState = false;  // Track display power state (true = powered on, false = powered off)
 

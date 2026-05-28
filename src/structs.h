@@ -65,14 +65,7 @@ struct PowerOption {
 // display.color_scheme (config.yaml); use with matching panel (e.g. gray16 + panel_ic 3001).
 #define COLOR_SCHEME_GRAY16 6u
 
-// display.transmission_modes (config.yaml bitfield). ZIPXL extends ZIP on builds with a larger buffer.
-#if defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY) && defined(BOARD_HAS_PSRAM)
-#define MAX_COMPRESSED_BUFFER_BYTES (512u * 1024u)
-#elif defined(TARGET_ESP32) && defined(TARGET_LARGE_MEMORY)
-#define MAX_COMPRESSED_BUFFER_BYTES (256u * 1024u)
-#else
-#define MAX_COMPRESSED_BUFFER_BYTES (54u * 1024u)
-#endif
+// display.transmission_modes (config.yaml bitfield).
 #define TRANSMISSION_MODE_ZIPXL          (1u << 0)
 #define TRANSMISSION_MODE_ZIP            (1u << 1)
 #define TRANSMISSION_MODE_G5             (1u << 2)
