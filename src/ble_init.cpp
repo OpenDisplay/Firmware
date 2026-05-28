@@ -24,6 +24,7 @@ void writeSerial(String message, bool newLine = true);
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLEAdvertising.h>
+#include <BLE2902.h>
 
 String getChipIdHex();
 void writeSerial(String message, bool newLine = true);
@@ -149,6 +150,7 @@ void ble_init_esp32(bool update_manufacturer_data) {
         return;
     }
     writeSerial("Characteristic created with properties: READ, NOTIFY, WRITE, WRITE_NR");
+    pTxCharacteristic->addDescriptor(new BLE2902());
     pTxCharacteristic->setCallbacks(&staticCharCallbacks);
     pRxCharacteristic = pTxCharacteristic;
     pService->start();
