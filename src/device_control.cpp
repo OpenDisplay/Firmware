@@ -1,6 +1,7 @@
 #include "device_control.h"
 #include "structs.h"
 #include "touch_input.h"
+#include "power_latch.h"
 #include <string.h>
 
 #ifdef TARGET_NRF
@@ -371,6 +372,7 @@ void handleLedStop(uint8_t* data, uint16_t len) {
 }
 
 void processButtonEvents() {
+    powerButtonPoll();
     if (buttonEventPending) {
         buttonEventPending = false;
         uint32_t currentTime = millis();

@@ -27,3 +27,7 @@ jobs:
       - name: Build ESP32 firmware
         run: |
           platformio run --environment esp32-s3-N16R8
+
+      - name: Build XTEINK X4 firmware
+        run: |
+          platformio run --environment esp32-c3-x4
