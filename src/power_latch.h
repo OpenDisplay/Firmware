@@ -1,11 +1,13 @@
 #pragma once
 
 // Soft battery-latch / power-button support for devices that gate their own
-// power rail through a MCU-controlled MOSFET (XTEINK X4: GPIO13 holds the
-// battery latch closed, GPIO3 is the active-low power button).
+// power rail through a MCU-controlled MOSFET. Enabled at runtime by the
+// DEVICE_FLAG_BATTERY_LATCH device_flags bit; the latch pin comes from
+// system_config.pwr_pin_2 and the optional active-low shutdown button from
+// pwr_pin_3 (0xFF = none).
 //
-// All functions compile to no-ops unless OPENDISPLAY_XTEINK_X4 is defined, so
-// callers in shared code need no per-board guards.
+// All functions are no-ops on non-ESP32 targets and when the flag is clear, so
+// callers in shared code need no guards.
 
 // Assert the keep-alive latch at boot so the device stays powered on battery.
 // Safe to call on every boot, including timer-wake from deep sleep.

@@ -58,7 +58,6 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     #endif
-    powerLatchBegin();
     allocCompressedDataBuffer();
     writeSerial("=== FIRMWARE INFO ===");
     writeSerial("Firmware Version: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()));

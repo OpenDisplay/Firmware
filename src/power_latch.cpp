@@ -1,66 +1,87 @@
 #include "power_latch.h"
 
-#if defined(OPENDISPLAY_XTEINK_X4)
+#if defined(TARGET_ESP32)
 
 #include <Arduino.h>
 #include "driver/gpio.h"
-#include "esp_sleep.h"
+#include "esp_sleep.h"  // pulls in SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+#include "structs.h"
+
+#ifndef DEVICE_FLAG_BATTERY_LATCH
+#define DEVICE_FLAG_BATTERY_LATCH (1 << 3)
+#endif
+
+extern struct GlobalConfig globalConfig;
 
 namespace {
 
-// GPIO13 gates the battery-latch MOSFET: driving it LOW opens the latch and cuts
-// the battery rail entirely. The latch self-holds in hardware once powered, so we
-// never drive it HIGH (see powerLatchBegin). DIO flash mode frees GPIO13 (the QIO
-// write-protect pin) — see the build env.
-constexpr gpio_num_t LATCH_PIN = GPIO_NUM_13;
-// The inset "dimple" button (active-low) — firmware reads it for long-press
-// shutdown. Power-ON is a separate protruding hardware button wired to the power
-// path/reset, not to a GPIO we read.
-constexpr gpio_num_t POWER_BTN_PIN = GPIO_NUM_3;
+// A self-holding battery-latch MOSFET: once the rail is powered the latch holds
+// in hardware, so firmware only ever drives the pin LOW (in powerOff) to cut
+// power. The latch pin and the optional shutdown button come from the device
+// config (pwr_pin_2 / pwr_pin_3)
 constexpr uint32_t POWER_OFF_HOLD_MS = 1500;
 
-// Only arm long-press shutdown after the dimple has been seen released once, so a
-// press still held from a GPIO3-low wake (USB) can't instantly re-trigger it.
+// Only arm long-press shutdown after the button has been seen released once, so a
+// press still held from a GPIO-low wake can't instantly re-trigger it.
 bool buttonReleasedSinceBoot = false;
 bool pressing = false;
 uint32_t pressStartMs = 0;
 
+// 0 is the config's "unset" sentinel and GPIO0 is a strapping pin, so neither 0
+// nor 0xFF is a usable latch/button pin.
+bool validPin(uint8_t pin) { return pin != 0 && pin != 0xFF; }
+
+bool latchEnabled() {
+    return (globalConfig.system_config.device_flags & DEVICE_FLAG_BATTERY_LATCH) &&
+           validPin(globalConfig.system_config.pwr_pin_2);
+}
+gpio_num_t latchPin() { return (gpio_num_t)globalConfig.system_config.pwr_pin_2; }
+int buttonPin() { return globalConfig.system_config.pwr_pin_3; }
+bool hasButton() { return validPin(globalConfig.system_config.pwr_pin_3); }
+
 void powerOff() {
-    // Wait for the dimple to be released before sleeping: we arm a GPIO3-low wake
+    const gpio_num_t latch = latchPin();
+    // Wait for the button to be released before sleeping: we arm a GPIO-low wake
     // below, so sleeping while it is still held would immediately wake us again.
-    pinMode(POWER_BTN_PIN, INPUT_PULLUP);
-    while (digitalRead(POWER_BTN_PIN) == LOW) {
-        delay(20);
+    if (hasButton()) {
+        pinMode(buttonPin(), INPUT_PULLUP);
+        while (digitalRead(buttonPin()) == LOW) {
+            delay(20);
+        }
     }
-    // Open the latch and hold it across sleep. On battery the rail collapses to a
-    // true zero-drain off (the hardware power button revives it); on USB the rail
-    // stays powered, so we deep-sleep and wake on the next dimple press.
-    gpio_hold_dis(LATCH_PIN);
-    gpio_set_direction(LATCH_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(LATCH_PIN, 0);
+    // Open the latch and hold it across sleep. On battery this collapses the rail
+    // to a true zero-drain off (a hardware power button revives it). On USB the
+    // rail is fed by USB regardless, so the chip can't power down: it enters deep
+    // sleep but USB brings it straight back up — i.e. an immediate reboot.
+    gpio_hold_dis(latch);
+    gpio_set_direction(latch, GPIO_MODE_OUTPUT);
+    gpio_set_level(latch, 0);
     esp_sleep_config_gpio_isolate();
     gpio_deep_sleep_hold_en();
-    gpio_hold_en(LATCH_PIN);
-    pinMode(POWER_BTN_PIN, INPUT_PULLUP);
-    esp_deep_sleep_enable_gpio_wakeup(1ULL << POWER_BTN_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+    gpio_hold_en(latch);
+#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+    if (hasButton()) {
+        pinMode(buttonPin(), INPUT_PULLUP);
+        esp_deep_sleep_enable_gpio_wakeup(1ULL << buttonPin(), ESP_GPIO_WAKEUP_GPIO_LOW);
+    }
+#endif
     esp_deep_sleep_start();
 }
 
 }  // namespace
 
 void powerLatchBegin() {
-    // Mirror crosspoint, the reference firmware for this board: the battery-latch
-    // MOSFET self-holds in hardware once the rail is powered, so firmware never
-    // drives GPIO13 HIGH. It is only ever driven LOW (in powerOff) to cut power.
-    // Release any pin-hold left by a prior deep sleep so GPIO13 returns to hardware
-    // control (a USB wake from powerOff would otherwise keep the latch held open),
-    // then arm the power button.
-    gpio_hold_dis(LATCH_PIN);
-    pinMode(POWER_BTN_PIN, INPUT_PULLUP);
+    if (!latchEnabled()) return;
+    // Release any pin-hold left by a prior deep sleep so the latch returns to
+    // hardware control (a USB wake from powerOff would otherwise keep it held
+    // open), then arm the shutdown button.
+    gpio_hold_dis(latchPin());
+    if (hasButton()) pinMode(buttonPin(), INPUT_PULLUP);
 }
 
 void powerButtonPoll() {
-    const bool down = digitalRead(POWER_BTN_PIN) == LOW;
+    if (!latchEnabled() || !hasButton()) return;
+    const bool down = digitalRead(buttonPin()) == LOW;
     if (!down) {
         buttonReleasedSinceBoot = true;
         pressing = false;
@@ -80,14 +101,18 @@ void powerButtonPoll() {
 }
 
 void powerLatchHoldForSleep() {
-    gpio_set_direction(LATCH_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(LATCH_PIN, 1);
+    if (!latchEnabled()) return;
+    gpio_set_direction(latchPin(), GPIO_MODE_OUTPUT);
+    gpio_set_level(latchPin(), 1);
     gpio_deep_sleep_hold_en();
-    gpio_hold_en(LATCH_PIN);
+    gpio_hold_en(latchPin());
 }
 
-#else  // not XTEINK X4
+#else  // not ESP32
 
+// Battery latch uses ESP-IDF sleep / GPIO-hold APIs; no nRF implementation yet.
+// The DEVICE_FLAG_BATTERY_LATCH config layer is platform-neutral — implement
+// these three here (Nordic sd_power_system_off / GPIO retention) to support it.
 void powerLatchBegin() {}
 void powerButtonPoll() {}
 void powerLatchHoldForSleep() {}
