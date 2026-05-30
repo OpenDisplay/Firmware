@@ -69,6 +69,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_PWR_PIN      (1 << 0)  // Bit 0: Device has external power management pin
 #define DEVICE_FLAG_XIAOINIT     (1 << 1)  // Bit 1: Call xiaoinit() after config load (nRF52840 only)
 #define DEVICE_FLAG_WS_PP_INIT   (1 << 2)  // Bit 2: Call ws_pp_init() after config load (Waveshare Photo Printer)
+#define DEVICE_FLAG_BATTERY_LATCH (1 << 3) // Bit 3: Self-holding battery latch on pwr_pin_2; optional active-low long-press shutdown button on pwr_pin_3
 
 #ifdef TARGET_NRF
 #include <bluefruit.h>

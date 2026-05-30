@@ -6,6 +6,7 @@
 #include "communication.h"
 #include "device_control.h"
 #include "display_service.h"
+#include "power_latch.h"
 #include "touch_input.h"
 #include "encryption.h"
 #include "ble_init.h"
@@ -331,6 +332,7 @@ void enterDeepSleep() {
     esp_sleep_enable_timer_wakeup(sleep_timeout_us);
     writeSerial("Entering deep sleep...");
     delay(100); // Brief delay to ensure serial output is sent
+    powerLatchHoldForSleep();
     esp_deep_sleep_start();
 }
 #endif
