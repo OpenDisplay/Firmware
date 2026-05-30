@@ -1238,6 +1238,74 @@ void decompressDirectWriteData() {
     } while (res == TINF_OK && directWriteBytesWritten < directWriteTotalBytes);
 }
 
+// True when the active display uses the bb_epaper 4-gray scheme (two 1-bit
+// controller planes). The Seeed driver path has its own 4bpp handling.
+static inline bool directWriteIsGray4(void) {
+    return (globalConfig.displays[0].color_scheme == 5)
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+        && !seeed_driver_used()
+#endif
+        ;
+}
+
+// 4-gray uploads arrive as two pre-split 1-bit controller planes concatenated
+// (plane0 then plane1), already gray-coded host-side (py-opendisplay applies the
+// panel's gray LUT, matching bbepSetPixel4Gray: plane0 <- stored bit0, plane1 <-
+// stored bit1). Stream the bytes to the panel, switching from PLANE_0 to PLANE_1
+// at the single-plane boundary — no on-device de-interleave or 2bpp frame buffer.
+// directWriteBytesWritten is the running total across both planes, so the
+// compressed (decompress-at-END) and uncompressed (live 0x71) paths share this
+// one plane-split implementation.
+static void streamGray4Bytes(const uint8_t* buf, uint32_t len) {
+    const uint32_t planeBytes = (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
+    uint32_t off = 0;
+    while (off < len && directWriteBytesWritten < 2u * planeBytes) {
+        if (directWriteBytesWritten == 0u) {
+            bbepSetAddrWindow(&bbep, 0, 0, directWriteWidth, directWriteHeight);
+            bbepStartWrite(&bbep, PLANE_0);
+        } else if (directWriteBytesWritten == planeBytes) {
+            bbepSetAddrWindow(&bbep, 0, 0, directWriteWidth, directWriteHeight);
+            bbepStartWrite(&bbep, PLANE_1);
+        }
+        const uint32_t limit = (directWriteBytesWritten < planeBytes) ? planeBytes : 2u * planeBytes;
+        uint32_t take = len - off;
+        if (directWriteBytesWritten + take > limit) take = limit - directWriteBytesWritten;
+        bbepWriteData(&bbep, (uint8_t*)(buf + off), (int)take);
+        off += take;
+        directWriteBytesWritten += take;
+    }
+}
+
+// Compressed 4-gray: decompress the ZIP stream once and feed the two concatenated
+// planes through streamGray4Bytes. Returns true only if both planes were produced
+// in full; the caller NACKs otherwise so a short/corrupt stream can't leave a
+// half-written frame on the panel.
+static bool renderDirectWriteGray4(void) {
+    if (!dictionaryBuffer || !decompressionChunk || directWriteCompressedReceived == 0) return false;
+    const uint32_t planeBytes = (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
+    struct uzlib_uncomp d;
+    memset(&d, 0, sizeof(d));
+    d.source = directWriteCompressedBuffer;
+    d.source_limit = directWriteCompressedBuffer + directWriteCompressedReceived;
+    d.source_read_cb = NULL;
+    uzlib_init();
+    int hdr = uzlib_zlib_parse_header(&d);
+    if (hdr < 0) return false;
+    uint16_t window = 0x100 << hdr;
+    if (window > (uint16_t)(32 * 1024)) window = (uint16_t)(32 * 1024);
+    uzlib_uncompress_init(&d, dictionaryBuffer, window);
+    int res;
+    do {
+        d.dest_start = decompressionChunk;
+        d.dest = decompressionChunk;
+        d.dest_limit = decompressionChunk + 4096;
+        res = uzlib_uncompress(&d);
+        size_t n = (size_t)(d.dest - d.dest_start);
+        if (n > 0) streamGray4Bytes(decompressionChunk, (uint32_t)n);
+    } while (res == TINF_OK && directWriteBytesWritten < 2u * planeBytes);
+    return directWriteBytesWritten == 2u * planeBytes;
+}
+
 void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteActive = false;
     directWriteCompressed = false;
@@ -1293,6 +1361,12 @@ if (partialCtx.active) cleanup_partial_write_state();
         else if (bitsPerPixel == 2) directWriteTotalBytes = (pixels + 3) / 4;
         else directWriteTotalBytes = (pixels + 7) / 8;
     }
+    // 4-gray arrives as two concatenated 1bpp planes (plane0 ++ plane1), streamed to
+    // PLANE_0/PLANE_1. Works over both transports: compressed buffers then renders at
+    // END (renderDirectWriteGray4); uncompressed streams the planes live as 0x71
+    // chunks arrive (streamGray4Bytes).
+    const bool gray4 = directWriteIsGray4();
+    if (gray4) directWriteTotalBytes = 2u * (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
     if (directWriteCompressed) {
         if (!compressedDataBuffer) {
             cleanupDirectWriteState(false);
@@ -1302,6 +1376,16 @@ if (partialCtx.active) cleanup_partial_write_state();
             return;
         }
         memcpy(&directWriteDecompressedTotal, data, 4);
+        // The host declares the decompressed size; for 4-gray it must match our
+        // two-plane size, or the stream is the wrong shape (packed 2bpp, or a
+        // panel whose width pads differently) — reject before rendering a partial frame.
+        if (gray4 && directWriteDecompressedTotal != directWriteTotalBytes) {
+            cleanupDirectWriteState(false);
+            touchResumeAfterEpdRefresh();
+            uint8_t errorResponse[] = {0xFF, 0xFF};
+            sendResponse(errorResponse, sizeof(errorResponse));
+            return;
+        }
         directWriteCompressedBuffer = compressedDataBuffer;
         directWriteCompressedSize = 0;
         directWriteCompressedReceived = 0;
@@ -1464,12 +1548,15 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
         if (seeed_driver_used()) {
             seeed_gfx_direct_write_chunk(data, bytesToWrite);
+            directWriteBytesWritten += bytesToWrite;
         } else
 #endif
-        {
+        if (directWriteIsGray4()) {
+            streamGray4Bytes(data, bytesToWrite);  // advances directWriteBytesWritten, splits planes
+        } else {
             bbepWriteData(&bbep, data, bytesToWrite);
+            directWriteBytesWritten += bytesToWrite;
         }
-        directWriteBytesWritten += bytesToWrite;
     }
     if (directWriteBytesWritten >= directWriteTotalBytes) {
         handleDirectWriteEnd(nullptr, 0);
@@ -1514,7 +1601,25 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     }
     if (!directWriteActive) return;
     directWriteStartTime = 0;
-    if (directWriteCompressed && directWriteCompressedReceived > 0) decompressDirectWriteData();
+    const bool gray4 = directWriteIsGray4();
+    if (gray4) {
+        // Both planes must be present before refresh. Compressed: decompress+stream
+        // now (false on short/corrupt). Uncompressed: planes were streamed live as
+        // 0x71 chunks, so just confirm the full two-plane payload arrived. Either way
+        // a shortfall NACKs rather than refreshing stale RAM or committing an etag.
+        const bool ok = directWriteCompressed
+            ? renderDirectWriteGray4()
+            : (directWriteBytesWritten == directWriteTotalBytes);
+        if (!ok) {
+            cleanupDirectWriteState(false);
+            touchResumeAfterEpdRefresh();
+            uint8_t errorResponse[] = {0xFF, 0x72};
+            sendResponse(errorResponse, sizeof(errorResponse));
+            return;
+        }
+    } else if (directWriteCompressed && directWriteCompressedReceived > 0) {
+        decompressDirectWriteData();
+    }
     int refreshMode = REFRESH_FULL;
     if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
     writeSerial("EPD refresh: ", false);
