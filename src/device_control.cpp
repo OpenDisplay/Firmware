@@ -1,6 +1,7 @@
 #include "device_control.h"
 #include "structs.h"
 #include "touch_input.h"
+#include "power_latch.h"
 #include <string.h>
 
 #ifdef TARGET_NRF
@@ -72,39 +73,306 @@ void reboot(){
 #endif
 }
 
+#define LED_DELAY_FACTOR_MS 100u
+
+typedef enum {
+    LED_PHASE_IDLE = 0,
+    LED_PHASE_GROUP,
+    LED_PHASE_LOOP1,
+    LED_PHASE_LOOP1_DELAY,
+    LED_PHASE_INTER1_DELAY,
+    LED_PHASE_LOOP2,
+    LED_PHASE_LOOP2_DELAY,
+    LED_PHASE_INTER2_DELAY,
+    LED_PHASE_LOOP3,
+    LED_PHASE_LOOP3_DELAY,
+    LED_PHASE_INTER3_DELAY,
+} led_phase_t;
+
+static struct {
+    bool active;
+    uint8_t instance;
+    struct LedConfig* led;
+    uint8_t brightness;
+    uint8_t c1;
+    uint8_t c2;
+    uint8_t c3;
+    uint8_t loop1delay;
+    uint8_t loop2delay;
+    uint8_t loop3delay;
+    uint8_t loopcnt1;
+    uint8_t loopcnt2;
+    uint8_t loopcnt3;
+    uint8_t ildelay1;
+    uint8_t ildelay2;
+    uint8_t ildelay3;
+    uint8_t grouprepeats;
+    uint8_t group_pos;
+    uint8_t i1;
+    uint8_t i2;
+    uint8_t i3;
+    led_phase_t phase;
+    bool waiting_delay;
+    uint32_t delay_until_ms;
+} s_led;
+
+static void led_all_off(struct LedConfig* led) {
+    if (led == NULL) {
+        return;
+    }
+    bool invertRed = (led->led_flags & 0x01) != 0;
+    bool invertGreen = (led->led_flags & 0x02) != 0;
+    bool invertBlue = (led->led_flags & 0x04) != 0;
+    if (led->led_1_r != 0xFF) {
+        digitalWrite(led->led_1_r, invertRed ? HIGH : LOW);
+    }
+    if (led->led_2_g != 0xFF) {
+        digitalWrite(led->led_2_g, invertGreen ? HIGH : LOW);
+    }
+    if (led->led_3_b != 0xFF) {
+        digitalWrite(led->led_3_b, invertBlue ? HIGH : LOW);
+    }
+}
+
+static void led_stop_internal(bool clear_mode) {
+    struct LedConfig* led = s_led.led;
+    s_led.waiting_delay = false;
+    if (led != NULL) {
+        led_all_off(led);
+        if (clear_mode) {
+            led->reserved[0] = 0x00;
+        }
+    }
+    memset(&s_led, 0, sizeof(s_led));
+    ledFlashActive = false;
+    activeLedInstance = 0xFF;
+    ledFlashPosition = 0;
+}
+
+static void led_schedule_delay_ms(uint16_t ms) {
+    if (ms == 0) {
+        s_led.waiting_delay = false;
+        return;
+    }
+    s_led.waiting_delay = true;
+    s_led.delay_until_ms = millis() + ms;
+}
+
+static void led_load_config(struct LedConfig* led) {
+    uint8_t* ledcfg = led->reserved;
+    s_led.led = led;
+    s_led.brightness = (uint8_t)(((ledcfg[0] >> 4) & 0x0F) + 1);
+    s_led.c1 = ledcfg[1];
+    s_led.c2 = ledcfg[4];
+    s_led.c3 = ledcfg[7];
+    s_led.loop1delay = (uint8_t)((ledcfg[2] >> 4) & 0x0F);
+    s_led.loop2delay = (uint8_t)((ledcfg[5] >> 4) & 0x0F);
+    s_led.loop3delay = (uint8_t)((ledcfg[8] >> 4) & 0x0F);
+    s_led.loopcnt1 = (uint8_t)(ledcfg[2] & 0x0F);
+    s_led.loopcnt2 = (uint8_t)(ledcfg[5] & 0x0F);
+    s_led.loopcnt3 = (uint8_t)(ledcfg[8] & 0x0F);
+    s_led.ildelay1 = ledcfg[3];
+    s_led.ildelay2 = ledcfg[6];
+    s_led.ildelay3 = ledcfg[9];
+    s_led.grouprepeats = (uint8_t)(ledcfg[10] + 1);
+    s_led.group_pos = 0;
+    s_led.i1 = 0;
+    s_led.i2 = 0;
+    s_led.i3 = 0;
+    s_led.phase = LED_PHASE_GROUP;
+    s_led.waiting_delay = false;
+}
+
+static void led_run_finish(void) {
+    led_stop_internal(false);
+}
+
+static void led_run_step(void) {
+    struct LedConfig* led;
+    uint8_t mode;
+
+    if (!s_led.active || s_led.led == NULL) {
+        return;
+    }
+    led = s_led.led;
+    activeLedInstance = s_led.instance;
+    mode = (uint8_t)(led->reserved[0] & 0x0F);
+    if (mode != 1) {
+        led_run_finish();
+        return;
+    }
+
+    for (;;) {
+        if (!s_led.active) {
+            return;
+        }
+
+        switch (s_led.phase) {
+            case LED_PHASE_GROUP:
+                if (s_led.group_pos >= s_led.grouprepeats && s_led.grouprepeats != 255) {
+                    led->reserved[0] = 0x00;
+                    led_run_finish();
+                    return;
+                }
+                s_led.i1 = 0;
+                s_led.i2 = 0;
+                s_led.i3 = 0;
+                s_led.phase = LED_PHASE_LOOP1;
+                break;
+
+            case LED_PHASE_LOOP1:
+                if (s_led.i1 >= s_led.loopcnt1) {
+                    if (s_led.ildelay1 > 0) {
+                        s_led.phase = LED_PHASE_INTER1_DELAY;
+                        led_schedule_delay_ms((uint16_t)(s_led.ildelay1 * LED_DELAY_FACTOR_MS));
+                        return;
+                    }
+                    s_led.phase = LED_PHASE_LOOP2;
+                    break;
+                }
+                flashLed(s_led.c1, s_led.brightness);
+                s_led.i1++;
+                if (s_led.loop1delay > 0) {
+                    s_led.phase = LED_PHASE_LOOP1_DELAY;
+                    led_schedule_delay_ms((uint16_t)(s_led.loop1delay * LED_DELAY_FACTOR_MS));
+                    return;
+                }
+                break;
+
+            case LED_PHASE_LOOP1_DELAY:
+                s_led.phase = LED_PHASE_LOOP1;
+                break;
+
+            case LED_PHASE_INTER1_DELAY:
+                s_led.phase = LED_PHASE_LOOP2;
+                break;
+
+            case LED_PHASE_LOOP2:
+                if (s_led.i2 >= s_led.loopcnt2) {
+                    if (s_led.ildelay2 > 0) {
+                        s_led.phase = LED_PHASE_INTER2_DELAY;
+                        led_schedule_delay_ms((uint16_t)(s_led.ildelay2 * LED_DELAY_FACTOR_MS));
+                        return;
+                    }
+                    s_led.phase = LED_PHASE_LOOP3;
+                    break;
+                }
+                flashLed(s_led.c2, s_led.brightness);
+                s_led.i2++;
+                if (s_led.loop2delay > 0) {
+                    s_led.phase = LED_PHASE_LOOP2_DELAY;
+                    led_schedule_delay_ms((uint16_t)(s_led.loop2delay * LED_DELAY_FACTOR_MS));
+                    return;
+                }
+                break;
+
+            case LED_PHASE_LOOP2_DELAY:
+                s_led.phase = LED_PHASE_LOOP2;
+                break;
+
+            case LED_PHASE_INTER2_DELAY:
+                s_led.phase = LED_PHASE_LOOP3;
+                break;
+
+            case LED_PHASE_LOOP3:
+                if (s_led.i3 >= s_led.loopcnt3) {
+                    if (s_led.ildelay3 > 0) {
+                        s_led.phase = LED_PHASE_INTER3_DELAY;
+                        led_schedule_delay_ms((uint16_t)(s_led.ildelay3 * LED_DELAY_FACTOR_MS));
+                        return;
+                    }
+                    s_led.group_pos++;
+                    s_led.phase = LED_PHASE_GROUP;
+                    break;
+                }
+                flashLed(s_led.c3, s_led.brightness);
+                s_led.i3++;
+                if (s_led.loop3delay > 0) {
+                    s_led.phase = LED_PHASE_LOOP3_DELAY;
+                    led_schedule_delay_ms((uint16_t)(s_led.loop3delay * LED_DELAY_FACTOR_MS));
+                    return;
+                }
+                break;
+
+            case LED_PHASE_LOOP3_DELAY:
+                s_led.phase = LED_PHASE_LOOP3;
+                break;
+
+            case LED_PHASE_INTER3_DELAY:
+                s_led.group_pos++;
+                s_led.phase = LED_PHASE_GROUP;
+                break;
+
+            default:
+                led_run_finish();
+                return;
+        }
+    }
+}
+
+void processLedFlash() {
+    if (!s_led.active) {
+        return;
+    }
+    if (s_led.waiting_delay) {
+        if ((int32_t)(millis() - s_led.delay_until_ms) < 0) {
+            return;
+        }
+        s_led.waiting_delay = false;
+    }
+    led_run_step();
+}
+
 void handleLedActivate(uint8_t* data, uint16_t len) {
-    writeSerial("=== handleLedActivate START ===", true);
-    writeSerial("Command length: " + String(len) + " bytes", true);
     if (len < 1) {
-        writeSerial("ERROR: LED activate command too short (len=" + String(len) + ", need at least 1 byte for instance)", true);
         uint8_t errorResponse[] = {0xFF, 0x73, 0x01, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     uint8_t ledInstance = data[0];
-    writeSerial("LED instance: " + String(ledInstance), true);
     if (ledInstance >= globalConfig.led_count) {
-        writeSerial("ERROR: LED instance " + String(ledInstance) + " out of range (led_count=" + String(globalConfig.led_count) + ")", true);
         uint8_t errorResponse[] = {0xFF, 0x73, 0x02, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     struct LedConfig* led = &globalConfig.leds[ledInstance];
-    activeLedInstance = ledInstance;
-    uint8_t* ledcfg = led->reserved;
     if (len >= 13) {
-        memcpy(ledcfg, data + 1, 12);
+        memcpy(led->reserved, data + 1, 12);
     }
+    uint8_t mode = (uint8_t)(led->reserved[0] & 0x0F);
+    if (mode != 1) {
+        led_stop_internal(true);
+        uint8_t successResponse[] = {0x00, 0x73, 0x00, 0x00};
+        sendResponse(successResponse, sizeof(successResponse));
+        return;
+    }
+
+    led_stop_internal(false);
+    s_led.active = true;
+    s_led.instance = ledInstance;
+    activeLedInstance = ledInstance;
     ledFlashActive = true;
     ledFlashPosition = 0;
-    ledFlashLogic();
-    ledFlashActive = false;
+    led_load_config(led);
+    led_run_step();
+
     uint8_t successResponse[] = {0x00, 0x73, 0x00, 0x00};
     sendResponse(successResponse, sizeof(successResponse));
-    writeSerial("=== handleLedActivate END ===", true);
+}
+
+void handleLedStop(uint8_t* data, uint16_t len) {
+    if (s_led.active && len >= 1 && data[0] != s_led.instance) {
+        uint8_t errorResponse[] = {0xFF, 0x75, 0x02, 0x00};
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
+    led_stop_internal(true);
+    uint8_t successResponse[] = {0x00, 0x75, 0x00, 0x00};
+    sendResponse(successResponse, sizeof(successResponse));
 }
 
 void processButtonEvents() {
+    powerButtonPoll();
     if (buttonEventPending) {
         buttonEventPending = false;
         uint32_t currentTime = millis();
@@ -208,49 +476,6 @@ void flashLed(uint8_t color, uint8_t brightness) {
         digitalWrite(ledGreenPin, invertGreen ? HIGH : LOW);
         digitalWrite(ledBluePin, invertBlue ? HIGH : LOW);
     }
-}
-
-void ledFlashLogic() {
-    writeSerial("=== ledFlashLogic START ===");
-    if (!ledFlashActive) return;
-    if (activeLedInstance == 0xFF) {
-        for (uint8_t i = 0; i < globalConfig.led_count; i++) {
-            if (globalConfig.leds[i].led_type == 1) {
-                activeLedInstance = i;
-                break;
-            }
-        }
-        if (activeLedInstance == 0xFF) return;
-    }
-    struct LedConfig* led = &globalConfig.leds[activeLedInstance];
-    uint8_t* ledcfg = led->reserved;
-    uint8_t brightness = ((ledcfg[0] >> 4) & 0x0F) + 1;
-    uint8_t mode = ledcfg[0] & 0x0F;
-    if (mode == 1) {
-        const uint8_t interloopdelayfactor = 100;
-        const uint8_t loopdelayfactor = 100;
-        uint8_t c1 = ledcfg[1], c2 = ledcfg[4], c3 = ledcfg[7];
-        uint8_t loop1delay = (ledcfg[2] >> 4) & 0x0F, loop2delay = (ledcfg[5] >> 4) & 0x0F, loop3delay = (ledcfg[8] >> 4) & 0x0F;
-        uint8_t loopcnt1 = ledcfg[2] & 0x0F, loopcnt2 = ledcfg[5] & 0x0F, loopcnt3 = ledcfg[8] & 0x0F;
-        uint8_t ildelay1 = ledcfg[3], ildelay2 = ledcfg[6], ildelay3 = ledcfg[9];
-        uint8_t grouprepeats = ledcfg[10] + 1;
-        while (ledFlashActive) {
-            if (ledFlashPosition >= grouprepeats && grouprepeats != 255) {
-                brightness = 0;
-                ledcfg[0] = 0x00;
-                ledFlashPosition = 0;
-                break;
-            }
-            for (int i = 0; i < loopcnt1; i++) { flashLed(c1, brightness); delay(loop1delay * loopdelayfactor); }
-            delay(ildelay1 * interloopdelayfactor);
-            for (int i = 0; i < loopcnt2; i++) { flashLed(c2, brightness); delay(loop2delay * loopdelayfactor); }
-            delay(ildelay2 * interloopdelayfactor);
-            for (int i = 0; i < loopcnt3; i++) { flashLed(c3, brightness); delay(loop3delay * loopdelayfactor); }
-            delay(ildelay3 * interloopdelayfactor);
-            ledFlashPosition++;
-        }
-    }
-    writeSerial("=== ledFlashLogic END ===");
 }
 
 #ifdef TARGET_ESP32

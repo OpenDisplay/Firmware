@@ -2,6 +2,7 @@
 #include "structs.h"
 #include "encryption_state.h"
 #include "encryption.h"
+#include "power_latch.h"
 #include <Arduino.h>
 #include <string.h>
 
@@ -24,6 +25,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_PWR_PIN (1 << 0)
 #define DEVICE_FLAG_XIAOINIT (1 << 1)
 #define DEVICE_FLAG_WS_PP_INIT (1 << 2)
+#define DEVICE_FLAG_BATTERY_LATCH (1 << 3)
 #endif
 void writeSerial(String message, bool newLine = true);
 
@@ -549,6 +551,7 @@ void printConfigSummary(){
     writeSerial("  XIAOINIT flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_XIAOINIT) ? "enabled" : "disabled"));
     #endif
     writeSerial("  WS_PP_INIT flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_WS_PP_INIT) ? "enabled" : "disabled"));
+    writeSerial("  BATTERY_LATCH flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_BATTERY_LATCH) ? "enabled" : "disabled"));
     writeSerial("Power Pin: " + String(globalConfig.system_config.pwr_pin));
     writeSerial("Power Pin 2: " + String(globalConfig.system_config.pwr_pin_2));
     writeSerial("Power Pin 3: " + String(globalConfig.system_config.pwr_pin_3));
@@ -710,6 +713,8 @@ void full_config_init() {
             ws_pp_init();
             writeSerial("ws_pp_init() completed");
         }
+        // Must run after config load: latch pins/flag come from globalConfig.
+        powerLatchBegin();
     } else {
         writeSerial("Global configuration load failed or no config found");
     }

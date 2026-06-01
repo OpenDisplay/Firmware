@@ -3,6 +3,7 @@
 #include "communication.h"
 #include "device_control.h"
 #include "display_service.h"
+#include "power_latch.h"
 #include "touch_input.h"
 #include "encryption.h"
 #include "ble_init.h"
@@ -79,23 +80,8 @@ void setup() {
 }
 
 void loop() {
+    processLedFlash();
     #ifdef TARGET_ESP32
-    handleWiFiServer();
-    static uint32_t lastWiFiCheck = 0;
-    if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
-        lastWiFiCheck = millis();
-        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
-            wifiConnected = false;
-            if (wifiServerConnected) {
-                disconnectWiFiServer();
-            }
-        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
-            wifiConnected = true;
-            restartWiFiLanAfterReconnect();
-        }
-    }
     if (woke_from_deep_sleep && advertising_timeout_active) {
         if (pServer && pServer->getConnectedCount() > 0) {
             writeSerial("BLE connection established - switching to full mode");
@@ -124,16 +110,25 @@ void loop() {
         commandQueueTail = (commandQueueTail + 1) % COMMAND_QUEUE_SIZE;
         writeSerial("Command processed");
     }
-    if (pTxCharacteristic && pServer && pServer->getConnectedCount() > 0) {
-        uint8_t bleDrain = 0;
-        while (responseQueueTail != responseQueueHead && bleDrain < 16) {
-            writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
-            pTxCharacteristic->setValue(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
-            pTxCharacteristic->notify();
-            responseQueue[responseQueueTail].pending = false;
-            responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
-            writeSerial("Response sent successfully");
-            bleDrain++;
+    if (responseQueueTail != responseQueueHead) {
+        if (esp32_ble_notify_enabled()) {
+            uint8_t bleDrain = 0;
+            while (responseQueueTail != responseQueueHead && bleDrain < 16) {
+                writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
+                pTxCharacteristic->setValue(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
+                pTxCharacteristic->notify();
+                responseQueue[responseQueueTail].pending = false;
+                responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
+                writeSerial("Response sent successfully");
+                bleDrain++;
+            }
+        } else if (pServer && pServer->getConnectedCount() > 0) {
+            // Connected but CCCD not enabled yet — keep responses queued
+        } else {
+            while (responseQueueTail != responseQueueHead) {
+                responseQueue[responseQueueTail].pending = false;
+                responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
+            }
         }
     }
     if (bleRestartAdvertisingPending) {
@@ -144,6 +139,24 @@ void loop() {
         if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
             writeSerial("ERROR: Direct write timeout (" + String(directWriteDuration) + " ms) - cleaning up stuck state");
             cleanupDirectWriteState(true);
+        }
+    }
+    // WiFi handling runs after BLE queue processing to avoid blocking
+    // BLE command responses (moved from top of loop in v1.6 fix).
+    handleWiFiServer();
+    static uint32_t lastWiFiCheck = 0;
+    if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
+            wifiConnected = false;
+            if (wifiServerConnected) {
+                disconnectWiFiServer();
+            }
+        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
+            wifiConnected = true;
+            restartWiFiLanAfterReconnect();
         }
     }
     #ifdef TARGET_ESP32
@@ -167,14 +180,17 @@ void loop() {
                 firstBootDelayInitialized = true;
                 firstBootDelayStart = millis();
                 processButtonEvents();
-                writeSerial("First boot: waiting 60s before entering deep sleep");
+                writeSerial("First boot: waiting 2 minutes before entering deep sleep");
             }
             uint32_t elapsed = millis() - firstBootDelayStart;
-            if (elapsed < 60000) {
+            if (elapsed < FIRST_BOOT_DEEP_SLEEP_DELAY_MS) {
                 idleDelay(5);
                 return;
             }
-            writeSerial("First boot delay elapsed, deep sleep permitted");
+            if (!firstBootDelayElapsed) {
+                firstBootDelayElapsed = true;
+                writeSerial("First boot delay elapsed, deep sleep permitted");
+            }
         }
         if(globalConfig.power_option.deep_sleep_time_seconds > 0 && globalConfig.power_option.power_mode == 1){
             enterDeepSleep();
@@ -182,10 +198,13 @@ void loop() {
         else{
             idleDelay(2000);
         }
-        updatemsdata();
+        static uint32_t lastMsdUpdate = 0;
+        if (millis() - lastMsdUpdate >= 60000) {
+            lastMsdUpdate = millis();
+            updatemsdata();
+        }
         processButtonEvents();
         processTouchInput();
-        if(!bleActive)writeSerial("Loop end: " + String(millis() / 100));
     }
     #else
     if(globalConfig.power_option.sleep_timeout_ms > 0){
@@ -209,6 +228,7 @@ void idleDelay(uint32_t delayMs) {
     while (remainingDelay > 0) {
         processButtonEvents();
         processTouchInput();
+        processLedFlash();
         uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
         delay(chunkDelay);
         remainingDelay -= chunkDelay;
@@ -270,12 +290,16 @@ void enterDeepSleep() {
             writeSerial("BLE advertising stopped");
         }
     }
+    delay(200);
     BLEDevice::deinit(true);
+    esp32_ble_clear_handles();
+    delay(100);
     writeSerial("BLE deinitialized");
     uint64_t sleep_timeout_us = (uint64_t)globalConfig.power_option.deep_sleep_time_seconds * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleep_timeout_us);
     writeSerial("Entering deep sleep...");
     delay(100); // Brief delay to ensure serial output is sent
+    powerLatchHoldForSleep();
     esp_deep_sleep_start();
 }
 #endif

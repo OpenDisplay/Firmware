@@ -27,6 +27,7 @@ extern CommandQueueItem commandQueue[COMMAND_QUEUE_SIZE];
 extern uint8_t commandQueueHead;
 extern uint8_t commandQueueTail;
 extern uint8_t rebootFlag;
+extern volatile bool esp32BleNotifySubscribed;
 
 void updatemsdata();
 void cleanupDirectWriteState(bool refreshDisplay);
@@ -36,13 +37,16 @@ extern bool directWriteActive;
 
 class MyBLEServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
+        (void)pServer;
         writeSerial("=== BLE CLIENT CONNECTED (ESP32) ===");
         rebootFlag = 0;
+        esp32BleNotifySubscribed = false;
         updatemsdata();
     }
     void onDisconnect(BLEServer* pServer) {
         (void)pServer;
         writeSerial("=== BLE CLIENT DISCONNECTED (ESP32) ===");
+        esp32BleNotifySubscribed = false;
         if (epdRefreshInProgress) {
             writeSerial("EPD refresh in progress — deferring cleanup/advertising to main loop");
         } else if (directWriteActive) {
@@ -55,6 +59,14 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
 
 class MyBLECharacteristicCallbacks : public BLECharacteristicCallbacks {
 public:
+#if defined(CONFIG_NIMBLE_ENABLED)
+    void onSubscribe(BLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) {
+        (void)pCharacteristic;
+        (void)desc;
+        esp32BleNotifySubscribed = (subValue & 0x0001) != 0;
+        writeSerial("BLE notify subscription: " + String(esp32BleNotifySubscribed ? "enabled" : "disabled"));
+    }
+#endif
     void onWrite(BLECharacteristic* pCharacteristic) {
         writeSerial("=== BLE WRITE RECEIVED (ESP32) ===");
         String value = pCharacteristic->getValue();

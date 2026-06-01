@@ -107,7 +107,7 @@ extern BLECharacteristic imageCharacteristic;
 #endif
 
 #ifndef BUILD_VERSION
-#define BUILD_VERSION "0.0"
+#define BUILD_VERSION "1.0"
 #endif
 #ifndef SHA
 #define SHA ""
@@ -570,7 +570,11 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             handleLedActivate(data + 2, len - 2);
             break;
         case 0x0075:
-            writeSerial("=== BUZZER ACTIVATE COMMAND (0x0075) ===");
+            writeSerial("=== LED STOP COMMAND (0x0075) ===");
+            handleLedStop(data + 2, len - 2);
+            break;
+        case 0x0077:
+            writeSerial("=== BUZZER ACTIVATE COMMAND (0x0077) ===");
             handleBuzzerActivate(data + 2, len - 2);
             break;
         case 0x0051:

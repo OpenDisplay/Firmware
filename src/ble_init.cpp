@@ -24,6 +24,9 @@ void writeSerial(String message, bool newLine = true);
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLEAdvertising.h>
+#if defined(CONFIG_BLUEDROID_ENABLED)
+#include <BLE2902.h>
+#endif
 
 String getChipIdHex();
 void writeSerial(String message, bool newLine = true);
@@ -94,6 +97,30 @@ void ble_init() {
 
 #ifdef TARGET_ESP32
 volatile bool bleRestartAdvertisingPending = false;
+volatile bool esp32BleNotifySubscribed = false;
+#if defined(CONFIG_BLUEDROID_ENABLED)
+static BLE2902* s_bleNotifyCccd = nullptr;
+#endif
+
+void esp32_ble_clear_handles(void) {
+    pServer = nullptr;
+    pService = nullptr;
+    pTxCharacteristic = nullptr;
+    pRxCharacteristic = nullptr;
+    esp32BleNotifySubscribed = false;
+}
+
+bool esp32_ble_notify_enabled(void) {
+    if (pTxCharacteristic == nullptr || pServer == nullptr || pServer->getConnectedCount() == 0) {
+        return false;
+    }
+#if defined(CONFIG_NIMBLE_ENABLED)
+    return esp32BleNotifySubscribed;
+#else
+    BLE2902* cccd = (BLE2902*)pTxCharacteristic->getDescriptorByUUID((uint16_t)0x2902);
+    return cccd != nullptr && cccd->getNotifications();
+#endif
+}
 
 void esp32_restart_ble_advertising(void) {
     if (pServer == nullptr) {
@@ -116,6 +143,13 @@ void esp32_restart_ble_advertising(void) {
 }
 
 void ble_init_esp32(bool update_manufacturer_data) {
+    esp32_ble_clear_handles();
+#if defined(CONFIG_BLUEDROID_ENABLED)
+    if (s_bleNotifyCccd != nullptr) {
+        delete s_bleNotifyCccd;
+        s_bleNotifyCccd = nullptr;
+    }
+#endif
     writeSerial("=== Initializing ESP32 BLE ===");
     String deviceName = "OD" + getChipIdHex();
     writeSerial("Device name will be: " + deviceName);
@@ -149,6 +183,11 @@ void ble_init_esp32(bool update_manufacturer_data) {
         return;
     }
     writeSerial("Characteristic created with properties: READ, NOTIFY, WRITE, WRITE_NR");
+#if defined(CONFIG_BLUEDROID_ENABLED)
+    s_bleNotifyCccd = new BLE2902();
+    pTxCharacteristic->addDescriptor(s_bleNotifyCccd);
+    writeSerial("CCCD (0x2902) descriptor added for notifications");
+#endif
     pTxCharacteristic->setCallbacks(&staticCharCallbacks);
     pRxCharacteristic = pTxCharacteristic;
     pService->start();

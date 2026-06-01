@@ -1010,6 +1010,7 @@ void initDisplay(){
         writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
         bbepWakeUp(&bbep);
         bbepSendCMDSequence(&bbep, bbep.pInitFull);
+        delay(200);
         if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
             writeBootScreenWithQr();
             writeSerial("EPD refresh: FULL (boot)", true);
@@ -1123,26 +1124,41 @@ void updatemsdata(){
 #endif
 #ifdef TARGET_ESP32
     if (advertisementData != nullptr) {
+        static uint8_t prev_msd_payload[16] = {0xFF};
+        if (memcmp(prev_msd_payload, msd_payload, 16) == 0) {
+            mloopcounter++;
+            mloopcounter &= 0x0F;
+            return;
+        }
+        memcpy(prev_msd_payload, msd_payload, 16);
         String manufacturerDataStr;
         manufacturerDataStr.reserve(16);
         for (int i = 0; i < 16; i++) manufacturerDataStr += (char)msd_payload[i];
         advertisementData->setManufacturerData(manufacturerDataStr);
         BLEAdvertising *pAdvertising = (pServer != nullptr) ? pServer->getAdvertising() : BLEDevice::getAdvertising();
         if (pAdvertising != nullptr) {
-            pAdvertising->stop();
-            BLEAdvertisementData freshAdvertisementData;
-            static String savedDeviceName = "";
-            if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
-            freshAdvertisementData.setName(savedDeviceName);
-            freshAdvertisementData.setFlags(0x06);
-            freshAdvertisementData.setManufacturerData(manufacturerDataStr);
-            *advertisementData = freshAdvertisementData;
-            pAdvertising->setAdvertisementData(freshAdvertisementData);
-            if (pService != nullptr) pAdvertising->addServiceUUID(pService->getUUID());
-            pAdvertising->setScanResponse(false);
-            pAdvertising->setMinPreferred(0x06);
-            pAdvertising->setMinPreferred(0x12);
-            pAdvertising->start();
+            if (pServer != nullptr && pServer->getConnectedCount() > 0) {
+                *advertisementData = BLEAdvertisementData();
+                advertisementData->setName("OD" + getChipIdHex());
+                advertisementData->setFlags(0x06);
+                advertisementData->setManufacturerData(manufacturerDataStr);
+            } else {
+                pAdvertising->stop();
+                BLEAdvertisementData freshAdvertisementData;
+                static String savedDeviceName = "";
+                if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
+                freshAdvertisementData.setName(savedDeviceName);
+                freshAdvertisementData.setFlags(0x06);
+                freshAdvertisementData.setManufacturerData(manufacturerDataStr);
+                *advertisementData = freshAdvertisementData;
+                pAdvertising->setAdvertisementData(freshAdvertisementData);
+                if (pService != nullptr) pAdvertising->addServiceUUID(pService->getUUID());
+                pAdvertising->setScanResponse(false);
+                pAdvertising->setMinPreferred(0x06);
+                pAdvertising->setMinPreferred(0x12);
+                delay(50);
+                pAdvertising->start();
+            }
         }
     }
     opendisplay_mdns_update_msd_txt();
@@ -1167,6 +1183,43 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
     directWriteCompressedReceived += len;
     uint8_t ackResponse[] = {0x00, 0x71};
     sendResponse(ackResponse, sizeof(ackResponse));
+}
+
+// True when the active display uses the bb_epaper 4-gray scheme (two 1-bit
+// controller planes). The Seeed driver path has its own 4bpp handling.
+static inline bool directWriteIsGray4(void) {
+    return (globalConfig.displays[0].color_scheme == 5)
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+        && !seeed_driver_used()
+#endif
+        ;
+}
+
+// 4-gray uploads arrive as two pre-split 1-bit controller planes concatenated
+// (plane0 then plane1), already gray-coded host-side (py-opendisplay applies the
+// panel's gray LUT, matching bbepSetPixel4Gray: plane0 <- stored bit0, plane1 <-
+// stored bit1). Stream the bytes to the panel, switching from PLANE_0 to PLANE_1
+// at the single-plane boundary - no on-device de-interleave or 2bpp frame buffer.
+// directWriteBytesWritten is the running total across both planes, so the
+// compressed and uncompressed paths share this one plane-split implementation.
+static void streamGray4Bytes(const uint8_t* buf, uint32_t len) {
+    const uint32_t planeBytes = (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
+    uint32_t off = 0;
+    while (off < len && directWriteBytesWritten < 2u * planeBytes) {
+        if (directWriteBytesWritten == 0u) {
+            bbepSetAddrWindow(&bbep, 0, 0, directWriteWidth, directWriteHeight);
+            bbepStartWrite(&bbep, PLANE_0);
+        } else if (directWriteBytesWritten == planeBytes) {
+            bbepSetAddrWindow(&bbep, 0, 0, directWriteWidth, directWriteHeight);
+            bbepStartWrite(&bbep, PLANE_1);
+        }
+        const uint32_t limit = (directWriteBytesWritten < planeBytes) ? planeBytes : 2u * planeBytes;
+        uint32_t take = len - off;
+        if (directWriteBytesWritten + take > limit) take = limit - directWriteBytesWritten;
+        bbepWriteData(&bbep, (uint8_t*)(buf + off), (int)take);
+        off += take;
+        directWriteBytesWritten += take;
+    }
 }
 
 void cleanupDirectWriteState(bool refreshDisplay) {
@@ -1222,6 +1275,11 @@ if (partialCtx.active) cleanup_partial_write_state();
         else if (bitsPerPixel == 2) directWriteTotalBytes = (pixels + 3) / 4;
         else directWriteTotalBytes = (pixels + 7) / 8;
     }
+    // 4-gray arrives as two concatenated 1bpp planes (plane0 ++ plane1), streamed to
+    // PLANE_0/PLANE_1. Both compressed and uncompressed transports feed bytes through
+    // streamGray4Bytes as chunks arrive.
+    const bool gray4 = directWriteIsGray4();
+    if (gray4) directWriteTotalBytes = 2u * (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
     if (directWriteCompressed) {
         if ((globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_ZIP) == 0) {
             cleanupDirectWriteState(false);
@@ -1391,12 +1449,15 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
         if (seeed_driver_used()) {
             seeed_gfx_direct_write_chunk(data, bytesToWrite);
+            directWriteBytesWritten += bytesToWrite;
         } else
 #endif
-        {
+        if (directWriteIsGray4()) {
+            streamGray4Bytes(data, bytesToWrite);  // advances directWriteBytesWritten, splits planes
+        } else {
             bbepWriteData(&bbep, data, bytesToWrite);
+            directWriteBytesWritten += bytesToWrite;
         }
-        directWriteBytesWritten += bytesToWrite;
     }
     if (directWriteBytesWritten >= directWriteTotalBytes) {
         handleDirectWriteEnd(nullptr, 0);
@@ -1446,6 +1507,19 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         uint8_t errorResponse[] = {0xFF, 0xFF};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
+    }
+    const bool gray4 = directWriteIsGray4();
+    if (gray4) {
+        // Both planes must be present before refresh. Compressed and uncompressed
+        // paths stream live as 0x71 chunks, so confirm the full two-plane payload
+        // arrived before refreshing stale RAM or committing an etag.
+        if (directWriteBytesWritten != directWriteTotalBytes) {
+            cleanupDirectWriteState(false);
+            touchResumeAfterEpdRefresh();
+            uint8_t errorResponse[] = {0xFF, 0x72};
+            sendResponse(errorResponse, sizeof(errorResponse));
+            return;
+        }
     }
     int refreshMode = REFRESH_FULL;
     if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
@@ -1538,12 +1612,20 @@ static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
             if (seeed_driver_used()) {
                 seeed_gfx_direct_write_chunk(decompressionChunk, (uint32_t)bytesOut);
+                directWriteBytesWritten += (uint32_t)bytesOut;
             } else
 #endif
+            if (directWriteIsGray4()) {
+                uint32_t before = directWriteBytesWritten;
+                streamGray4Bytes(decompressionChunk, (uint32_t)bytesOut);
+                if (directWriteBytesWritten - before != (uint32_t)bytesOut) {
+                    return false;
+                }
+            } else
             {
                 bbepWriteData(&bbep, decompressionChunk, bytesOut);
+                directWriteBytesWritten += (uint32_t)bytesOut;
             }
-            directWriteBytesWritten += (uint32_t)bytesOut;
             if (directWriteBytesWritten > directWriteDecompressedTotal) {
                 return false;
             }

@@ -28,8 +28,8 @@ struct SystemConfig {
     uint8_t device_flags;       // Misc device flags (bitfield)
     uint8_t pwr_pin;            // Power pin number (0xFF if not present)
     uint8_t reserved[15];       // Reserved bytes for future use
-    uint8_t pwr_pin_2;          // Optional 2nd power/enable (e.g. Seeed ED103 TFT_ENABLE); 0 or 0xFF = default (11)
-    uint8_t pwr_pin_3;          // Optional 3rd power/enable (e.g. ITE_ENABLE); 0 or 0xFF = default (21)
+    uint8_t pwr_pin_2;          // Optional 2nd power/enable (e.g. Seeed ED103 TFT_ENABLE); 0 or 0xFF = default (11). Battery-latch pin when DEVICE_FLAG_BATTERY_LATCH is set.
+    uint8_t pwr_pin_3;          // Optional 3rd power/enable (e.g. ITE_ENABLE); 0 or 0xFF = default (21). Shutdown-button pin (active-low, 0xFF = none) when DEVICE_FLAG_BATTERY_LATCH is set.
 } __attribute__((packed));
 
 // 0x02: manufacturer_data
@@ -116,7 +116,7 @@ struct LedConfig {
 } __attribute__((packed));
 
 // 0x29: passive_buzzer (repeatable, max 4 instances)
-// Frequency in 0x0075 payload: 0 = silence/rest; 1–255 maps linearly to firmware-defined Hz range (not stored in config).
+// Frequency in 0x0077 payload: 0 = silence/rest; 1–255 maps linearly to firmware-defined Hz range (not stored in config).
 #define BUZZER_FLAG_ENABLE_ACTIVE_HIGH (1u << 0)
 
 struct PassiveBuzzerConfig {

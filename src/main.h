@@ -10,7 +10,7 @@
 #include "display_service.h"
 
 #ifndef BUILD_VERSION
-#define BUILD_VERSION "0.0"
+#define BUILD_VERSION "1.0"
 #endif
 #ifndef SHA
 #define SHA ""
@@ -67,6 +67,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_PWR_PIN      (1 << 0)  // Bit 0: Device has external power management pin
 #define DEVICE_FLAG_XIAOINIT     (1 << 1)  // Bit 1: Call xiaoinit() after config load (nRF52840 only)
 #define DEVICE_FLAG_WS_PP_INIT   (1 << 2)  // Bit 2: Call ws_pp_init() after config load (Waveshare Photo Printer)
+#define DEVICE_FLAG_BATTERY_LATCH (1 << 3) // Bit 3: Self-holding battery latch on pwr_pin_2; optional active-low long-press shutdown button on pwr_pin_3
 
 #ifdef TARGET_NRF
 #include <bluefruit.h>
@@ -230,8 +231,9 @@ void handleButtonPress(uint8_t buttonIndex);
 void processButtonEvents();  // Process button events and update BLE data
 void idleDelay(uint32_t delayMs);  // Non-blocking delay that processes buttons at 100ms intervals
 void flashLed(uint8_t color, uint8_t brightness);  // Flash LED with color and brightness
-void ledFlashLogic();  // LED flashing logic with pattern support (runs indefinitely)
+void processLedFlash();  // Advance async LED flash state machine
 void handleLedActivate(uint8_t* data, uint16_t len);  // Handle LED activation command
+void handleLedStop(uint8_t* data, uint16_t len);  // Stop running LED flash sequence
 #ifdef TARGET_ESP32
 void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler (IRAM_ATTR in implementation)
 #else
@@ -311,8 +313,10 @@ RTC_DATA_ATTR uint32_t deep_sleep_count = 0;
 bool advertising_timeout_active = false;
 uint32_t advertising_start_time = 0;
 
-// First-boot holdoff before allowing deep sleep
+// First-boot holdoff before allowing deep sleep (2 minutes)
+static constexpr uint32_t FIRST_BOOT_DEEP_SLEEP_DELAY_MS = 120000;
 static bool firstBootDelayInitialized = false;
+static bool firstBootDelayElapsed = false;
 static uint32_t firstBootDelayStart = 0;
 #endif
 

@@ -144,6 +144,23 @@ static uint16_t bootTextWidth(const char* s, uint8_t scale) {
     return (!s || scale == 0) ? 0 : (uint16_t)(strlen(s) * 6U * scale);
 }
 
+// 4-gray panels store each pixel's 2-bit code as two separate 1-bit controller
+// planes (LSB -> PLANE_0, MSB -> PLANE_1) combined by the panel's gray LUT.
+// De-interleave one bit of the packed 2bpp row into a 1bpp plane row (MSB-first)
+// and stream it. planeRow scratch lives just past the 2bpp row in staticRowBuffer
+// (200B + 100B for an 800px panel, well within the 680B buffer).
+static void writeGray4PlaneRow(const uint8_t* row2bpp, int pitch2bpp, int planePitch, uint16_t w, int bitSel) {
+    uint8_t* planeRow = staticRowBuffer + pitch2bpp;
+    memset(planeRow, 0x00, planePitch);
+    for (uint16_t x = 0; x < w; x++) {
+        // SSD16xx 4-gray stores the inverted gray code (bb_epaper pColorLookup maps
+        // level -> 3 - level); the boot image uses level 0=black, 3=white.
+        uint8_t code = (uint8_t)((~(row2bpp[x >> 2] >> (6 - ((x & 3) << 1)))) & 0x03);
+        if ((code >> bitSel) & 0x01) planeRow[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
+    }
+    bbepWriteData(&bbep, planeRow, planePitch);
+}
+
 bool writeBootScreenWithQr() {
     const uint16_t w = globalConfig.displays[0].pixel_width;
     const uint16_t h = globalConfig.displays[0].pixel_height;
@@ -218,7 +235,7 @@ bool writeBootScreenWithQr() {
     char nameLine[16];
     snprintf(nameLine, sizeof(nameLine), "OD%s", last6.c_str());
     char fwLine[16];
-    snprintf(fwLine, sizeof(fwLine), "FW:%d.%d", getFirmwareMajor(), getFirmwareMinor());
+    snprintf(fwLine, sizeof(fwLine), "FW:O %u.%u", (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor());
     const char* domainLine = "OPENDISPLAY.ORG";
     char keyHex[33];
     bytesToHex(&payload[5], 16, keyHex, sizeof(keyHex));
@@ -227,66 +244,87 @@ bool writeBootScreenWithQr() {
     memcpy(k2, keyHex + 16, 16); k2[16] = '\0';
 
     uint8_t* row = staticRowBuffer;
+    // bb_epaper 4-gray (scheme 5) needs the packed 2bpp image split into two
+    // 1-bit controller planes, so render the frame once per plane and
+    // de-interleave. Every other scheme writes a single packed plane in one pass.
+    const bool gray4Split = (colorScheme == 5)
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (!seeed_driver_used()) {
-        bbepSetAddrWindow(&bbep, 0, 0, w, h);
-        bbepStartWrite(&bbep, getplane());
-    }
-#else
-    bbepSetAddrWindow(&bbep, 0, 0, w, h);
-    bbepStartWrite(&bbep, getplane());
+        && !seeed_driver_used()
 #endif
-    for (uint16_t y = 0; y < h; y++) {
-        memset(row, whiteValue, pitch);
-        uint16_t availW = qrRight ? qrX : w;
-        uint16_t textY = pad;
-        if (qrRight) {
-            uint16_t lineH = (uint16_t)(scaleText * 10);
-            uint16_t blockH = (uint16_t)(4 * lineH + 7 * scaleText);
-            textY = (qrPx > blockH) ? (uint16_t)(qrY + (qrPx - blockH) / 2) : qrY;
+        ;
+    const int planePitch = (w + 7) / 8;
+    const int planePasses = gray4Split ? 2 : 1;
+    for (int pass = 0; pass < planePasses; pass++) {
+        const int bitSel = pass;  // pass 0 -> LSB/PLANE_0, pass 1 -> MSB/PLANE_1
+        const int targetPlane = gray4Split ? (pass == 0 ? PLANE_0 : PLANE_1)
+                                           : (useBitplanes ? PLANE_0 : getplane());
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+        if (!seeed_driver_used()) {
+            bbepSetAddrWindow(&bbep, 0, 0, w, h);
+            bbepStartWrite(&bbep, targetPlane);
         }
-        uint16_t dW = bootTextWidth(domainLine, scaleText);
-        uint16_t nW = bootTextWidth(nameLine, scaleText);
-        uint16_t fW = bootTextWidth(fwLine, scaleText);
-        uint16_t k1W = bootTextWidth(k1, scaleText);
-        uint16_t k2W = bootTextWidth(k2, scaleText);
-        uint16_t domX = (dW < availW) ? (uint16_t)((availW - dW) / 2) : pad;
-        uint16_t nameX = (nW < availW) ? (uint16_t)((availW - nW) / 2) : pad;
-        uint16_t fwX = (fW < availW) ? (uint16_t)((availW - fW) / 2) : pad;
-        uint16_t k1X = (k1W < availW) ? (uint16_t)((availW - k1W) / 2) : pad;
-        uint16_t k2X = (k2W < availW) ? (uint16_t)((availW - k2W) / 2) : pad;
-        drawBootTextRow(row, y, domX, textY, domainLine, scaleText, w, pitch, bitsPerPixel, colorScheme);
-        drawBootTextRow(row, y, nameX, (uint16_t)(textY + scaleText * 10), nameLine, scaleText, w, pitch, bitsPerPixel, colorScheme);
-        drawBootTextRow(row, y, fwX, (uint16_t)(textY + scaleText * 20), fwLine, scaleText, w, pitch, bitsPerPixel, colorScheme);
-        drawBootTextRow(row, y, k1X, (uint16_t)(textY + scaleText * 30), k1, scaleText, w, pitch, bitsPerPixel, colorScheme);
-        drawBootTextRow(row, y, k2X, (uint16_t)(textY + scaleText * 40), k2, scaleText, w, pitch, bitsPerPixel, colorScheme);
+#else
+        bbepSetAddrWindow(&bbep, 0, 0, w, h);
+        bbepStartWrite(&bbep, targetPlane);
+#endif
+        for (uint16_t y = 0; y < h; y++) {
+            memset(row, whiteValue, pitch);
+            uint16_t availW = qrRight ? qrX : w;
+            uint16_t textY = pad;
+            if (qrRight) {
+                uint16_t lineH = (uint16_t)(scaleText * 10);
+                uint16_t blockH = (uint16_t)(4 * lineH + 7 * scaleText);
+                textY = (qrPx > blockH) ? (uint16_t)(qrY + (qrPx - blockH) / 2) : qrY;
+            }
+            uint16_t dW = bootTextWidth(domainLine, scaleText);
+            uint16_t nW = bootTextWidth(nameLine, scaleText);
+            uint16_t fW = bootTextWidth(fwLine, scaleText);
+            uint16_t k1W = bootTextWidth(k1, scaleText);
+            uint16_t k2W = bootTextWidth(k2, scaleText);
+            uint16_t domX = (dW < availW) ? (uint16_t)((availW - dW) / 2) : pad;
+            uint16_t nameX = (nW < availW) ? (uint16_t)((availW - nW) / 2) : pad;
+            uint16_t fwX = (fW < availW) ? (uint16_t)((availW - fW) / 2) : pad;
+            uint16_t k1X = (k1W < availW) ? (uint16_t)((availW - k1W) / 2) : pad;
+            uint16_t k2X = (k2W < availW) ? (uint16_t)((availW - k2W) / 2) : pad;
+            drawBootTextRow(row, y, domX, textY, domainLine, scaleText, w, pitch, bitsPerPixel, colorScheme);
+            drawBootTextRow(row, y, nameX, (uint16_t)(textY + scaleText * 10), nameLine, scaleText, w, pitch, bitsPerPixel, colorScheme);
+            drawBootTextRow(row, y, fwX, (uint16_t)(textY + scaleText * 20), fwLine, scaleText, w, pitch, bitsPerPixel, colorScheme);
+            drawBootTextRow(row, y, k1X, (uint16_t)(textY + scaleText * 30), k1, scaleText, w, pitch, bitsPerPixel, colorScheme);
+            drawBootTextRow(row, y, k2X, (uint16_t)(textY + scaleText * 40), k2, scaleText, w, pitch, bitsPerPixel, colorScheme);
 
-        if (y >= qrY && y < (uint16_t)(qrY + qrPx)) {
-            uint16_t localY = (uint16_t)(y - qrY);
-            uint16_t my = (uint16_t)(localY / modulePx);
-            if (my < qrModules) {
-                int16_t qy = (int16_t)my - quiet;
-                for (uint16_t mx = 0; mx < qrModules; mx++) {
-                    int16_t qx = (int16_t)mx - quiet;
-                    bool on = false;
-                    if (qx >= 0 && qy >= 0 && qx < qrSize && qy < qrSize) on = qrcode_getModule(&qr, (uint8_t)qx, (uint8_t)qy);
-                    if (!on) continue;
-                    uint16_t px0 = (uint16_t)(qrX + mx * modulePx);
-                    for (uint16_t px = px0; px < (uint16_t)(px0 + modulePx) && px < w; px++) {
-                        setBootPixelBlack(row, px, pitch, bitsPerPixel, colorScheme);
+            if (y >= qrY && y < (uint16_t)(qrY + qrPx)) {
+                uint16_t localY = (uint16_t)(y - qrY);
+                uint16_t my = (uint16_t)(localY / modulePx);
+                if (my < qrModules) {
+                    int16_t qy = (int16_t)my - quiet;
+                    for (uint16_t mx = 0; mx < qrModules; mx++) {
+                        int16_t qx = (int16_t)mx - quiet;
+                        bool on = false;
+                        if (qx >= 0 && qy >= 0 && qx < qrSize && qy < qrSize) on = qrcode_getModule(&qr, (uint8_t)qx, (uint8_t)qy);
+                        if (!on) continue;
+                        uint16_t px0 = (uint16_t)(qrX + mx * modulePx);
+                        for (uint16_t px = px0; px < (uint16_t)(px0 + modulePx) && px < w; px++) {
+                            setBootPixelBlack(row, px, pitch, bitsPerPixel, colorScheme);
+                        }
                     }
                 }
             }
-        }
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        if (seeed_driver_used()) {
-            seeed_gfx_boot_write_row(y, row, pitch);
-        } else {
-            bbepWriteData(&bbep, row, pitch);
-        }
+            if (seeed_driver_used()) {
+                seeed_gfx_boot_write_row(y, row, pitch);
+            } else if (gray4Split) {
+                writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
+            } else {
+                bbepWriteData(&bbep, row, pitch);
+            }
 #else
-        bbepWriteData(&bbep, row, pitch);
+            if (gray4Split) {
+                writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
+            } else {
+                bbepWriteData(&bbep, row, pitch);
+            }
 #endif
+        }
     }
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
@@ -300,14 +338,6 @@ bool writeBootScreenWithQr() {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
             bbepStartWrite(&bbep, PLANE_1);
             for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, pitch);
-        }
-        if (colorScheme == 5) {
-            int otherPlane = (getplane() == PLANE_0) ? PLANE_1 : PLANE_0;
-            int otherPlanePitch = (w + 7) / 8;
-            memset(row, 0x00, otherPlanePitch);
-            bbepSetAddrWindow(&bbep, 0, 0, w, h);
-            bbepStartWrite(&bbep, otherPlane);
-            for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, otherPlanePitch);
         }
     }
     writeSerial("Boot screen with QR rendered", true);
