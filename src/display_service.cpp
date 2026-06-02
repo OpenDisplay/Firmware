@@ -1165,7 +1165,6 @@ void updatemsdata(){
                 freshAdvertisementData.setManufacturerData(manufacturerDataStr);
                 *advertisementData = freshAdvertisementData;
                 pAdvertising->setAdvertisementData(freshAdvertisementData);
-                if (pService != nullptr) pAdvertising->addServiceUUID(pService->getUUID());
                 pAdvertising->setScanResponse(false);
                 pAdvertising->setMinPreferred(0x06);
                 pAdvertising->setMinPreferred(0x12);
