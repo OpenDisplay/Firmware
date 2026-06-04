@@ -81,8 +81,9 @@ static void pollConfiguredPowerOffButtons() {
 }
 
 // BinaryInputs.input_type wire values (see structs.h for the full contract).
+// 2 is reserved for switches (host-side feature); the ADC ladder uses 3.
 #define BINARY_INPUT_TYPE_DIGITAL    1
-#define BINARY_INPUT_TYPE_ADC_LADDER 2
+#define BINARY_INPUT_TYPE_ADC_LADDER 3
 
 // --- ADC resistor-ladder buttons (e.g. XTEINK X4) -------------------------
 // Several buttons share one ADC pin via a resistor ladder, distinguished by
