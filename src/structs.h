@@ -167,7 +167,9 @@ struct DataBus {
 //   GPIO, read with digitalRead + edge interrupt. invert/pullups/pulldowns apply
 //   per pin. All pins in the instance report into button_data_byte_index.
 //
-// input_type == 2 (ADC resistor ladder, e.g. XTEINK X4): several buttons share
+// input_type == 2 (switch): reserved for the host-side switch feature.
+//
+// input_type == 3 (ADC resistor ladder, e.g. XTEINK X4): several buttons share
 //   one ADC pin, distinguished by voltage; polled (no interrupt). Layout:
 //     reserved_pin_1            = ADC GPIO pin
 //     reserved[0]               = num_buttons N (1..5)
@@ -179,7 +181,7 @@ struct DataBus {
 //   format as digital buttons.
 struct BinaryInputs {
     uint8_t instance_number;    // Unique index for multiple input blocks (0-based)
-    uint8_t input_type;         // 1 = digital buttons, 2 = ADC resistor ladder
+    uint8_t input_type;         // 1 = digital buttons, 2 = switch, 3 = ADC resistor ladder
     uint8_t display_as;         // How input should be represented in systems (enum)
     uint8_t reserved_pin_1;     // Reserved / spare pin 1
     uint8_t reserved_pin_2;     // Reserved / spare pin 2
