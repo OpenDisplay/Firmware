@@ -21,6 +21,8 @@ extern "C" {
 #include "nrf_soc.h"
 }
 #include <bluefruit.h>
+#include "nrf.h"
+#include "nrf_gpio.h"
 #endif
 
 #ifdef TARGET_ESP32
@@ -101,6 +103,58 @@ void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
 void bbepFill(BBEPDISP *pBBEP, unsigned char ucColor, int iPlane);
 bool bbepIsBusy(BBEPDISP *pBBEP);
 void flashLed(uint8_t color, uint8_t brightness);
+bool waitforrefresh(int timeout);
+
+#ifdef TARGET_NRF
+static bool nrfVbusPresent() {
+    return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+}
+#else
+static bool nrfVbusPresent() { return true; }
+#endif
+
+static void epdBsPinLowIfNrf() {
+#ifdef TARGET_NRF
+    pinMode(13, OUTPUT);
+    digitalWrite(13, LOW);
+#endif
+}
+
+// First full refresh on battery needs the panel rail up longer than USB-powered boot.
+static void prepareEpdRailForBoot() {
+    epdBsPinLowIfNrf();
+    pwrmgm(true);
+#ifdef TARGET_NRF
+    if (!nrfVbusPresent()) {
+        delay(500);
+        pwrmgm(false);
+        delay(150);
+        epdBsPinLowIfNrf();
+        pwrmgm(true);
+        delay(500);
+    }
+#endif
+}
+
+static void initBbepPanelSession() {
+    const DisplayConfig& d = globalConfig.displays[0];
+    bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
+    bbepWakeUp(&bbep);
+    bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    delay(200);
+}
+
+static bool refreshBootScreenFull() {
+    if (!writeBootScreenWithQr()) {
+        writeSerial("Boot screen render failed", true);
+        return false;
+    }
+    writeSerial("EPD refresh: FULL (boot)", true);
+    touchSuspendForEpdRefresh();
+    bbepRefresh(&bbep, REFRESH_FULL);
+    return waitforrefresh(60);
+}
+
 static void cleanup_partial_write_state(void);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
 static void partial_prepare_panel_ram(void);
@@ -397,10 +451,15 @@ void initio(){
         for (uint8_t i = 0; i < globalConfig.led_count; i++) {
             if (globalConfig.leds[i].led_type == 0) {
                 activeLedInstance = i;
-                flashLed(0xE0, 15);
-                flashLed(0x1C, 15);
-                flashLed(0x03, 15);
-                flashLed(0xFF, 15);
+#ifdef TARGET_NRF
+                if (nrfVbusPresent())
+#endif
+                {
+                    flashLed(0xE0, 15);
+                    flashLed(0x1C, 15);
+                    flashLed(0x03, 15);
+                    flashLed(0xFF, 15);
+                }
             }
         }
     }
@@ -1000,23 +1059,27 @@ void initDisplay(){
     } else
 #endif
     {
-        pwrmgm(true);
+        prepareEpdRailForBoot();
         memset(&bbep, 0, sizeof(BBEPDISP));
         int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
         bbepSetPanelType(&bbep, panelType);
         bbepSetRotation(&bbep, globalConfig.displays[0].rotation * 90);
-        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
         writeSerial(String("Height: ") + String(globalConfig.displays[0].pixel_height), true);
         writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
-        bbepWakeUp(&bbep);
-        bbepSendCMDSequence(&bbep, bbep.pInitFull);
-        delay(200);
+        initBbepPanelSession();
         if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
-            writeBootScreenWithQr();
-            writeSerial("EPD refresh: FULL (boot)", true);
-            touchSuspendForEpdRefresh();
-            bbepRefresh(&bbep, REFRESH_FULL);
-            waitforrefresh(60);
+            bool bootOk = refreshBootScreenFull();
+            if (!bootOk && !nrfVbusPresent()) {
+                writeSerial("Boot refresh failed on battery — re-powering panel and retrying", true);
+                pwrmgm(false);
+                delay(200);
+                prepareEpdRailForBoot();
+                initBbepPanelSession();
+                bootOk = refreshBootScreenFull();
+            }
+            if (!bootOk) {
+                writeSerial("Boot screen refresh did not complete", true);
+            }
             bbepSleep(&bbep, 1);
             delay(200);
             pwrmgm(false);
@@ -1058,10 +1121,15 @@ float readBatteryVoltage() {
     uint8_t sensePin = globalConfig.power_option.battery_sense_pin;
     uint8_t enablePin = globalConfig.power_option.battery_sense_enable_pin;
     uint16_t scalingFactor = globalConfig.power_option.voltage_scaling_factor;
+    const bool enableInverted =
+        (globalConfig.power_option.battery_sense_flags & BATTERY_SENSE_FLAG_ENABLE_INVERTED) != 0;
+    const uint8_t enableLevel = enableInverted ? LOW : HIGH;
+    const uint8_t disableLevel = enableInverted ? HIGH : LOW;
+
     pinMode(sensePin, INPUT);
     if (enablePin != 0xFF) {
         pinMode(enablePin, OUTPUT);
-        digitalWrite(enablePin, HIGH);
+        digitalWrite(enablePin, enableLevel);
         delay(10);
     }
     const int numSamples = 10;
@@ -1071,7 +1139,14 @@ float readBatteryVoltage() {
         delay(2);
     }
     uint32_t adcAverage = adcSum / numSamples;
-    if (enablePin != 0xFF) digitalWrite(enablePin, LOW);
+    if (enablePin != 0xFF) {
+        digitalWrite(enablePin, disableLevel);
+    }
+    if (enableInverted) {
+#ifdef TARGET_NRF
+        nrf_gpio_cfg_default(sensePin);
+#endif
+    }
     if (scalingFactor > 0) return (adcAverage * scalingFactor) / (100000.0);
     return -1.0;
 }

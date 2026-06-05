@@ -57,6 +57,9 @@ struct PowerOption {
     uint8_t reserved[10];        // Reserved bytes for future use
 } __attribute__((packed));
 
+// battery_sense_flags (power_option)
+#define BATTERY_SENSE_FLAG_ENABLE_INVERTED (1 << 0)  // Enable active-low (e.g. XIAO ~READ_BAT on P0.14)
+
 // Panel IDs must match web/firmware/toolbox/config.yaml display.panel_ic_type enum values.
 // Decimal 3000–3999 = Seeed_GFX / OpenDisplay runtime epaper (add new IDs here as panels ship).
 #define PANEL_IC_SEEED_ED103TC2_1872X1404 3000u

@@ -573,6 +573,7 @@ void printConfigSummary(){
     writeSerial("Battery Sense Pin: " + String(globalConfig.power_option.battery_sense_pin));
     writeSerial("Battery Sense Enable Pin: " + String(globalConfig.power_option.battery_sense_enable_pin));
     writeSerial("Battery Sense Flags: 0x" + String(globalConfig.power_option.battery_sense_flags, HEX));
+    writeSerial("  ENABLE_INVERTED: " + String((globalConfig.power_option.battery_sense_flags & BATTERY_SENSE_FLAG_ENABLE_INVERTED) ? "yes" : "no"));
     writeSerial("Capacity Estimator: " + String(globalConfig.power_option.capacity_estimator));
     writeSerial("Voltage Scaling Factor: " + String(globalConfig.power_option.voltage_scaling_factor));
     writeSerial("Deep Sleep Current: " + String(globalConfig.power_option.deep_sleep_current_ua) + " uA");

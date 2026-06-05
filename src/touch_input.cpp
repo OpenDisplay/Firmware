@@ -351,6 +351,9 @@ void touchResumeAfterEpdRefresh(void) {
     if (s_epd_refresh_suspend != 0) {
         return;
     }
+    if (globalConfig.touch_controller_count == 0) {
+        return;
+    }
     invalidateOpenDisplayWire();
     initOrRestoreWireForOpenDisplay();
     delay(GT911_POST_RESET_SETTLE_MS);
