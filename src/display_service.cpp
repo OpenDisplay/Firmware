@@ -1111,7 +1111,8 @@ int getBitsPerPixel() {
         return 4;
     }
 #endif
-    if (globalConfig.displays[0].color_scheme == 4) return 4;
+    if (globalConfig.displays[0].color_scheme == 4) return 4; // BWGBRY 6-color
+    if (globalConfig.displays[0].color_scheme == 8) return 4; // BWGBRYO 7-color ACeP (Inkplate 6COLOR)
     if (globalConfig.displays[0].color_scheme == 3) return 2;
     if (globalConfig.displays[0].color_scheme == 5) return 2;
     return 1;
