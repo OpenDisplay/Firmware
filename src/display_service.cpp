@@ -271,6 +271,7 @@ int mapEpd(int id){
         case 0x0041: return EP_PANEL_UNDEFINED;
         // bb_epaper 2.1.9 does not define the 13.3" EP133 panel yet.
         case 0x0042: return EP_PANEL_UNDEFINED;
+        case 0x0043: return EP585C_600x448; // Inkplate 6COLOR (ACeP 7-color, UC8159)
         default: return EP_PANEL_UNDEFINED;
     }
 }
