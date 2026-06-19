@@ -2,10 +2,16 @@
 #include "structs.h"
 #include "touch_input.h"
 #include "power_latch.h"
+#include "buzzer_control.h"
 #include <string.h>
+
+#ifdef TARGET_ESP32
+void enterDeepSleep();
+#endif
 
 #ifdef TARGET_NRF
 #include <bluefruit.h>
+#include "ble_init.h"
 extern "C" {
 #include "nrf_soc.h"
 }
@@ -35,7 +41,6 @@ void writeSerial(String message, bool newLine = true);
 struct ButtonState {
     uint8_t button_id;
     uint8_t press_count;
-    volatile uint32_t last_press_time;
     volatile uint8_t current_state;
     uint8_t byte_index;
     uint8_t pin;
@@ -43,9 +48,51 @@ struct ButtonState {
     bool initialized;
     uint8_t pin_offset;
     bool inverted;
+    bool power_off;
+    uint16_t power_off_hold_ms;
 };
 #define MAX_BUTTONS 32
 extern ButtonState buttonStates[MAX_BUTTONS];
+
+#ifdef TARGET_ESP32
+static bool s_pwrOffReleased[MAX_BUTTONS];
+static bool s_pwrOffPressing[MAX_BUTTONS];
+static bool s_pwrOffDone[MAX_BUTTONS];
+static uint32_t s_pwrOffStartMs[MAX_BUTTONS];
+
+static void pollConfiguredPowerOffButtons() {
+    if (!powerLatchDffConfigured() && !powerLatchMosfetConfigured()) {
+        return;
+    }
+    for (uint8_t i = 0; i < buttonStateCount; i++) {
+        ButtonState* btn = &buttonStates[i];
+        if (!btn->initialized || !btn->power_off) {
+            continue;
+        }
+        bool pinState = digitalRead(btn->pin);
+        bool down = btn->inverted ? !pinState : pinState;
+        if (!down) {
+            s_pwrOffReleased[i] = true;
+            s_pwrOffPressing[i] = false;
+            s_pwrOffDone[i] = false;
+            continue;
+        }
+        if (!s_pwrOffReleased[i]) {
+            continue;
+        }
+        if (!s_pwrOffPressing[i]) {
+            s_pwrOffPressing[i] = true;
+            s_pwrOffStartMs[i] = millis();
+            continue;
+        }
+        if (!s_pwrOffDone[i] && millis() - s_pwrOffStartMs[i] >= btn->power_off_hold_ms) {
+            s_pwrOffDone[i] = true;
+            passiveBuzzerPowerOffAlert();
+            powerLatchTriggerOff();
+        }
+    }
+}
+#endif
 
 void connect_callback(uint16_t conn_handle) {
     (void)conn_handle;
@@ -373,41 +420,14 @@ void handleLedStop(uint8_t* data, uint16_t len) {
 
 void processButtonEvents() {
     powerButtonPoll();
+#ifdef TARGET_ESP32
+    pollConfiguredPowerOffButtons();
+#endif
     if (buttonEventPending) {
         buttonEventPending = false;
-        uint32_t currentTime = millis();
         uint8_t changedButtonIndex = lastChangedButtonIndex;
         lastChangedButtonIndex = 0xFF;
         writeSerial("Button event pending: " + String(changedButtonIndex));
-        if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
-            ButtonState* btn = &buttonStates[changedButtonIndex];
-            if (btn->current_state == 1) {
-                bool resetCount = false;
-                if (btn->last_press_time == 0 || currentTime - btn->last_press_time > 5000) {
-                    resetCount = true;
-                }
-                if (btn->last_press_time > 0) {
-                    for (uint8_t j = 0; j < buttonStateCount; j++) {
-                        if (j != changedButtonIndex && buttonStates[j].initialized &&
-                            buttonStates[j].last_press_time > 0 &&
-                            buttonStates[j].last_press_time > btn->last_press_time &&
-                            (currentTime - buttonStates[j].last_press_time) < 5000) {
-                            resetCount = true;
-                            break;
-                        }
-                    }
-                }
-                if (resetCount) {
-                    for (uint8_t j = 0; j < buttonStateCount; j++) {
-                        if (buttonStates[j].initialized) {
-                            buttonStates[j].press_count = 0;
-                        }
-                    }
-                    btn->press_count = 1;
-                }
-                btn->last_press_time = currentTime;
-            }
-        }
         if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
             ButtonState* btn = &buttonStates[changedButtonIndex];
             bool pinState = digitalRead(btn->pin);
@@ -424,6 +444,9 @@ void processButtonEvents() {
             }
         }
         updatemsdata();
+#ifdef TARGET_NRF
+        ble_nrf_boost_advertising();
+#endif
     }
 }
 
@@ -491,7 +514,7 @@ void handleButtonISR(uint8_t buttonIndex) {
     if (newState != btn->current_state) {
         btn->current_state = newState;
         lastChangedButtonIndex = buttonIndex;
-        if (pressed && btn->press_count < 15) btn->press_count++;
+        if (pressed) btn->press_count = (btn->press_count + 1) & 0x0F;
         buttonEventPending = true;
     }
 }
@@ -525,22 +548,27 @@ void initButtons() {
         buttonStates[i].initialized = false;
         buttonStates[i].button_id = 0;
         buttonStates[i].press_count = 0;
-        buttonStates[i].last_press_time = 0;
         buttonStates[i].current_state = 0;
         buttonStates[i].byte_index = 0xFF;
         buttonStates[i].pin = 0xFF;
         buttonStates[i].instance_index = 0xFF;
+        buttonStates[i].power_off = false;
+        buttonStates[i].power_off_hold_ms = 0;
     }
     if (globalConfig.binary_input_count == 0) return;
     for (uint8_t instanceIdx = 0; instanceIdx < globalConfig.binary_input_count; instanceIdx++) {
         struct BinaryInputs* input = &globalConfig.binary_inputs[instanceIdx];
         if (input->input_type != 1) continue;
         if (input->button_data_byte_index > 10) continue;
+        uint16_t instanceHoldMs = (input->power_off_hold_sec == 0) ? 3000u : (uint16_t)input->power_off_hold_sec * 1000u;
         uint8_t* instancePins[8] = {
             &input->reserved_pin_1,&input->reserved_pin_2,&input->reserved_pin_3,&input->reserved_pin_4,
             &input->reserved_pin_5,&input->reserved_pin_6,&input->reserved_pin_7,&input->reserved_pin_8
         };
         for (uint8_t pinIdx = 0; pinIdx < 8; pinIdx++) {
+            if (input->input_flags != 0 && (input->input_flags & (1 << pinIdx)) == 0) {
+                continue;
+            }
             uint8_t pin = *instancePins[pinIdx];
             if (pin == 0xFF) continue;
             if (touch_input_gpio_is_touch_int(pin)) {
@@ -555,9 +583,10 @@ void initButtons() {
             btn->pin = pin;
             btn->instance_index = instanceIdx;
             btn->press_count = 0;
-            btn->last_press_time = 0;
             btn->pin_offset = pinIdx;
             btn->inverted = (input->invert & (1 << pinIdx)) != 0;
+            btn->power_off = (input->power_off_flags & (1 << pinIdx)) != 0;
+            btn->power_off_hold_ms = instanceHoldMs;
             pinMode(pin, INPUT);
             bool hasPullup = (input->pullups & (1 << pinIdx)) != 0;
 #ifdef TARGET_ESP32
@@ -604,7 +633,6 @@ void initButtons() {
             bool initialPressed = btn->inverted ? !pinState : pinState;
             btn->current_state = initialPressed ? 1 : 0;
             btn->press_count = 0;
-            btn->last_press_time = 0;
         }
 #ifdef TARGET_ESP32
         for (uint8_t i = 0; i < buttonStateCount; i++) {
@@ -659,5 +687,21 @@ void enterDFUMode() {
     writeSerial("ESP32: Rebooting (OTA typically handled via WiFi)", true);
     delay(100);
     esp_restart();
+#endif
+}
+
+void handleDeepSleepCommand() {
+    writeSerial("=== DEEP SLEEP COMMAND (0x0052) ===", true);
+#ifdef TARGET_ESP32
+    if (powerLatchDffConfigured()) {
+        uint8_t ok[] = {0x00, 0x52, 0x00, 0x00};
+        sendResponse(ok, sizeof(ok));
+        delay(100);
+        powerLatchPowerOff();
+        return;
+    }
+    enterDeepSleep();
+#else
+    writeSerial("Deep sleep command not supported on this target", true);
 #endif
 }

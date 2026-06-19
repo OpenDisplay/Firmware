@@ -26,6 +26,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_XIAOINIT (1 << 1)
 #define DEVICE_FLAG_WS_PP_INIT (1 << 2)
 #define DEVICE_FLAG_BATTERY_LATCH (1 << 3)
+#define DEVICE_FLAG_PWR_LATCH_DFF (1 << 4)
 #endif
 void writeSerial(String message, bool newLine = true);
 
@@ -44,8 +45,8 @@ extern bool wifiInitialized;
 #endif
 
 void xiaoinit();
+void powerDownExternalFlashFromConfig(void);
 void ws_pp_init();
-
 extern bool encryptionInitialized;
 
 bool initConfigStorage(){
@@ -345,6 +346,20 @@ bool loadGlobalConfig(){
                     return false;
                 }
                 break;
+            case 0x2B: // flash_config
+                if (globalConfig.flash_config_count < 2 && offset + sizeof(struct FlashConfig) <= configLen - 2) {
+                    memcpy(&globalConfig.flash_configs[globalConfig.flash_config_count], &configData[offset], sizeof(struct FlashConfig));
+                    offset += sizeof(struct FlashConfig);
+                    globalConfig.flash_config_count++;
+                } else if (globalConfig.flash_config_count >= 2) {
+                    writeSerial("WARNING: Maximum flash_config count reached, skipping");
+                    offset += sizeof(struct FlashConfig);
+                } else {
+                    writeSerial("ERROR: Not enough data for flash_config");
+                    globalConfig.loaded = false;
+                    return false;
+                }
+                break;
             case 0x26: // wifi_config (see struct WifiConfig)
                 {
                     if (offset + sizeof(struct WifiConfig) > configLen - 2) {
@@ -552,6 +567,7 @@ void printConfigSummary(){
     #endif
     writeSerial("  WS_PP_INIT flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_WS_PP_INIT) ? "enabled" : "disabled"));
     writeSerial("  BATTERY_LATCH flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_BATTERY_LATCH) ? "enabled" : "disabled"));
+    writeSerial("  PWR_LATCH_DFF flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_PWR_LATCH_DFF) ? "enabled" : "disabled"));
     writeSerial("Power Pin: " + String(globalConfig.system_config.pwr_pin));
     writeSerial("Power Pin 2: " + String(globalConfig.system_config.pwr_pin_2));
     writeSerial("Power Pin 3: " + String(globalConfig.system_config.pwr_pin_3));
@@ -670,7 +686,8 @@ void printConfigSummary(){
         writeSerial("  IC type: " + String(globalConfig.touch_controllers[i].touch_ic_type));
         writeSerial("  Bus ID: " + String(globalConfig.touch_controllers[i].bus_id));
         writeSerial("  I2C addr (7-bit): 0x" + String(globalConfig.touch_controllers[i].i2c_addr_7bit, HEX));
-        writeSerial("  INT/RST pins: " + String(globalConfig.touch_controllers[i].int_pin) + " / " + String(globalConfig.touch_controllers[i].rst_pin));
+        writeSerial("  INT/RST/EN pins: " + String(globalConfig.touch_controllers[i].int_pin) + " / " +
+                    String(globalConfig.touch_controllers[i].rst_pin) + " / " + String(globalConfig.touch_controllers[i].enable_pin));
         writeSerial("  Display instance: " + String(globalConfig.touch_controllers[i].display_instance));
         writeSerial("  Flags: 0x" + String(globalConfig.touch_controllers[i].flags, HEX));
         writeSerial("  Poll ms / MSD start byte: " + String(globalConfig.touch_controllers[i].poll_interval_ms) + " / " + String(globalConfig.touch_controllers[i].touch_data_start_byte));
@@ -703,6 +720,7 @@ void full_config_init() {
         encryptionInitialized = true;
         checkResetPin();
 #ifdef TARGET_NRF
+        powerDownExternalFlashFromConfig();
         if (globalConfig.loaded && (globalConfig.system_config.device_flags & DEVICE_FLAG_XIAOINIT)) {
             writeSerial("Device flag DEVICE_FLAG_XIAOINIT is set, calling xiaoinit()...");
             xiaoinit();

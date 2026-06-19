@@ -581,6 +581,9 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             writeSerial("=== ENTER DFU MODE COMMAND (0x0051) ===");
             enterDFUMode();
             break;
+        case 0x0052:
+            handleDeepSleepCommand();
+            break;
         default:
             writeSerial("ERROR: Unknown command: 0x" + String(command, HEX));
             writeSerial("Expected: 0x0011 (read config), 0x0064 (image info), 0x0065 (block data), or 0x0003 (finalize)");

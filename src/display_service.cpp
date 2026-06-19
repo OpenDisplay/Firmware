@@ -7,6 +7,7 @@
 #include "structs.h"
 #include "buzzer_control.h"
 #include "sensor_sht40.h"
+#include "sensor_bq27220.h"
 #include "communication.h"
 #include "encryption.h"
 #include "boot_screen.h"
@@ -21,8 +22,8 @@ extern "C" {
 #include "nrf_soc.h"
 }
 #include <bluefruit.h>
+#include "ble_init.h"
 #include "nrf.h"
-#include "nrf_gpio.h"
 #endif
 
 #ifdef TARGET_ESP32
@@ -101,6 +102,9 @@ void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
 void bbepFill(BBEPDISP *pBBEP, unsigned char ucColor, int iPlane);
+void bbepWriteCmd(BBEPDISP *pBBEP, uint8_t cmd);
+void bbepCMD2(BBEPDISP *pBBEP, uint8_t cmd1, uint8_t cmd2);
+void bbepWaitBusy(BBEPDISP *pBBEP);
 bool bbepIsBusy(BBEPDISP *pBBEP);
 void flashLed(uint8_t color, uint8_t brightness);
 bool waitforrefresh(int timeout);
@@ -120,18 +124,18 @@ static void epdBsPinLowIfNrf() {
 #endif
 }
 
-// First full refresh on battery needs the panel rail up longer than USB-powered boot.
+// Battery boot: power-cycle the panel rail once. pwrmgm(true) already waits ~900 ms
+// per enable; extra delays here are only for rail discharge between off/on.
 static void prepareEpdRailForBoot() {
     epdBsPinLowIfNrf();
     pwrmgm(true);
 #ifdef TARGET_NRF
     if (!nrfVbusPresent()) {
-        delay(500);
+        delay(50);
         pwrmgm(false);
-        delay(150);
+        delay(50);
         epdBsPinLowIfNrf();
         pwrmgm(true);
-        delay(500);
     }
 #endif
 }
@@ -156,6 +160,8 @@ static bool refreshBootScreenFull() {
 }
 
 static void cleanup_partial_write_state(void);
+static bool panel_skips_bbep_set_addr_window(void);
+static void partial_set_addr_window(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 static bool partial_consume_bytes(uint8_t* data, uint32_t len);
 static void partial_prepare_panel_ram(void);
 static bool partial_write_to_panel(int refreshMode);
@@ -271,6 +277,16 @@ int mapEpd(int id){
         case 0x0041: return EP_PANEL_UNDEFINED;
         // bb_epaper 2.1.9 does not define the 13.3" EP133 panel yet.
         case 0x0042: return EP_PANEL_UNDEFINED;
+        case 0x0043: return EP154_200x200_4GRAY;
+        case 0x0044: return EP42B_400x300_4GRAY;
+        case 0x0045: return EP397_800x480;
+        case 0x0046: return EP397_800x480_4GRAY;
+        case 0x0047: return EP368_792x528;
+        case 0x0048: return EP368_792x528_4GRAY;
+        case 0x0049: return EP213ZZ_122x250;
+        case 0x004A: return EP40_SPECTRA_400x600;
+        case 0x004B: return EP27_176x264;
+        case 0x004C: return EP27_176x264_4GRAY;
         default: return EP_PANEL_UNDEFINED;
     }
 }
@@ -312,6 +328,129 @@ bool waitforrefresh(int timeout){
     return false;
 }
 
+#ifdef TARGET_ESP32
+static bool s_wire_open_display_ready = false;
+static int8_t s_wire_sda_pin = -1;
+static int8_t s_wire_scl_pin = -1;
+static uint32_t s_wire_clock_hz = 0;
+
+static bool wireBeginForOpenDisplay(int sda, int scl, uint32_t hz) {
+    // Do not pinMode() before begin on ESP32 — periman must hand pins to the I2C driver.
+    if (Wire.begin(sda, scl, hz)) {
+        Wire.setClock(hz);
+        s_wire_sda_pin = (int8_t)sda;
+        s_wire_scl_pin = (int8_t)scl;
+        s_wire_clock_hz = hz;
+        s_wire_open_display_ready = true;
+        return true;
+    }
+    if (hz > 100000u && Wire.begin(sda, scl, 100000u)) {
+        writeSerial("NOTE: I2C fallback to 100kHz (SDA=GPIO" + String(sda) + " SCL=GPIO" + String(scl) + ")", true);
+        Wire.setClock(100000u);
+        s_wire_sda_pin = (int8_t)sda;
+        s_wire_scl_pin = (int8_t)scl;
+        s_wire_clock_hz = 100000u;
+        s_wire_open_display_ready = true;
+        return true;
+    }
+    writeSerial("ERROR: Wire.begin failed (SDA=GPIO" + String(sda) + " SCL=GPIO" + String(scl) + ")", true);
+    return false;
+}
+#endif
+
+static bool i2cDataBusValid(uint8_t bus_id) {
+    if (bus_id >= globalConfig.data_bus_count) {
+        return false;
+    }
+    const struct DataBus& bus = globalConfig.data_buses[bus_id];
+    return bus.bus_type == 0x01 && bus.pin_1 != 0xFF && bus.pin_2 != 0xFF;
+}
+
+bool openDisplayI2cBusConfigured(void) {
+    for (uint8_t i = 0; i < globalConfig.data_bus_count; i++) {
+        if (i2cDataBusValid(i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void invalidateOpenDisplayWire(void) {
+#ifdef TARGET_ESP32
+    if (s_wire_open_display_ready) {
+        Wire.end();
+    }
+    s_wire_open_display_ready = false;
+#endif
+}
+
+bool initOrRestoreWireForBus(uint8_t bus_id) {
+#ifdef TARGET_ESP32
+    if (bus_id == 0xFF) {
+        bus_id = 0;
+    }
+    if (!i2cDataBusValid(bus_id)) {
+        return false;
+    }
+    const struct DataBus& bus = globalConfig.data_buses[bus_id];
+    uint32_t hz = bus.bus_speed_hz ? bus.bus_speed_hz : 100000u;
+    int sda = (int)bus.pin_2;
+    int scl = (int)bus.pin_1;
+    if (s_wire_open_display_ready && s_wire_sda_pin == sda && s_wire_scl_pin == scl) {
+        return true;
+    }
+    if (s_wire_open_display_ready) {
+        Wire.end();
+        s_wire_open_display_ready = false;
+    }
+    if (!wireBeginForOpenDisplay(sda, scl, hz)) {
+        s_wire_open_display_ready = false;
+        return false;
+    }
+    return true;
+#else
+    (void)bus_id;
+    initOrRestoreWireForOpenDisplay();
+    return true;
+#endif
+}
+
+void initOrRestoreWireForOpenDisplay(void) {
+#ifdef TARGET_ESP32
+    if (globalConfig.data_bus_count > 0 && i2cDataBusValid(0)) {
+        (void)initOrRestoreWireForBus(0);
+        return;
+    }
+    if (!s_wire_open_display_ready) {
+        if (Wire.begin()) {
+            s_wire_open_display_ready = true;
+        }
+    }
+#else
+    if (globalConfig.data_bus_count > 0) {
+        const struct DataBus& bus = globalConfig.data_buses[0];
+        if (bus.bus_type == 0x01 && bus.pin_1 != 0xFF && bus.pin_2 != 0xFF) {
+            uint32_t hz = bus.bus_speed_hz ? bus.bus_speed_hz : 100000u;
+            pinMode(bus.pin_1, INPUT);
+            pinMode(bus.pin_2, INPUT);
+            if (bus.pullups & 0x01) {
+                pinMode(bus.pin_1, INPUT_PULLUP);
+            }
+            if (bus.pullups & 0x02) {
+                pinMode(bus.pin_2, INPUT_PULLUP);
+            }
+        }
+    }
+    Wire.begin();
+    if (globalConfig.data_bus_count > 0) {
+        const struct DataBus& bus = globalConfig.data_buses[0];
+        if (bus.bus_speed_hz > 0) {
+            Wire.setClock(bus.bus_speed_hz);
+        }
+    }
+#endif
+}
+
 void initDataBuses(){
     writeSerial("=== Initializing Data Buses ===", true);
     if(globalConfig.data_bus_count == 0){
@@ -327,46 +466,27 @@ void initDataBuses(){
                 continue;
             }
             uint32_t busSpeed = (bus->bus_speed_hz > 0) ? bus->bus_speed_hz : 100000;
-            #ifdef TARGET_ESP32
-            pinMode(bus->pin_1, INPUT);
-            pinMode(bus->pin_2, INPUT);
-            if(bus->pullups & 0x01){
-                pinMode(bus->pin_1, INPUT_PULLUP);
-            }
-            if(bus->pullups & 0x02){
-                pinMode(bus->pin_2, INPUT_PULLUP);
-            }
-            if(bus->pulldowns & 0x01){
-                pinMode(bus->pin_1, INPUT_PULLDOWN);
-            }
-            if(bus->pulldowns & 0x02){
-                pinMode(bus->pin_2, INPUT_PULLDOWN);
-            }
-            #endif
-            #ifdef TARGET_NRF
-            pinMode(bus->pin_1, INPUT);
-            pinMode(bus->pin_2, INPUT);
-            if(bus->pullups & 0x01){
-                pinMode(bus->pin_1, INPUT_PULLUP);
-            }
-            if(bus->pullups & 0x02){
-                pinMode(bus->pin_2, INPUT_PULLUP);
-            }
-            #endif
             if(i == 0){
                 #ifdef TARGET_ESP32
-                Wire.begin(bus->pin_2, bus->pin_1); // SDA, SCL
-                Wire.setClock(busSpeed);
+                initOrRestoreWireForOpenDisplay();
                 #endif
                 #ifdef TARGET_NRF
+                pinMode(bus->pin_1, INPUT);
+                pinMode(bus->pin_2, INPUT);
+                if(bus->pullups & 0x01){
+                    pinMode(bus->pin_1, INPUT_PULLUP);
+                }
+                if(bus->pullups & 0x02){
+                    pinMode(bus->pin_2, INPUT_PULLUP);
+                }
                 Wire.begin(); // Uses default I2C pins
                 Wire.setClock(busSpeed);
                 writeSerial("NOTE: nRF52840 using default I2C pins (config pins: SCL=" + String(bus->pin_1) + ", SDA=" + String(bus->pin_2) + ")", true);
                 #endif
                 writeSerial("I2C bus " + String(i) + " initialized: SCL=pin" + String(bus->pin_1) + ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz", true);
             } else {
-                writeSerial("WARNING: I2C bus " + String(i) + " configured but not initialized (only first bus supported)", true);
-                writeSerial("  SCL=pin" + String(bus->pin_1) + ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz", true);
+                writeSerial("I2C bus " + String(i) + " configured (init on demand): SCL=pin" + String(bus->pin_1) +
+                    ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz", true);
             }
         }
         else if(bus->bus_type == 0x02){
@@ -378,49 +498,6 @@ void initDataBuses(){
         }
     }
     writeSerial("=== Data Bus Initialization Complete ===", true);
-}
-
-#ifdef TARGET_ESP32
-static bool s_wire_open_display_ready = false;
-static int8_t s_wire_sda_pin = -1;
-static int8_t s_wire_scl_pin = -1;
-static uint32_t s_wire_clock_hz = 0;
-#endif
-
-void invalidateOpenDisplayWire(void) {
-#ifdef TARGET_ESP32
-    s_wire_open_display_ready = false;
-#endif
-}
-
-void initOrRestoreWireForOpenDisplay(void) {
-#ifdef TARGET_ESP32
-    if (globalConfig.data_bus_count > 0) {
-        const struct DataBus& bus = globalConfig.data_buses[0];
-        if (bus.bus_type == 0x01 && bus.pin_1 != 0xFF && bus.pin_2 != 0xFF) {
-            uint32_t hz = bus.bus_speed_hz ? bus.bus_speed_hz : 100000u;
-            int sda = (int)bus.pin_2;
-            int scl = (int)bus.pin_1;
-            if (s_wire_open_display_ready && s_wire_sda_pin == sda && s_wire_scl_pin == scl &&
-                s_wire_clock_hz == hz) {
-                return;
-            }
-            Wire.begin(sda, scl);
-            Wire.setClock(hz);
-            s_wire_sda_pin = (int8_t)sda;
-            s_wire_scl_pin = (int8_t)scl;
-            s_wire_clock_hz = hz;
-            s_wire_open_display_ready = true;
-            return;
-        }
-    }
-    if (!s_wire_open_display_ready) {
-        Wire.begin();
-        s_wire_open_display_ready = true;
-    }
-#else
-    Wire.begin();
-#endif
 }
 
 void initio(){
@@ -477,6 +554,7 @@ void initio(){
 
 void scanI2CDevices(){
     writeSerial("=== Scanning I2C Bus for Devices ===", true);
+    initOrRestoreWireForOpenDisplay();
     uint8_t deviceCount = 0;
     uint8_t foundDevices[128];
     for(uint8_t address = 0x08; address < 0x78; address++){
@@ -529,11 +607,15 @@ void initSensors(){
         else if(sensor->sensor_type == SENSOR_TYPE_SHT40){
             writeSerial("  SHT40 (I2C + MSD slot)", true);
         }
+        else if(sensor->sensor_type == SENSOR_TYPE_BQ27220){
+            writeSerial("  BQ27220 fuel gauge (MSD voltage + optional dynamic SOC/status bytes)", true);
+        }
         else{
             writeSerial("  Unknown sensor type 0x" + String(sensor->sensor_type, HEX), true);
         }
     }
     initSht40Sensors();
+    initBq27220Sensors();
     writeSerial("=== Sensor Initialization Complete ===", true);
 }
 
@@ -1117,19 +1199,20 @@ int getBitsPerPixel() {
 }
 
 float readBatteryVoltage() {
+    if (bq27220IsConfigured()) {
+        float gaugeV = bq27220BatteryVoltageVolts();
+        if (gaugeV >= 0.0f) {
+            return gaugeV;
+        }
+    }
     if (globalConfig.power_option.battery_sense_pin == 0xFF) return -1.0;
     uint8_t sensePin = globalConfig.power_option.battery_sense_pin;
     uint8_t enablePin = globalConfig.power_option.battery_sense_enable_pin;
     uint16_t scalingFactor = globalConfig.power_option.voltage_scaling_factor;
-    const bool enableInverted =
-        (globalConfig.power_option.battery_sense_flags & BATTERY_SENSE_FLAG_ENABLE_INVERTED) != 0;
-    const uint8_t enableLevel = enableInverted ? LOW : HIGH;
-    const uint8_t disableLevel = enableInverted ? HIGH : LOW;
-
     pinMode(sensePin, INPUT);
     if (enablePin != 0xFF) {
         pinMode(enablePin, OUTPUT);
-        digitalWrite(enablePin, enableLevel);
+        digitalWrite(enablePin, HIGH);
         delay(10);
     }
     const int numSamples = 10;
@@ -1140,12 +1223,7 @@ float readBatteryVoltage() {
     }
     uint32_t adcAverage = adcSum / numSamples;
     if (enablePin != 0xFF) {
-        digitalWrite(enablePin, disableLevel);
-    }
-    if (enableInverted) {
-#ifdef TARGET_NRF
-        nrf_gpio_cfg_default(sensePin);
-#endif
+        digitalWrite(enablePin, LOW);
     }
     if (scalingFactor > 0) return (adcAverage * scalingFactor) / (100000.0);
     return -1.0;
@@ -1166,11 +1244,17 @@ float readChipTemperature() {
 
 void updatemsdata(){
     pollSht40SensorsForMsd();
+    pollBq27220ForMsd();
     float batteryVoltage = readBatteryVoltage();
     float chipTemperature = readChipTemperature();
-    uint16_t batteryVoltageMv = (uint16_t)(batteryVoltage * 1000);
-    uint16_t batteryVoltage10mv = batteryVoltageMv / 10;
-    if (batteryVoltage10mv > 511) batteryVoltage10mv = 511;
+    uint16_t batteryVoltage10mv = 0;
+    if (batteryVoltage >= 0.0f) {
+        uint16_t batteryVoltageMv = (uint16_t)(batteryVoltage * 1000.0f);
+        batteryVoltage10mv = batteryVoltageMv / 10;
+        if (batteryVoltage10mv > 511) {
+            batteryVoltage10mv = 511;
+        }
+    }
     int16_t tempEncoded = (int16_t)((chipTemperature + 40.0f) * 2.0f);
     if (tempEncoded < 0) tempEncoded = 0;
     else if (tempEncoded > 255) tempEncoded = 255;
@@ -1192,7 +1276,7 @@ void updatemsdata(){
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     Bluefruit.Advertising.addName();
     Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, msd_payload, 16);
-    Bluefruit.Advertising.setInterval(256, 1600);
+    ble_nrf_apply_adv_interval();
     Bluefruit.Advertising.setFastTimeout(1);
     Bluefruit.Advertising.stop();
     Bluefruit.Advertising.start(0);
@@ -1658,6 +1742,128 @@ static void cleanup_partial_write_state(void) {
     }
 }
 
+static bool panel_skips_bbep_set_addr_window(void) {
+    return bbep.type == EP397_800x480 || bbep.type == EP397_800x480_4GRAY ||
+           bbep.type == EP426_800x480 || bbep.type == EP426_800x480_4GRAY;
+}
+
+static bool panel_uses_pixel_ram_x(BBEPDISP *pBBEP) {
+    return pBBEP->type == EP397_800x480 || pBBEP->type == EP397_800x480_4GRAY ||
+           pBBEP->type == EP426_800x480 || pBBEP->type == EP426_800x480_4GRAY;
+}
+
+static bool panel_uses_ep397_y_decrement(BBEPDISP *pBBEP) {
+    return pBBEP->type == EP397_800x480 || pBBEP->type == EP397_800x480_4GRAY;
+}
+
+static bool panel_uses_ep426_x_decrement(BBEPDISP *pBBEP) {
+    return pBBEP->type == EP426_800x480 || pBBEP->type == EP426_800x480_4GRAY;
+}
+
+static bool panel_skips_reinit_on_partial_refresh(BBEPDISP *pBBEP) {
+    return panel_uses_ep397_y_decrement(pBBEP) || panel_uses_ep426_x_decrement(pBBEP);
+}
+
+static void partial_set_ep397_ram_y(BBEPDISP *pBBEP, int ty, int cy) {
+    uint8_t uc[4];
+    int yLast = ty + cy - 1;
+    int ramYStart = (pBBEP->native_height - 1) - ty;
+    int ramYEnd = (pBBEP->native_height - 1) - yLast;
+
+    bbepWriteCmd(pBBEP, SSD1608_SET_RAMYPOS);
+    uc[0] = (uint8_t)(ramYStart & 0xff);
+    uc[1] = (uint8_t)(ramYStart >> 8);
+    uc[2] = (uint8_t)(ramYEnd & 0xff);
+    uc[3] = (uint8_t)(ramYEnd >> 8);
+    bbepWriteData(pBBEP, uc, 4);
+
+    bbepWriteCmd(pBBEP, SSD1608_SET_RAMYCOUNT);
+    uc[0] = (uint8_t)(ramYStart & 0xff);
+    uc[1] = (uint8_t)(ramYStart >> 8);
+    bbepWriteData(pBBEP, uc, 2);
+}
+
+static void partial_set_ep426_ram_y(BBEPDISP *pBBEP, int ty, int cy) {
+    uint8_t uc[4];
+    int yLast = ty + cy - 1;
+
+    // Match epd426_init_* 0x45 wire order: Y start in bytes 0-1, Y end in bytes 2-3.
+    bbepWriteCmd(pBBEP, SSD1608_SET_RAMYPOS);
+    uc[0] = (uint8_t)ty;
+    uc[1] = (uint8_t)(ty >> 8);
+    uc[2] = (uint8_t)yLast;
+    uc[3] = (uint8_t)(yLast >> 8);
+    bbepWriteData(pBBEP, uc, 4);
+
+    bbepWriteCmd(pBBEP, SSD1608_SET_RAMYCOUNT);
+    uc[0] = (uint8_t)ty;
+    uc[1] = (uint8_t)(ty >> 8);
+    bbepWriteData(pBBEP, uc, 2);
+}
+
+static void partial_set_pixel_ram_x(BBEPDISP *pBBEP, int x, int cx) {
+    uint8_t uc[4];
+    int px0 = x;
+    int px1 = x + cx - 1;
+    if (panel_uses_ep426_x_decrement(pBBEP)) {
+        px0 = (pBBEP->native_width - 1) - x;
+        px1 = (pBBEP->native_width - 1) - (x + cx - 1);
+    }
+
+    bbepWriteCmd(pBBEP, SSD1608_SET_RAMXPOS);
+    uc[0] = (uint8_t)(px0 & 0xff);
+    uc[1] = (uint8_t)((px0 >> 8) & 0xff);
+    uc[2] = (uint8_t)(px1 & 0xff);
+    uc[3] = (uint8_t)(px1 >> 8);
+    bbepWriteData(pBBEP, uc, 4);
+
+    bbepWriteCmd(pBBEP, SSD1608_SET_RAMXCOUNT);
+    uc[0] = (uint8_t)(px0 & 0xff);
+    uc[1] = (uint8_t)(px0 >> 8);
+    bbepWriteData(pBBEP, uc, 2);
+}
+
+static void partial_set_addr_window(BBEPDISP *pBBEP, int x, int y, int cx, int cy) {
+    if (!panel_skips_bbep_set_addr_window()) {
+        bbepSetAddrWindow(pBBEP, x, y, cx, cy);
+        return;
+    }
+    if (!pBBEP) return;
+
+    uint8_t uc[4];
+    int ty = y;
+    cx = (cx + 7) & 0xfff8;
+
+    if (panel_uses_pixel_ram_x(pBBEP)) {
+        partial_set_pixel_ram_x(pBBEP, x, cx);
+    } else {
+        int tx = x / 8;
+        bbepWriteCmd(pBBEP, SSD1608_SET_RAMXPOS);
+        uc[0] = (uint8_t)tx;
+        uc[1] = (uint8_t)(tx + ((cx - 1) >> 3));
+        bbepWriteData(pBBEP, uc, 2);
+        bbepCMD2(pBBEP, SSD1608_SET_RAMXCOUNT, (uint8_t)tx);
+    }
+
+    if (panel_uses_ep426_x_decrement(pBBEP)) {
+        partial_set_ep426_ram_y(pBBEP, ty, cy);
+    } else if (panel_uses_ep397_y_decrement(pBBEP)) {
+        partial_set_ep397_ram_y(pBBEP, ty, cy);
+    } else {
+        bbepWriteCmd(pBBEP, SSD1608_SET_RAMYPOS);
+        uc[0] = (uint8_t)ty;
+        uc[1] = (uint8_t)(ty >> 8);
+        uc[2] = (uint8_t)(ty + cy - 1);
+        uc[3] = (uint8_t)((ty + cy - 1) >> 8);
+        bbepWriteData(pBBEP, uc, 4);
+        uc[0] = (uint8_t)ty;
+        uc[1] = (uint8_t)(ty >> 8);
+        bbepWriteCmd(pBBEP, SSD1608_SET_RAMYCOUNT);
+        bbepWriteData(pBBEP, uc, 2);
+    }
+    bbepWaitBusy(pBBEP);
+}
+
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
     if (partialCtx.compressed) {
         if (len > UINT32_MAX - partialCtx.bytes_received) return false;
@@ -1744,7 +1950,7 @@ static bool partial_write_stream_bytes(uint8_t* data, uint32_t len) {
         uint8_t targetPlane = partialCtx.bytes_written < partialCtx.plane_size ? PLANE_1 : PLANE_0;
         if (partialCtx.current_plane != targetPlane) {
             if (targetPlane == PLANE_0 && partialCtx.bytes_written != partialCtx.plane_size) return false;
-            bbepSetAddrWindow(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
+            partial_set_addr_window(&bbep, partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
             bbepStartWrite(&bbep, targetPlane);
             partialCtx.current_plane = targetPlane;
         }
@@ -1759,6 +1965,23 @@ static bool partial_write_stream_bytes(uint8_t* data, uint32_t len) {
     return true;
 }
 
+static bool partial_trigger_refresh(int refreshMode) {
+    if (refreshMode < 0 || refreshMode > 3) refreshMode = REFRESH_PARTIAL;
+    if (panel_skips_reinit_on_partial_refresh(&bbep)) {
+        if (panel_uses_ep397_y_decrement(&bbep)) {
+            static const uint8_t u8CMDz3[4] = {0xf7, 0xd7, 0xff, 0};
+            bbepCMD2(&bbep, SSD1608_DISP_CTRL2, u8CMDz3[refreshMode]);
+        } else {
+            static const uint8_t u8CMD[4] = {0xf7, 0xc7, 0xff, 0xc0};
+            bbepCMD2(&bbep, SSD1608_DISP_CTRL2, u8CMD[refreshMode]);
+        }
+        bbepWriteCmd(&bbep, SSD1608_MASTER_ACTIVATE);
+        return waitforrefresh(60);
+    }
+    bbepRefresh(&bbep, refreshMode);
+    return waitforrefresh(60);
+}
+
 static void partial_prepare_panel_ram(void) {
     writeSerial("EPD partial start: auto-fill panel RAM", true);
     if (!displayPowerState) {
@@ -1766,7 +1989,8 @@ static void partial_prepare_panel_ram(void) {
     }
     bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
     bbepWakeUp(&bbep);
-    bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    const uint8_t* initSeq = bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull;
+    bbepSendCMDSequence(&bbep, initSeq);
     bbepFill(&bbep, BBEP_WHITE, PLANE_1);
     bbepFill(&bbep, BBEP_WHITE, PLANE_0);
 }
@@ -1784,8 +2008,7 @@ static bool partial_write_to_panel(int refreshMode) {
 
     if (partialCtx.bytes_written != partialCtx.expected_stream_size) return false;
     delay(20);
-    bbepRefresh(&bbep, refreshMode);
-    bool refreshSuccess = waitforrefresh(60);
+    bool refreshSuccess = partial_trigger_refresh(refreshMode);
     bbepSleep(&bbep, 1);
     delay(50);
     displayPowerState = false;

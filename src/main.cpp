@@ -58,13 +58,16 @@ void setup() {
     writeSerial("Starting setup...");
     full_config_init();
     initio();
+#ifdef TARGET_NRF
+    // SoftDevice must start before display/SPI; advertising starts after boot screen.
+    ble_nrf_stack_init();
+#endif
     initDisplay();
     writeSerial("Display initialized");
 #ifdef TARGET_ESP32
     // Full BLE after display: ESP32 queues commands for loop() until setup returns.
     ble_init();
 #elif defined(TARGET_NRF)
-    ble_nrf_stack_init();
     ble_nrf_advertising_start();
 #endif
     #ifdef TARGET_ESP32
@@ -211,6 +214,7 @@ void loop() {
     else{
         idleDelay(500);
     }
+    ble_nrf_advertising_tick();
     processButtonEvents();
     processTouchInput();
     writeSerial("Loop end: " + String(millis() / 100));
@@ -223,6 +227,9 @@ void idleDelay(uint32_t delayMs) {
     const uint32_t CHECK_INTERVAL_MS = 100;
     uint32_t remainingDelay = delayMs;
     while (remainingDelay > 0) {
+#ifdef TARGET_NRF
+        ble_nrf_advertising_tick();
+#endif
         processButtonEvents();
         processTouchInput();
         processLedFlash();
@@ -316,7 +323,8 @@ static void configureDisplayPinsLowPower() {
         pinMode(d.busy_pin, INPUT);
     }
 
-    if (!(globalConfig.system_config.device_flags & DEVICE_FLAG_BATTERY_LATCH)) {
+    if (!(globalConfig.system_config.device_flags &
+          (DEVICE_FLAG_BATTERY_LATCH | DEVICE_FLAG_PWR_LATCH_DFF))) {
         const uint8_t auxPins[] = {
             globalConfig.system_config.pwr_pin_2,
             globalConfig.system_config.pwr_pin_3,
@@ -401,12 +409,16 @@ void pwrmgm(bool onoff){
         } else {
             delay(200);
         }
+        initOrRestoreWireForOpenDisplay();
     } else {
         if (!seeed_driver_spi) {
             SPI.end();
         }
-        Wire.end();
-        invalidateOpenDisplayWire();
+        // Keep I2C alive when sensors/touch use data_bus[0] (e.g. reTerminal MISC_I2C on GPIO0/1).
+        if (!openDisplayI2cBusConfigured()) {
+            Wire.end();
+            invalidateOpenDisplayWire();
+        }
         configureDisplayPinsLowPower();
         if (globalConfig.system_config.pwr_pin != 0xFF) {
             digitalWrite(globalConfig.system_config.pwr_pin, LOW);
@@ -465,6 +477,60 @@ void ws_pp_init(){
     digitalWrite(45, HIGH);
     writeSerial("Photo Printer initialized");
 }
+
+#ifdef TARGET_NRF
+void powerDownExternalFlashFromConfig(void) {
+    if (!globalConfig.loaded || globalConfig.flash_config_count == 0) {
+        return;
+    }
+    const FlashConfig* flashCfg = nullptr;
+    for (uint8_t i = 0; i < globalConfig.flash_config_count; i++) {
+        if ((globalConfig.flash_configs[i].flags & FLASH_CONFIG_FLAG_ENABLED) != 0) {
+            flashCfg = &globalConfig.flash_configs[i];
+            break;
+        }
+    }
+    if (flashCfg == nullptr) {
+        return;
+    }
+    const uint8_t mosiPin = flashCfg->mosi_pin;
+    const uint8_t sckPin = flashCfg->sck_pin;
+    const uint8_t csPin = flashCfg->cs_pin;
+    if (mosiPin == 0xFF || sckPin == 0xFF || csPin == 0xFF) {
+        writeSerial("Flash config: invalid MOSI/SCK/CS pins", true);
+        return;
+    }
+    writeSerial("Flash config: deep sleep MOSI=" + String(mosiPin) + " SCK=" + String(sckPin) + " CS=" + String(csPin), true);
+
+    pinMode(mosiPin, OUTPUT);
+    pinMode(sckPin, OUTPUT);
+    pinMode(csPin, OUTPUT);
+    digitalWrite(sckPin, LOW);
+    digitalWrite(csPin, LOW);
+
+    uint8_t cmd = 0xB9;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+        digitalWrite(mosiPin, (cmd & 0x80) ? HIGH : LOW);
+        cmd <<= 1;
+        delayMicroseconds(1);
+        digitalWrite(sckPin, HIGH);
+        delayMicroseconds(1);
+        digitalWrite(sckPin, LOW);
+    }
+    digitalWrite(csPin, HIGH);
+    delayMicroseconds(30);
+
+    // Park like powerDownExternalFlash: CLK/MOSI LOW, CS HIGH (deselected, deep sleep).
+    pinMode(mosiPin, OUTPUT);
+    digitalWrite(mosiPin, LOW);
+    pinMode(sckPin, OUTPUT);
+    digitalWrite(sckPin, LOW);
+    pinMode(csPin, OUTPUT);
+    digitalWrite(csPin, HIGH);
+}
+#else
+void powerDownExternalFlashFromConfig(void) {}
+#endif
 
 bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, uint8_t csPin, uint8_t wpPin, uint8_t holdPin) {
     #ifdef TARGET_NRF

@@ -1,10 +1,8 @@
 #pragma once
 
-// Soft battery-latch / power-button support for devices that gate their own
-// power rail through a MCU-controlled MOSFET. Enabled at runtime by the
-// DEVICE_FLAG_BATTERY_LATCH device_flags bit; the latch pin comes from
-// system_config.pwr_pin_2 and the optional active-low shutdown button from
-// pwr_pin_3 (0xFF = none).
+// Power-latch support (ESP32). DEVICE_FLAG_BATTERY_LATCH (bit 3): MOSFET hold on
+// pwr_pin_2 + optional long-press shutdown on pwr_pin_3. DEVICE_FLAG_PWR_LATCH_DFF
+// (bit 4): 74AHC1G79 D-FF; pwr_pin_2=D, pwr_pin_3=CP; release via command 0x0052 or binary_inputs power_off_flags
 //
 // All functions are no-ops on non-ESP32 targets and when the flag is clear, so
 // callers in shared code need no guards.
@@ -21,3 +19,9 @@ void powerButtonPoll();
 // device retains power and can wake itself. Call immediately before
 // esp_deep_sleep_start().
 void powerLatchHoldForSleep();
+
+// Release 74AHC1G79 D-FF latch (pwr_latch_dff only). Used by command 0x0052.
+bool powerLatchDffConfigured(void);
+bool powerLatchMosfetConfigured(void);
+void powerLatchPowerOff();
+void powerLatchTriggerOff();
