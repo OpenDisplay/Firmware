@@ -232,16 +232,16 @@ bool writeBootScreenWithQr() {
     const uint16_t w = globalConfig.displays[0].pixel_width;
     const uint16_t h = globalConfig.displays[0].pixel_height;
     const uint8_t colorScheme = globalConfig.displays[0].color_scheme;
-    const bool useBitplanes = (colorScheme == 1 || colorScheme == 2);
+    const bool useBitplanes = (colorScheme == COLOR_SCHEME_BWR || colorScheme == COLOR_SCHEME_BWY);
     const int bitsPerPixel = getBitsPerPixel();
     int pitch;
     uint8_t whiteValue;
     if (bitsPerPixel == 4) {
         pitch = w / 2;
-        whiteValue = 0xFF;
+        whiteValue = 0x11; // for 4bpp spectra 6 panel, white is 0x11.  It MAY be 0xFF for other panels, so in production need to VERIFY THIS!!!
     } else if (bitsPerPixel == 2) {
         pitch = (w + 3) / 4;
-        whiteValue = (colorScheme == 5) ? 0xFF : 0x55;
+        whiteValue = (colorScheme == COLOR_SCHEME_GRAY4) ? 0xFF : 0x55;
     } else {
         pitch = (w + 7) / 8;
         whiteValue = 0xFF;

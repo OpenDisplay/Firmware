@@ -72,6 +72,14 @@ struct PowerOption {
 #define PANEL_IC_SEEED_ED103TC2_1872X1404_4GRAY 3001u
 
 // display.color_scheme (config.yaml); use with matching panel (e.g. gray16 + panel_ic 3001).
+// add more entries to match the ColorScheme enum from bb_epaper
+#define COLOR_SCHEME_MONO 0u
+#define COLOR_SCHEME_BWR 1u
+#define COLOR_SCHEME_BWY 2u
+#define COLOR_SCHEME_BWRY 3u
+#define COLOR_SCHEME_BWGBRY 4u
+#define COLOR_SCHEME_GRAY4 5u
+#define COLOR_SCHEME_GRAY8 7u
 #define COLOR_SCHEME_GRAY16 6u
 
 // display.transmission_modes (config.yaml bitfield).
