@@ -115,31 +115,39 @@ static inline void setBootPixelBlack(uint8_t* row, uint16_t x, int pitch, int bi
     (void)colorScheme;
 }
 
-static void drawBootTextRow(uint8_t* row, uint16_t y, uint16_t x0, uint16_t y0, const char* s, uint8_t scale, uint16_t displayW, int pitch, int bitsPerPixel, uint8_t colorScheme, int maxX) {
-    if (!s || scale == 0) return;
-    uint16_t clipW = displayW;
-    if (maxX >= 0 && (uint16_t)maxX < clipW) clipW = (uint16_t)maxX;
+static bool bootTextPixelBlack(uint16_t lx, uint16_t ly,
+                               uint16_t x0, uint16_t y0,
+                               const char* s, uint8_t scale,
+                               uint16_t w_log, int maxX) {
+    if (!s || scale == 0) return false;
+    uint16_t clipRight = w_log;
+    if (maxX >= 0 && (uint16_t)maxX < clipRight) clipRight = (uint16_t)maxX;
+    if (lx >= clipRight || lx < x0) return false;
+    if (ly < y0 || ly >= (uint16_t)(y0 + 7u * scale)) return false;
+    uint8_t gy = (uint8_t)((ly - y0) / scale);
     uint16_t cursor = x0;
     for (const char* p = s; *p; p++) {
-        const uint8_t* g = bootGlyph(*p);
-        for (uint8_t col = 0; col < 5; col++) {
-            uint8_t bits = g[col];
-            for (uint8_t gy = 0; gy < 7; gy++) {
-                if (((bits >> gy) & 1) == 0) continue;
-                uint16_t py = (uint16_t)(y0 + gy * scale);
-                if (y < py || y >= (uint16_t)(py + scale)) continue;
-                uint16_t px = (uint16_t)(cursor + col * scale);
-                for (uint8_t sx = 0; sx < scale; sx++) {
-                    for (uint8_t sy = 0; sy < scale; sy++) {
-                        if (y == (uint16_t)(py + sy) && (uint16_t)(px + sx) < clipW) {
-                            setBootPixelBlack(row, (uint16_t)(px + sx), pitch, bitsPerPixel, colorScheme);
-                        }
-                    }
-                }
-            }
+        uint16_t charEnd  = (uint16_t)(cursor + 5u * scale);
+        uint16_t nextCursor = (uint16_t)(cursor + 6u * scale);
+        if (lx < nextCursor) {
+            if (lx >= charEnd) return false;  // inter-character gap
+            uint8_t col = (uint8_t)((lx - cursor) / scale);
+            return ((bootGlyph(*p)[col] >> gy) & 1) != 0;
         }
-        cursor = (uint16_t)(cursor + 6 * scale);
+        cursor = nextCursor;
     }
+    return false;
+}
+
+static bool bootQrPixelBlack(uint16_t lx, uint16_t ly,
+                              int qrX, int qrY, int qrPx, int modulePx,
+                              uint8_t quiet, uint8_t qrSize, QRCode* qr) {
+    if (qrX < 0 || lx < (uint16_t)qrX || lx >= (uint16_t)(qrX + qrPx)) return false;
+    if (qrY < 0 || ly < (uint16_t)qrY || ly >= (uint16_t)(qrY + qrPx)) return false;
+    int16_t mx = (int16_t)((lx - (uint16_t)qrX) / (uint16_t)modulePx) - (int16_t)quiet;
+    int16_t my = (int16_t)((ly - (uint16_t)qrY) / (uint16_t)modulePx) - (int16_t)quiet;
+    if (mx < 0 || my < 0 || mx >= (int16_t)qrSize || my >= (int16_t)qrSize) return false;
+    return qrcode_getModule(qr, (uint8_t)mx, (uint8_t)my);
 }
 
 static uint16_t bootTextWidth(const char* s, uint8_t scale) {
@@ -231,6 +239,10 @@ static void writeGray4PlaneRow(const uint8_t* row2bpp, int pitch2bpp, int planeP
 bool writeBootScreenWithQr() {
     const uint16_t w = globalConfig.displays[0].pixel_width;
     const uint16_t h = globalConfig.displays[0].pixel_height;
+    const uint8_t rotation = globalConfig.displays[0].rotation; // 0=0°,1=90°,2=180°,3=270°
+    const bool is90or270 = (rotation == 1 || rotation == 3);
+    const uint16_t w_log = is90or270 ? h : w;  // logical (user-visible) width
+    const uint16_t h_log = is90or270 ? w : h;  // logical (user-visible) height
     const uint8_t colorScheme = globalConfig.displays[0].color_scheme;
     const bool useBitplanes = (colorScheme == COLOR_SCHEME_BWR || colorScheme == COLOR_SCHEME_BWY);
     const int bitsPerPixel = getBitsPerPixel();
@@ -312,11 +324,11 @@ bool writeBootScreenWithQr() {
         bool layoutOk = false;
         int tryScale;
 
-        for (tryScale = (w >= 400 && h >= 300) ? 2 : 1; tryScale >= 1 && !layoutOk; tryScale--) {
+        for (tryScale = (w_log >= 400 && h_log >= 300) ? 2 : 1; tryScale >= 1 && !layoutOk; tryScale--) {
             scaleText = tryScale;
             pad = 6 * scaleText;
             maxTextW = bootMaxTextWidth(bootLines, 5, scaleText);
-            layoutOk = bootLayoutFit(w, h, scaleText, pad, (int)qrModules, &modulePx, &qrPx, &qrRight, &qrX,
+            layoutOk = bootLayoutFit(w_log, h_log, scaleText, pad, (int)qrModules, &modulePx, &qrPx, &qrRight, &qrX,
                                      &qrY, &availW, &textY, maxTextW);
         }
         if (!layoutOk) {
@@ -325,10 +337,10 @@ bool writeBootScreenWithQr() {
             modulePx = 1;
             qrPx = modulePx * (int)qrModules;
             qrRight = false;
-            qrX = ((int)w - qrPx) / 2;
-            qrY = (int)h - pad - qrPx;
+            qrX = ((int)w_log - qrPx) / 2;
+            qrY = (int)h_log - pad - qrPx;
             if (qrY < pad) qrY = pad;
-            availW = (int)w - pad * 2;
+            availW = (int)w_log - pad * 2;
             textY = pad;
         }
     }
@@ -338,9 +350,9 @@ bool writeBootScreenWithQr() {
     uint16_t fW = bootTextWidth(fwLine, (uint8_t)scaleText);
     uint16_t k1W = bootTextWidth(k1, (uint8_t)scaleText);
     uint16_t k2W = bootTextWidth(k2, (uint8_t)scaleText);
-    int textOriginX = qrRight ? pad : ((int)w - availW) / 2;
+    int textOriginX = qrRight ? pad : ((int)w_log - availW) / 2;
     if (textOriginX < pad) textOriginX = pad;
-    int textMaxX = qrRight ? (qrX - pad) : (int)w;
+    int textMaxX = qrRight ? (qrX - pad) : (int)w_log;
     int domX = textOriginX + ((availW - (int)dW) / 2);
     int nameX = textOriginX + ((availW - (int)nW) / 2);
     int fwX = textOriginX + ((availW - (int)fW) / 2);
@@ -376,34 +388,35 @@ bool writeBootScreenWithQr() {
         bbepSetAddrWindow(&bbep, 0, 0, w, h);
         bbepStartWrite(&bbep, targetPlane);
 #endif
-        for (uint16_t y = 0; y < h; y++) {
+        const int ls = bootLineStep(scaleText);
+        const uint16_t domY  = (uint16_t)textY;
+        const uint16_t nameY = (uint16_t)(textY + ls);
+        const uint16_t fwY   = (uint16_t)(textY + ls * 2);
+        const uint16_t k1Y   = (uint16_t)(textY + ls * 3);
+        const uint16_t k2Y   = (uint16_t)(textY + ls * 4);
+        for (uint16_t y_native = 0; y_native < h; y_native++) {
             memset(row, whiteValue, pitch);
-            drawBootTextRow(row, y, (uint16_t)domX, (uint16_t)textY, domainLine, (uint8_t)scaleText, w, pitch, bitsPerPixel, colorScheme, textMaxX);
-            drawBootTextRow(row, y, (uint16_t)nameX, (uint16_t)(textY + bootLineStep(scaleText)), nameLine, (uint8_t)scaleText, w, pitch, bitsPerPixel, colorScheme, textMaxX);
-            drawBootTextRow(row, y, (uint16_t)fwX, (uint16_t)(textY + bootLineStep(scaleText) * 2), fwLine, (uint8_t)scaleText, w, pitch, bitsPerPixel, colorScheme, textMaxX);
-            drawBootTextRow(row, y, (uint16_t)k1X, (uint16_t)(textY + bootLineStep(scaleText) * 3), k1, (uint8_t)scaleText, w, pitch, bitsPerPixel, colorScheme, textMaxX);
-            drawBootTextRow(row, y, (uint16_t)k2X, (uint16_t)(textY + bootLineStep(scaleText) * 4), k2, (uint8_t)scaleText, w, pitch, bitsPerPixel, colorScheme, textMaxX);
-
-            if (y >= (uint16_t)qrY && y < (uint16_t)(qrY + qrPx)) {
-                uint16_t localY = (uint16_t)(y - qrY);
-                uint16_t my = (uint16_t)(localY / modulePx);
-                if (my < qrModules) {
-                    int16_t qy = (int16_t)my - quiet;
-                    for (uint16_t mx = 0; mx < qrModules; mx++) {
-                        int16_t qx = (int16_t)mx - quiet;
-                        bool on = false;
-                        if (qx >= 0 && qy >= 0 && qx < qrSize && qy < qrSize) on = qrcode_getModule(&qr, (uint8_t)qx, (uint8_t)qy);
-                        if (!on) continue;
-                        uint16_t px0 = (uint16_t)(qrX + mx * modulePx);
-                        for (uint16_t px = px0; px < (uint16_t)(px0 + modulePx) && px < w; px++) {
-                            setBootPixelBlack(row, px, pitch, bitsPerPixel, colorScheme);
-                        }
-                    }
+            for (uint16_t x_native = 0; x_native < w; x_native++) {
+                // Map native pixel to logical (user-visible) coordinates
+                uint16_t lx, ly;
+                switch (rotation) {
+                    case 1:  lx = y_native; ly = (uint16_t)(h_log - 1u - x_native); break; // 90° CW
+                    case 2:  lx = (uint16_t)(w_log - 1u - x_native); ly = (uint16_t)(h_log - 1u - y_native); break; // 180°
+                    case 3:  lx = (uint16_t)(w_log - 1u - y_native); ly = x_native; break; // 270° CW
+                    default: lx = x_native; ly = y_native; break;
                 }
+                bool black =
+                    bootTextPixelBlack(lx, ly, (uint16_t)domX,  domY,  domainLine, (uint8_t)scaleText, w_log, textMaxX) ||
+                    bootTextPixelBlack(lx, ly, (uint16_t)nameX, nameY, nameLine,   (uint8_t)scaleText, w_log, textMaxX) ||
+                    bootTextPixelBlack(lx, ly, (uint16_t)fwX,   fwY,   fwLine,     (uint8_t)scaleText, w_log, textMaxX) ||
+                    bootTextPixelBlack(lx, ly, (uint16_t)k1X,   k1Y,   k1,         (uint8_t)scaleText, w_log, textMaxX) ||
+                    bootTextPixelBlack(lx, ly, (uint16_t)k2X,   k2Y,   k2,         (uint8_t)scaleText, w_log, textMaxX) ||
+                    bootQrPixelBlack(lx, ly, qrX, qrY, qrPx, modulePx, quiet, qrSize, &qr);
+                if (black) setBootPixelBlack(row, x_native, pitch, bitsPerPixel, colorScheme);
             }
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
             if (seeed_driver_used()) {
-                seeed_gfx_boot_write_row(y, row, pitch);
+                seeed_gfx_boot_write_row(y_native, row, pitch);
             } else if (gray4Split) {
                 writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
             } else {
