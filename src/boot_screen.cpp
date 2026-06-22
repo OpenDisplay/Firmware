@@ -7,6 +7,10 @@
 #include <bb_epaper.h>
 #include "qr/qrcode.h"
 #include "display_service.h"
+#if __has_include("logo_bitmap.h")
+#include "logo_bitmap.h"
+#define BOOT_HAS_LOGO
+#endif
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
 #include "display_seeed_gfx.h"
 #endif
@@ -150,6 +154,18 @@ static bool bootQrPixelBlack(uint16_t lx, uint16_t ly,
     return qrcode_getModule(qr, (uint8_t)mx, (uint8_t)my);
 }
 
+static bool bootLogoPixelBlack(uint16_t lx, uint16_t ly,
+                               int logoX, int logoY,
+                               const uint8_t* bmp, int bmpW, int bmpH, int stride,
+                               int maxX) {
+    if ((int)lx < logoX || (int)lx >= logoX + bmpW) return false;
+    if ((int)lx >= maxX) return false;
+    if ((int)ly < logoY || (int)ly >= logoY + bmpH) return false;
+    int bx = (int)lx - logoX;
+    int by = (int)ly - logoY;
+    return (bmp[by * stride + bx / 8] >> (7 - (bx & 7))) & 1;
+}
+
 static uint16_t bootTextWidth(const char* s, uint8_t scale) {
     return (!s || scale == 0) ? 0 : (uint16_t)(strlen(s) * 6U * scale);
 }
@@ -158,8 +174,17 @@ static int bootLineStep(int scale) {
     return scale * 10;
 }
 
+static int bootLogoBlockH(int scale) {
+#ifdef BOOT_HAS_LOGO
+    int h = (scale >= 3) ? BOOT_LOGO_H_S3 : (scale >= 2) ? BOOT_LOGO_H_S2 : BOOT_LOGO_H_S1;
+    return scale * 4 + h;
+#else
+    return 0;
+#endif
+}
+
 static int bootBlockH(int scale) {
-    return 4 * bootLineStep(scale) + 7 * scale;
+    return 4 * bootLineStep(scale) + 7 * scale + bootLogoBlockH(scale);
 }
 
 static uint16_t bootMaxTextWidth(const char* const* lines, unsigned n, int scale) {
@@ -194,7 +219,6 @@ static bool bootLayoutFit(uint16_t w, uint16_t h, int scale, int pad, int qrModu
                 int qrX = (int)w - pad - qrPx;
                 int qrY = pad;
                 int textY = pad;
-                if (blockH < qrPx) textY = pad + (qrPx - blockH) / 2;
                 *modulePxOut = modulePx;
                 *qrPxOut = qrPx;
                 *qrRightOut = true;
@@ -324,10 +348,16 @@ bool writeBootScreenWithQr() {
         bool layoutOk = false;
         int tryScale;
 
-        for (tryScale = (w_log >= 400 && h_log >= 300) ? 2 : 1; tryScale >= 1 && !layoutOk; tryScale--) {
+        for (tryScale = (w_log >= 600 && h_log >= 400) ? 3 : (w_log >= 400 && h_log >= 300) ? 2 : 1; tryScale >= 1 && !layoutOk; tryScale--) {
             scaleText = tryScale;
             pad = 6 * scaleText;
             maxTextW = bootMaxTextWidth(bootLines, 5, scaleText);
+#ifdef BOOT_HAS_LOGO
+            {
+                int lw = (tryScale >= 3) ? BOOT_LOGO_W_S3 : (tryScale >= 2) ? BOOT_LOGO_W_S2 : BOOT_LOGO_W_S1;
+                if ((uint16_t)lw > maxTextW) maxTextW = (uint16_t)lw;
+            }
+#endif
             layoutOk = bootLayoutFit(w_log, h_log, scaleText, pad, (int)qrModules, &modulePx, &qrPx, &qrRight, &qrX,
                                      &qrY, &availW, &textY, maxTextW);
         }
@@ -364,6 +394,29 @@ bool writeBootScreenWithQr() {
     if (k1X < pad) k1X = pad;
     if (k2X < pad) k2X = pad;
 
+#ifdef BOOT_HAS_LOGO
+    const uint8_t* logoBmp;
+    int logoW, logoH, logoStride;
+    if (scaleText >= 3) {
+        logoBmp = BOOT_LOGO_BITMAP_S3; logoW = BOOT_LOGO_W_S3;
+        logoH = BOOT_LOGO_H_S3; logoStride = BOOT_LOGO_STRIDE_S3;
+    } else if (scaleText >= 2) {
+        logoBmp = BOOT_LOGO_BITMAP_S2; logoW = BOOT_LOGO_W_S2;
+        logoH = BOOT_LOGO_H_S2; logoStride = BOOT_LOGO_STRIDE_S2;
+    } else {
+        logoBmp = BOOT_LOGO_BITMAP_S1; logoW = BOOT_LOGO_W_S1;
+        logoH = BOOT_LOGO_H_S1; logoStride = BOOT_LOGO_STRIDE_S1;
+    }
+    int logoX = textOriginX + (availW - logoW) / 2;
+    int logoY = textY;
+    if (logoX < pad) logoX = pad;
+#endif
+    int textStartY = textY
+#ifdef BOOT_HAS_LOGO
+        + logoH + 4 * scaleText
+#endif
+        ;
+
     uint8_t* row = staticRowBuffer;
     // bb_epaper 4-gray (scheme 5) needs the packed 2bpp image split into two
     // 1-bit controller planes, so render the frame once per plane and
@@ -389,11 +442,11 @@ bool writeBootScreenWithQr() {
         bbepStartWrite(&bbep, targetPlane);
 #endif
         const int ls = bootLineStep(scaleText);
-        const uint16_t domY  = (uint16_t)textY;
-        const uint16_t nameY = (uint16_t)(textY + ls);
-        const uint16_t fwY   = (uint16_t)(textY + ls * 2);
-        const uint16_t k1Y   = (uint16_t)(textY + ls * 3);
-        const uint16_t k2Y   = (uint16_t)(textY + ls * 4);
+        const uint16_t domY  = (uint16_t)textStartY;
+        const uint16_t nameY = (uint16_t)(textStartY + ls);
+        const uint16_t fwY   = (uint16_t)(textStartY + ls * 2);
+        const uint16_t k1Y   = (uint16_t)(textStartY + ls * 3);
+        const uint16_t k2Y   = (uint16_t)(textStartY + ls * 4);
         for (uint16_t y_native = 0; y_native < h; y_native++) {
             memset(row, whiteValue, pitch);
             for (uint16_t x_native = 0; x_native < w; x_native++) {
@@ -411,7 +464,11 @@ bool writeBootScreenWithQr() {
                     bootTextPixelBlack(lx, ly, (uint16_t)fwX,   fwY,   fwLine,     (uint8_t)scaleText, w_log, textMaxX) ||
                     bootTextPixelBlack(lx, ly, (uint16_t)k1X,   k1Y,   k1,         (uint8_t)scaleText, w_log, textMaxX) ||
                     bootTextPixelBlack(lx, ly, (uint16_t)k2X,   k2Y,   k2,         (uint8_t)scaleText, w_log, textMaxX) ||
-                    bootQrPixelBlack(lx, ly, qrX, qrY, qrPx, modulePx, quiet, qrSize, &qr);
+                    bootQrPixelBlack(lx, ly, qrX, qrY, qrPx, modulePx, quiet, qrSize, &qr)
+#ifdef BOOT_HAS_LOGO
+                    || bootLogoPixelBlack(lx, ly, logoX, logoY, logoBmp, logoW, logoH, logoStride, textMaxX)
+#endif
+                    ;
                 if (black) setBootPixelBlack(row, x_native, pitch, bitsPerPixel, colorScheme);
             }
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
