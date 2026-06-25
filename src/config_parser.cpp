@@ -677,6 +677,11 @@ void printConfigSummary(){
         writeSerial("  Invert: 0x" + String(globalConfig.binary_inputs[i].invert, HEX));
         writeSerial("  Pullups: 0x" + String(globalConfig.binary_inputs[i].pullups, HEX));
         writeSerial("  Pulldowns: 0x" + String(globalConfig.binary_inputs[i].pulldowns, HEX));
+        if (globalConfig.binary_inputs[i].input_type == 3) {
+            writeSerial("  ADC Ladder: count=" + String(globalConfig.binary_inputs[i].reserved[0]) +
+                        " idBase=" + String(globalConfig.binary_inputs[i].reserved[1]) +
+                        " byteIdx=" + String(globalConfig.binary_inputs[i].button_data_byte_index));
+        }
         writeSerial("");
     }
     writeSerial("--- Touch Controllers (" + String(globalConfig.touch_controller_count) + ") ---");
