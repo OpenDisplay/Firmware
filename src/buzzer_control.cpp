@@ -168,3 +168,24 @@ void handleBuzzerActivate(uint8_t* data, uint16_t len) {
     uint8_t ok[] = {0x00, 0x77, 0x00, 0x00};
     sendResponse(ok, sizeof(ok));
 }
+
+void passiveBuzzerPowerOffAlert(void) {
+    const PassiveBuzzerConfig* b = nullptr;
+    for (uint8_t i = 0; i < globalConfig.passive_buzzer_count; i++) {
+        const uint8_t pin = globalConfig.passive_buzzers[i].drive_pin;
+        if (pin != 0 && pin != 0xFF) {
+            b = &globalConfig.passive_buzzers[i];
+            break;
+        }
+    }
+    if (!b) {
+        return;
+    }
+    const uint32_t hz = buzzer_index_to_hz(128);
+    buzzer_set_enable(b, true);
+    buzzer_drive_tone_sw(b, hz, 80);
+    delay(80);
+    buzzer_drive_tone_sw(b, hz, 80);
+    buzzer_set_enable(b, false);
+    buzzer_drive_off(b);
+}

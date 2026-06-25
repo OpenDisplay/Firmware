@@ -68,6 +68,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_XIAOINIT     (1 << 1)  // Bit 1: Call xiaoinit() after config load (nRF52840 only)
 #define DEVICE_FLAG_WS_PP_INIT   (1 << 2)  // Bit 2: Call ws_pp_init() after config load (Waveshare Photo Printer)
 #define DEVICE_FLAG_BATTERY_LATCH (1 << 3) // Bit 3: Self-holding battery latch on pwr_pin_2; optional active-low long-press shutdown button on pwr_pin_3
+#define DEVICE_FLAG_PWR_LATCH_DFF (1 << 4) // Bit 4: 74AHC1G79 D-FF latch; pwr_pin_2=D, pwr_pin_3=CP; release via command 0x0052
 
 #ifdef TARGET_NRF
 #include <bluefruit.h>
@@ -131,7 +132,6 @@ uint8_t msd_payload[16] = {0};  // Manufacturer Specific Data payload (public, u
 struct ButtonState {
     uint8_t button_id;          // Button ID (0-7, from instance_number + pin offset)
     uint8_t press_count;         // Press count (0-15)
-    volatile uint32_t last_press_time;    // Timestamp of last press (millis, updated in ISR)
     volatile uint8_t current_state;       // Current button state (0=released, 1=pressed, updated in ISR)
     uint8_t byte_index;          // Byte index in dynamicreturndata
     uint8_t pin;                 // GPIO pin number
@@ -194,6 +194,7 @@ bool displayPowerState = false;  // Track display power state (true = powered on
 bool waitforrefresh(int timeout);
 void pwrmgm(bool onoff);
 bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, uint8_t csPin, uint8_t wpPin, uint8_t holdPin);
+void powerDownExternalFlashFromConfig(void);
 void xiaoinit();
 void ws_pp_init();
 void writeSerial(String message, bool newLine = true);

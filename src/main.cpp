@@ -214,6 +214,7 @@ void loop() {
     else{
         idleDelay(500);
     }
+    ble_nrf_advertising_tick();
     processButtonEvents();
     processTouchInput();
     writeSerial("Loop end: " + String(millis() / 100));
@@ -226,6 +227,9 @@ void idleDelay(uint32_t delayMs) {
     const uint32_t CHECK_INTERVAL_MS = 100;
     uint32_t remainingDelay = delayMs;
     while (remainingDelay > 0) {
+#ifdef TARGET_NRF
+        ble_nrf_advertising_tick();
+#endif
         processButtonEvents();
         processTouchInput();
         processLedFlash();
@@ -304,6 +308,35 @@ void enterDeepSleep() {
 }
 #endif
 
+// Panel rail is cut after this — drive control lines LOW; BUSY stays an input.
+static void configureDisplayPinsLowPower() {
+    const DisplayConfig& d = globalConfig.displays[0];
+    const uint8_t pins[] = {
+        d.cs_pin, d.clk_pin, d.data_pin, d.dc_pin, d.reset_pin,
+    };
+    for (uint8_t pin : pins) {
+        if (pin == 0xFF) continue;
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    }
+    if (d.busy_pin != 0xFF) {
+        pinMode(d.busy_pin, INPUT);
+    }
+
+    if (!(globalConfig.system_config.device_flags &
+          (DEVICE_FLAG_BATTERY_LATCH | DEVICE_FLAG_PWR_LATCH_DFF))) {
+        const uint8_t auxPins[] = {
+            globalConfig.system_config.pwr_pin_2,
+            globalConfig.system_config.pwr_pin_3,
+        };
+        for (uint8_t pin : auxPins) {
+            if (pin == 0xFF || pin == 0) continue;
+            pinMode(pin, OUTPUT);
+            digitalWrite(pin, LOW);
+        }
+    }
+}
+
 void pwrmgm(bool onoff){
     if(globalConfig.display_count == 0){
         writeSerial("No display configured");
@@ -340,50 +373,57 @@ void pwrmgm(bool onoff){
 #else
     const bool seeed_driver_spi = false;
 #endif
-    if (!seeed_driver_spi) {
-        if(onoff){
-            pinMode(globalConfig.displays[0].reset_pin, OUTPUT);
-            pinMode(globalConfig.displays[0].cs_pin, OUTPUT);
-            if (globalConfig.displays[0].dc_pin != 0xFF) {
-                pinMode(globalConfig.displays[0].dc_pin, OUTPUT);
-            }
-            pinMode(globalConfig.displays[0].clk_pin, OUTPUT);
-            pinMode(globalConfig.displays[0].data_pin, OUTPUT);
-            delay(200);
-        }
-        else{
-            SPI.end();
-            Wire.end();
-            invalidateOpenDisplayWire();
-            pinMode(globalConfig.displays[0].reset_pin, INPUT);
-            pinMode(globalConfig.displays[0].cs_pin, INPUT);
-            if (globalConfig.displays[0].dc_pin != 0xFF) {
-                pinMode(globalConfig.displays[0].dc_pin, INPUT);
-            }
-            pinMode(globalConfig.displays[0].clk_pin, INPUT);
-            pinMode(globalConfig.displays[0].data_pin, INPUT);
-        }
-    } else {
-        if (onoff) {
-            delay(200);
+    const DisplayConfig& disp = globalConfig.displays[0];
+    if (onoff) {
+        if (globalConfig.system_config.pwr_pin != 0xFF) {
+            digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
+            delay(800);
         } else {
+            writeSerial("Power pin not set");
+        }
+        if (!seeed_driver_spi) {
+            if (disp.reset_pin != 0xFF) {
+                pinMode(disp.reset_pin, OUTPUT);
+                digitalWrite(disp.reset_pin, HIGH);
+            }
+            if (disp.cs_pin != 0xFF) {
+                pinMode(disp.cs_pin, OUTPUT);
+                digitalWrite(disp.cs_pin, HIGH);
+            }
+            if (disp.dc_pin != 0xFF) {
+                pinMode(disp.dc_pin, OUTPUT);
+                digitalWrite(disp.dc_pin, LOW);
+            }
+            if (disp.clk_pin != 0xFF) {
+                pinMode(disp.clk_pin, OUTPUT);
+                digitalWrite(disp.clk_pin, LOW);
+            }
+            if (disp.data_pin != 0xFF) {
+                pinMode(disp.data_pin, OUTPUT);
+                digitalWrite(disp.data_pin, LOW);
+            }
+            if (disp.busy_pin != 0xFF) {
+                pinMode(disp.busy_pin, INPUT);
+            }
+            delay(100);
+        } else {
+            delay(200);
+        }
+        initOrRestoreWireForOpenDisplay();
+    } else {
+        if (!seeed_driver_spi) {
             SPI.end();
+        }
+        // Keep I2C alive when sensors/touch use data_bus[0] (e.g. reTerminal MISC_I2C on GPIO0/1).
+        if (!openDisplayI2cBusConfigured()) {
             Wire.end();
             invalidateOpenDisplayWire();
         }
+        configureDisplayPinsLowPower();
+        if (globalConfig.system_config.pwr_pin != 0xFF) {
+            digitalWrite(globalConfig.system_config.pwr_pin, LOW);
+        }
     }
-    if(globalConfig.system_config.pwr_pin != 0xFF){
-    if(onoff){
-        digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
-        delay(200);
-    }
-    else{
-        digitalWrite(globalConfig.system_config.pwr_pin, LOW);
-    }
-    }
-    else{
-        writeSerial("Power pin not set");
-       }
 }
 
 void writeSerial(String message, bool newLine){
@@ -398,15 +438,11 @@ void writeSerial(String message, bool newLine){
 
 void xiaoinit(){
     powerDownExternalFlash(20,24,21,25,22,23);
-    pinMode(31, INPUT);
-    pinMode(14, INPUT);
+    //pinMode(31, INPUT);
+    //pinMode(14, INPUT);
     pinMode(13, OUTPUT);  //that actually does something
     digitalWrite(13, LOW);
-    pinMode(17, INPUT);
-    //buttons
-    pinMode(15, INPUT);
-    pinMode(3, INPUT);
-    pinMode(28, INPUT);
+    //pinMode(17, INPUT);
 }
 
 void ws_pp_init(){
@@ -441,6 +477,60 @@ void ws_pp_init(){
     digitalWrite(45, HIGH);
     writeSerial("Photo Printer initialized");
 }
+
+#ifdef TARGET_NRF
+void powerDownExternalFlashFromConfig(void) {
+    if (!globalConfig.loaded || globalConfig.flash_config_count == 0) {
+        return;
+    }
+    const FlashConfig* flashCfg = nullptr;
+    for (uint8_t i = 0; i < globalConfig.flash_config_count; i++) {
+        if ((globalConfig.flash_configs[i].flags & FLASH_CONFIG_FLAG_ENABLED) != 0) {
+            flashCfg = &globalConfig.flash_configs[i];
+            break;
+        }
+    }
+    if (flashCfg == nullptr) {
+        return;
+    }
+    const uint8_t mosiPin = flashCfg->mosi_pin;
+    const uint8_t sckPin = flashCfg->sck_pin;
+    const uint8_t csPin = flashCfg->cs_pin;
+    if (mosiPin == 0xFF || sckPin == 0xFF || csPin == 0xFF) {
+        writeSerial("Flash config: invalid MOSI/SCK/CS pins", true);
+        return;
+    }
+    writeSerial("Flash config: deep sleep MOSI=" + String(mosiPin) + " SCK=" + String(sckPin) + " CS=" + String(csPin), true);
+
+    pinMode(mosiPin, OUTPUT);
+    pinMode(sckPin, OUTPUT);
+    pinMode(csPin, OUTPUT);
+    digitalWrite(sckPin, LOW);
+    digitalWrite(csPin, LOW);
+
+    uint8_t cmd = 0xB9;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+        digitalWrite(mosiPin, (cmd & 0x80) ? HIGH : LOW);
+        cmd <<= 1;
+        delayMicroseconds(1);
+        digitalWrite(sckPin, HIGH);
+        delayMicroseconds(1);
+        digitalWrite(sckPin, LOW);
+    }
+    digitalWrite(csPin, HIGH);
+    delayMicroseconds(30);
+
+    // Park like powerDownExternalFlash: CLK/MOSI LOW, CS HIGH (deselected, deep sleep).
+    pinMode(mosiPin, OUTPUT);
+    digitalWrite(mosiPin, LOW);
+    pinMode(sckPin, OUTPUT);
+    digitalWrite(sckPin, LOW);
+    pinMode(csPin, OUTPUT);
+    digitalWrite(csPin, HIGH);
+}
+#else
+void powerDownExternalFlashFromConfig(void) {}
+#endif
 
 bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, uint8_t csPin, uint8_t wpPin, uint8_t holdPin) {
     #ifdef TARGET_NRF
@@ -517,12 +607,18 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
     jedecIdAfterStr.toUpperCase();
     writeSerial("JEDEC ID after: " + jedecIdAfterStr + " (byte[0]=0x" + String(jedecIdAfter[0], HEX) + ", byte[1]=0x" + String(jedecIdAfter[1], HEX) + ", byte[2]=0x" + String(jedecIdAfter[2], HEX) + ")");
     }
-    digitalWrite(csPin, HIGH);
-    pinMode(wpPin, INPUT);
-    pinMode(holdPin, INPUT);
-    pinMode(mosiPin, INPUT);
-    pinMode(misoPin, INPUT);
-    pinMode(sckPin, INPUT);    
+    // CS/WP/HOLD are active-low: keep HIGH so the chip stays deselected and in deep sleep.
+    // CLK/MOSI/MISO LOW — defined idle levels, no floating buffers on the MCU side.
+    const uint8_t qspiLow[] = { mosiPin, misoPin, sckPin };
+    for (uint8_t pin : qspiLow) {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    }
+    const uint8_t qspiHigh[] = { csPin, wpPin, holdPin };
+    for (uint8_t pin : qspiHigh) {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, HIGH);
+    }
     #else
     writeSerial("External flash power-down not implemented for ESP32");
     return false;

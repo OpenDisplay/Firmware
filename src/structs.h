@@ -28,8 +28,8 @@ struct SystemConfig {
     uint8_t device_flags;       // Misc device flags (bitfield)
     uint8_t pwr_pin;            // Power pin number (0xFF if not present)
     uint8_t reserved[15];       // Reserved bytes for future use
-    uint8_t pwr_pin_2;          // Optional 2nd power/enable (e.g. Seeed ED103 TFT_ENABLE); 0 or 0xFF = default (11). Battery-latch pin when DEVICE_FLAG_BATTERY_LATCH is set.
-    uint8_t pwr_pin_3;          // Optional 3rd power/enable (e.g. ITE_ENABLE); 0 or 0xFF = default (21). Shutdown-button pin (active-low, 0xFF = none) when DEVICE_FLAG_BATTERY_LATCH is set.
+    uint8_t pwr_pin_2;          // Aux enable or latch D (PWR_HOLD) when DEVICE_FLAG_PWR_LATCH_DFF; battery latch when DEVICE_FLAG_BATTERY_LATCH
+    uint8_t pwr_pin_3;          // Aux enable or latch CP (PWR_LOCK) when DEVICE_FLAG_PWR_LATCH_DFF; shutdown button when DEVICE_FLAG_BATTERY_LATCH
 } __attribute__((packed));
 
 // 0x02: manufacturer_data
@@ -54,8 +54,17 @@ struct PowerOption {
     uint16_t voltage_scaling_factor; // Voltage scaling / divider factor
     uint32_t deep_sleep_current_ua; // Deep sleep current in microamperes
     uint16_t deep_sleep_time_seconds; // Deep sleep duration in seconds (0 if not used)
-    uint8_t reserved[10];        // Reserved bytes for future use
+    uint8_t charge_enable_pin;      // BQ25616 CE (0 or 0xFF = unused)
+    uint8_t charge_state_pin;       // BQ25616 charge-state GPIO (0 or 0xFF = unused)
+    uint8_t charger_flags;          // bit0 enable active-low; bit1 state active-low when charging
+    uint8_t reserved[7];
 } __attribute__((packed));
+
+#define CHARGER_FLAG_ENABLE_ACTIVE_LOW (1u << 0)
+#define CHARGER_FLAG_STATE_ACTIVE_LOW  (1u << 1)
+
+// battery_sense_flags (power_option)
+#define BATTERY_SENSE_FLAG_ENABLE_INVERTED (1 << 0)  // Enable active-low (e.g. XIAO ~READ_BAT on P0.14)
 
 // Panel IDs must match web/firmware/toolbox/config.yaml display.panel_ic_type enum values.
 // Decimal 3000–3999 = Seeed_GFX / OpenDisplay runtime epaper (add new IDs here as panels ship).
@@ -63,6 +72,14 @@ struct PowerOption {
 #define PANEL_IC_SEEED_ED103TC2_1872X1404_4GRAY 3001u
 
 // display.color_scheme (config.yaml); use with matching panel (e.g. gray16 + panel_ic 3001).
+// add more entries to match the ColorScheme enum from bb_epaper
+#define COLOR_SCHEME_MONO 0u
+#define COLOR_SCHEME_BWR 1u
+#define COLOR_SCHEME_BWY 2u
+#define COLOR_SCHEME_BWRY 3u
+#define COLOR_SCHEME_BWGBRY 4u
+#define COLOR_SCHEME_GRAY4 5u
+#define COLOR_SCHEME_GRAY8 7u
 #define COLOR_SCHEME_GRAY16 6u
 
 // display.transmission_modes (config.yaml bitfield).
@@ -133,14 +150,15 @@ struct PassiveBuzzerConfig {
 #define SENSOR_TYPE_HUMIDITY    0x0002u
 #define SENSOR_TYPE_AXP2101     0x0003u
 #define SENSOR_TYPE_SHT40       0x0004u
+#define SENSOR_TYPE_BQ27220     0x0005u
 
 struct SensorData {
     uint8_t instance_number;    // Unique index for multiple sensor blocks (0-based)
     uint16_t sensor_type;       // Sensor type enum (SENSOR_TYPE_*)
     uint8_t bus_id;             // Instance id of the bus to use for this sensor
     uint8_t i2c_addr_7bit;      // I2C 7-bit address; 0 or 0xFF = default per sensor (SHT40: 0x44)
-    uint8_t msd_data_start_byte; // SHT40: first index in dynamicreturndata for 3-byte MSD block; 0 or 0xFF = default (7)
-    uint8_t reserved[24];       // Reserved for future use
+    uint8_t msd_data_start_byte; // SHT40: 3-byte block (0/0xFF=default 7); BQ27220: 1 packed byte (0xFF=skip)
+    uint8_t reserved[24];
 } __attribute__((packed));
 
 // 0x24: data_bus (repeatable, max 4 instances)
@@ -172,9 +190,9 @@ struct DataBus {
 // input_type == 3 (ADC resistor ladder, e.g. XTEINK X4): several buttons share
 //   one ADC pin, distinguished by voltage; polled (no interrupt). Layout:
 //     reserved_pin_1            = ADC GPIO pin
-//     reserved[0]               = num_buttons N (1..5)
+//     reserved[0]               = num_buttons N (1..4)
 //     reserved[1]               = button id base (button i reports id base+i, &7)
-//     reserved[2 + 2k .. +1]    = threshold[k], LE uint16, k = 0..N (N+1 values)
+//     reserved[2 + 2k .. +1]    = threshold[k], LE uint16, k = 0..N (N+1 values; max 5)
 //   Thresholds descend; button i is pressed when thr[i+1] < adc <= thr[i], and
 //   nothing is pressed when adc > thr[0] (idle ceiling). thr[N] is the bottom
 //   floor (use 0). Reported into button_data_byte_index using the same byte
@@ -196,7 +214,9 @@ struct BinaryInputs {
     uint8_t pullups;            // Internal pullup resistors per pin (bitfield)
     uint8_t pulldowns;          // Internal pulldown resistors per pin (bitfield)
     uint8_t button_data_byte_index;  // Byte index in dynamicreturndata (0-10) for button data
-    uint8_t reserved[14];       // Reserved bytes for future use
+    uint8_t power_off_flags;        // Bit N = pin N+1 long-press power-off (latched devices only)
+    uint8_t power_off_hold_sec;     // Hold before power-off; 0 = default 3 s
+    uint8_t reserved[12];
 } __attribute__((packed));
 
 // 0x28: touch_controller (repeatable, max 4 instances)
@@ -218,7 +238,27 @@ struct TouchController {
     uint8_t flags;              // TOUCH_FLAG_*
     uint8_t poll_interval_ms;   // 0 = default 25 ms
     uint8_t touch_data_start_byte; // First of 5 bytes in MSD dynamicreturndata (0–6): byte0 low nibble = contacts 1–5 (down) or 6 (released, last xy kept); high nibble = track id
-    uint8_t reserved[21];
+    uint8_t enable_pin;           // Optional touch panel power enable; 0 or 0xFF = unused
+    uint8_t reserved[20];
+} __attribute__((packed));
+
+// 0x2B: flash_config (repeatable, max 2 instances)
+#define FLASH_CONFIG_FLAG_ENABLED (1u << 0)
+
+struct FlashConfig {
+    uint8_t instance_number;
+    uint8_t flash_ic_type;
+    uint8_t bus_instance;
+    uint8_t flags;
+    uint8_t mosi_pin;
+    uint8_t sck_pin;
+    uint8_t cs_pin;
+    uint8_t power_pin;
+    uint8_t power_active;
+    uint8_t power_on_delay_ms;
+    uint8_t power_off_delay_ms;
+    uint8_t mode;
+    uint8_t reserved[20];
 } __attribute__((packed));
 
 // Global configuration structure
@@ -249,6 +289,9 @@ struct GlobalConfig {
 
     struct PassiveBuzzerConfig passive_buzzers[4];
     uint8_t passive_buzzer_count;
+
+    struct FlashConfig flash_configs[2];
+    uint8_t flash_config_count;
 
     // Config metadata
     uint8_t version;            // Protocol version

@@ -5,5 +5,6 @@
 
 void initPassiveBuzzers(void);
 void handleBuzzerActivate(uint8_t* data, uint16_t len);
+void passiveBuzzerPowerOffAlert(void);
 
 #endif

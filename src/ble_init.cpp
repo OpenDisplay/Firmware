@@ -43,6 +43,46 @@ extern MyBLECharacteristicCallbacks staticCharCallbacks;
 #endif
 
 #ifdef TARGET_NRF
+static uint32_t s_nrf_adv_boost_until = 0;
+
+static constexpr uint16_t NRF_ADV_INTERVAL_MIN = 256;   // 160 ms
+static constexpr uint16_t NRF_ADV_INTERVAL_MAX = 1600;  // 1000 ms
+static constexpr uint16_t NRF_ADV_BOOST_MIN = 32;         // 20 ms
+static constexpr uint16_t NRF_ADV_BOOST_MAX = 48;         // 30 ms
+static constexpr uint32_t NRF_ADV_BOOST_MS = 3000;
+
+void ble_nrf_boost_advertising(void) {
+    s_nrf_adv_boost_until = millis() + NRF_ADV_BOOST_MS;
+}
+
+void ble_nrf_apply_adv_interval(void) {
+    if (s_nrf_adv_boost_until != 0 && millis() < s_nrf_adv_boost_until) {
+        Bluefruit.Advertising.setInterval(NRF_ADV_BOOST_MIN, NRF_ADV_BOOST_MAX);
+    } else {
+        s_nrf_adv_boost_until = 0;
+        Bluefruit.Advertising.setInterval(NRF_ADV_INTERVAL_MIN, NRF_ADV_INTERVAL_MAX);
+    }
+}
+
+void ble_nrf_advertising_tick(void) {
+    static bool was_boosted = false;
+    const bool boosting = (s_nrf_adv_boost_until != 0 && millis() < s_nrf_adv_boost_until);
+    if (boosting) {
+        was_boosted = true;
+        return;
+    }
+    if (!was_boosted || !Bluefruit.Advertising.isRunning()) {
+        was_boosted = false;
+        s_nrf_adv_boost_until = 0;
+        return;
+    }
+    was_boosted = false;
+    s_nrf_adv_boost_until = 0;
+    Bluefruit.Advertising.setInterval(NRF_ADV_INTERVAL_MIN, NRF_ADV_INTERVAL_MAX);
+    Bluefruit.Advertising.stop();
+    Bluefruit.Advertising.start(0);
+}
+
 void ble_nrf_stack_init() {
     Bluefruit.configCentralBandwidth(BANDWIDTH_MAX);
     Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
@@ -82,7 +122,7 @@ void ble_nrf_advertising_start() {
     Bluefruit.Advertising.addName();
     updatemsdata();
     Bluefruit.Advertising.restartOnDisconnect(true);
-    Bluefruit.Advertising.setInterval(256, 1600);
+    ble_nrf_apply_adv_interval();
     Bluefruit.Advertising.setFastTimeout(10);
     writeSerial("Starting BLE advertising...");
     Bluefruit.Advertising.start(0);
