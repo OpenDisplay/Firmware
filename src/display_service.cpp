@@ -1438,14 +1438,6 @@ if (partialCtx.active) cleanup_partial_write_state();
     // streamGray4Bytes as chunks arrive.
     const bool gray4 = directWriteIsGray4();
     if (gray4) directWriteTotalBytes = 2u * (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
-    if (directWriteCompressed) {
-        if ((globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_ZIP) == 0) {
-            cleanupDirectWriteState(false);
-            touchResumeAfterEpdRefresh();
-            uint8_t errorResponse[] = {0xFF, 0xFF};
-            sendResponse(errorResponse, sizeof(errorResponse));
-            return;
-        }
         memcpy(&directWriteDecompressedTotal, data, 4);
         if (directWriteDecompressedTotal != directWriteTotalBytes) {
             cleanupDirectWriteState(false);
@@ -1510,12 +1502,6 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     uint16_t rectH    = ((uint16_t)data[15] << 8) | data[16];
 
     if ((flags & ~PARTIAL_ALLOWED_FLAGS) != 0) {
-        send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
-        return;
-    }
-
-    if ((flags & PARTIAL_FLAG_COMPRESSED) != 0 &&
-        (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_ZIP) == 0) {
         send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
         return;
     }
