@@ -1438,6 +1438,7 @@ if (partialCtx.active) cleanup_partial_write_state();
     // streamGray4Bytes as chunks arrive.
     const bool gray4 = directWriteIsGray4();
     if (gray4) directWriteTotalBytes = 2u * (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
+    if (directWriteCompressed) {
         memcpy(&directWriteDecompressedTotal, data, 4);
         if (directWriteDecompressedTotal != directWriteTotalBytes) {
             cleanupDirectWriteState(false);
