@@ -8,9 +8,9 @@ Usage:
 Output defaults to src/logo_bitmap.h.
 
 Produces three bitmaps (one per text scale level):
-    Scale 1:  96 x  50 px
-    Scale 2: 192 x 100 px
-    Scale 3: 288 x 150 px
+    Scale 1:  84 x  44 px
+    Scale 2: 154 x  80 px
+    Scale 3: 307 x 160 px
 
 Pixels are packed MSB-first into uint8_t rows.
 Requires: Pillow  (pip install Pillow)
@@ -23,9 +23,9 @@ import io
 import textwrap
 
 SIZES = [
-    (1,  96,  50,  12),   # (scale, w, h, stride)
-    (2, 192, 100,  24),
-    (3, 288, 150,  36),
+    (1,  84,  44, 11),   # (scale, w, h, stride)
+    (2, 154,  80, 20),
+    (3, 307, 160, 39),
 ]
 
 
