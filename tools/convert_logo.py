@@ -3,14 +3,14 @@
 convert_logo.py — Convert an SVG logo to a packed 1-bit C header for the boot screen.
 
 Usage:
-    python3 tools/convert_logo.py <logo.svg> [output_header]
+    python3 tools/convert_logo.py [logo.svg] [output_header]
 
-Output defaults to src/logo_bitmap.h.
+SVG defaults to tools/od_logo.svg. Output defaults to src/logo_bitmap.h.
 
 Produces three bitmaps (one per text scale level):
     Scale 1:  84 x  44 px
     Scale 2: 154 x  80 px
-    Scale 3: 307 x 160 px
+    Scale 3: 499 x 260 px
 
 Pixels are packed MSB-first into uint8_t rows.
 Requires: Pillow  (pip install Pillow)
@@ -25,7 +25,7 @@ import textwrap
 SIZES = [
     (1,  84,  44, 11),   # (scale, w, h, stride)
     (2, 154,  80, 20),
-    (3, 307, 160, 39),
+    (3, 499, 260, 63),
 ]
 
 
@@ -109,12 +109,8 @@ def format_array(name, data, cols=16):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 tools/convert_logo.py <logo.svg> [output_header]",
-              file=sys.stderr)
-        sys.exit(1)
-
-    svg_path = sys.argv[1]
+    default_svg = os.path.join(os.path.dirname(__file__), "od_logo.svg")
+    svg_path = sys.argv[1] if len(sys.argv) >= 2 else default_svg
     out_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
         os.path.dirname(__file__), "..", "src", "logo_bitmap.h"
     )

@@ -255,14 +255,6 @@ static inline bool bootSwatchIsBorder(uint16_t lx, uint16_t ly,
             (int)ly == swatchY0 || (int)ly == swatchY1 - 1);
 }
 
-static int bootLogoBlockH(int scale) {
-#ifdef BOOT_HAS_LOGO
-    int h = (scale >= 3) ? BOOT_LOGO_H_S3 : (scale >= 2) ? BOOT_LOGO_H_S2 : BOOT_LOGO_H_S1;
-    return scale * 4 + h;
-#else
-    return 0;
-#endif
-}
 
 static uint16_t bootMaxTextWidth(const char* const* lines, unsigned n, int scale) {
     uint16_t maxW = 0;
@@ -457,14 +449,20 @@ bool writeBootScreenWithQr() {
     const uint8_t quiet = 4;
     const uint16_t qrModules = (uint16_t)(qrSize + 2 * quiet);
 
-// ARRANGING THESE IN ORDER OF HOW THEY SHOW UP
-    char manufLine[32] = "Seeed Studio";  // HARDCODED FOR NOW
-    char modelLine[32] = "OpenDisplay 7.3\" Color Kit";  // HARDCODED FOR NOW
+// ARRANGING THESE IN ORDER OF HOW THEY SHOW UP.  
+// ADDED HANDLING OF OPTIONAL EXTENDED DATA LINES FOR MANUFACTURER AND MODEL.
+// IF NOT PRESENT, THEY WILL BE EMPTY STRINGS.
+    char manufLine[32] = "";
+    char modelLine[32] = "";
+    if (globalConfig.data_extended_loaded) {
+        snprintf(manufLine, sizeof(manufLine), "%s", (char*)globalConfig.data_extended.manufacturer_name);
+        snprintf(modelLine, sizeof(modelLine), "%s", (char*)globalConfig.data_extended.model_name);
+    }
     const char* domainLine = "URL:  OPENDISPLAY.ORG";
     char nameLine[32];
-    snprintf(nameLine, sizeof(nameLine), "ID:  OD%s", last6.c_str());
+    snprintf(nameLine, sizeof(nameLine), "ID:   OD%s", last6.c_str());
     char fwLine[32];
-    snprintf(fwLine, sizeof(fwLine), "FW:  OD ver %u.%u", (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor());
+    snprintf(fwLine, sizeof(fwLine), "FW:   OD ver %u.%u", (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor());
     char keyHex[33];
     bytesToHex(&payload[5], 16, keyHex, sizeof(keyHex));
     char k1[24], k2[24];
@@ -485,19 +483,11 @@ bool writeBootScreenWithQr() {
         bool layoutOk = false;
         int tryScale;
 
-        for (tryScale = (w_log >= 600 && h_log >= 400) ? 3 : (w_log >= 400 && h_log >= 300) ? 2 : 1; tryScale >= 1 && !layoutOk; tryScale--) {
+        for (tryScale = (w_log >= 600 && h_log >= 400) ? 6 : (w_log >= 400 && h_log >= 300) ? 2 : 1; tryScale >= 1 && !layoutOk; tryScale--) {
             scaleText = tryScale;
             pad = 6 * scaleText;
             maxTextW = bootMaxTextWidth(bootLines, 7, scaleText);
             int contentH = 6 * bootLineStep(scaleText) + 7 * scaleText;
-            if (!useZoneLayout) {
-                // logo lives in the text block on small screens
-                contentH += bootLogoBlockH(scaleText);
-#ifdef BOOT_HAS_LOGO
-                int lw = (tryScale >= 3) ? BOOT_LOGO_W_S3 : (tryScale >= 2) ? BOOT_LOGO_W_S2 : BOOT_LOGO_W_S1;
-                if ((uint16_t)lw > maxTextW) maxTextW = (uint16_t)lw;
-#endif
-            }
             layoutOk = bootLayoutFit(w_log, (uint16_t)middleH, contentH, pad, (int)qrModules, &modulePx, &qrPx, &qrRight, &qrX,
                                      &qrY, &availW, &textY, maxTextW);
         }
@@ -546,32 +536,10 @@ bool writeBootScreenWithQr() {
             logoBmp = BOOT_LOGO_BITMAP_S1; logoW = BOOT_LOGO_W_S1;
             logoH = BOOT_LOGO_H_S1; logoStride = BOOT_LOGO_STRIDE_S1;
         }
-    } else {
-        if (scaleText >= 3) {
-            logoBmp = BOOT_LOGO_BITMAP_S3; logoW = BOOT_LOGO_W_S3;
-            logoH = BOOT_LOGO_H_S3; logoStride = BOOT_LOGO_STRIDE_S3;
-        } else if (scaleText >= 2) {
-            logoBmp = BOOT_LOGO_BITMAP_S2; logoW = BOOT_LOGO_W_S2;
-            logoH = BOOT_LOGO_H_S2; logoStride = BOOT_LOGO_STRIDE_S2;
-        } else {
-            logoBmp = BOOT_LOGO_BITMAP_S1; logoW = BOOT_LOGO_W_S1;
-            logoH = BOOT_LOGO_H_S1; logoStride = BOOT_LOGO_STRIDE_S1;
-        }
     }
-    int logoX, logoY;
-    if (useZoneLayout) {
-        logoX = pad;
-        logoY = 8;
-    } else {
-        logoX = textOriginX + (availW - logoW) / 2;
-        logoY = textY;
-    }
-    if (logoX < pad) logoX = pad;
+    int logoX = pad, logoY = 8;
 #endif
     int textStartY = textY;
-#ifdef BOOT_HAS_LOGO
-    if (!useZoneLayout) textStartY += logoH + 4 * scaleText;
-#endif
 
     uint8_t* row = staticRowBuffer;
     // bb_epaper 4-gray (scheme 5) needs the packed 2bpp image split into two
@@ -644,8 +612,7 @@ bool writeBootScreenWithQr() {
                     bootTextPixelBlack(lx, ly, (uint16_t)k2X,    k2Y,    k2,         (uint8_t)scaleText, w_log, textMaxX) ||
                     bootQrPixelBlack(lx, ly, qrX, qrY, qrPx, modulePx, quiet, qrSize, &qr)
 #ifdef BOOT_HAS_LOGO
-                    || bootLogoPixelBlack(lx, ly, logoX, logoY, logoBmp, logoW, logoH, logoStride,
-                                          useZoneLayout ? (int)w_log : textMaxX)
+                    || (useZoneLayout && bootLogoPixelBlack(lx, ly, logoX, logoY, logoBmp, logoW, logoH, logoStride, (int)w_log))
 #endif
                     ;
                 if (black) {

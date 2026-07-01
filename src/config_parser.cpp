@@ -196,6 +196,7 @@ bool loadGlobalConfig(){
     wifiSsid[0] = '\0';
     wifiPassword[0] = '\0';
     wifiEncryptionType = 0;
+    globalConfig.data_extended_loaded = false;
     static uint8_t configData[MAX_CONFIG_SIZE];
     static uint32_t configLen = MAX_CONFIG_SIZE;
     if (!loadConfig(configData, &configLen)) {
@@ -342,6 +343,26 @@ bool loadGlobalConfig(){
                     offset += sizeof(struct PassiveBuzzerConfig);
                 } else {
                     writeSerial("ERROR: Not enough data for passive_buzzer");
+                    globalConfig.loaded = false;
+                    return false;
+                }
+                break;
+            case 0x2C: // data_extended
+                if (offset + sizeof(struct DataExtended) <= configLen - 2) {
+                    memcpy(&globalConfig.data_extended, &configData[offset], sizeof(struct DataExtended));
+                    offset += sizeof(struct DataExtended);
+                    globalConfig.data_extended.manufacturer_name[31] = '\0';
+                    globalConfig.data_extended.model_name[31] = '\0';
+                    globalConfig.data_extended.serial_number[31] = '\0';
+                    globalConfig.data_extended.friendly_name[31] = '\0';
+                    globalConfig.data_extended.device_location[31] = '\0';
+                    globalConfig.data_extended.device_id[31] = '\0';
+                    globalConfig.data_extended.custom_string_1[31] = '\0';
+                    globalConfig.data_extended.custom_string_2[31] = '\0';
+                    globalConfig.data_extended.custom_string_3[31] = '\0';
+                    globalConfig.data_extended_loaded = true;
+                } else {
+                    writeSerial("ERROR: Not enough data for data_extended");
                     globalConfig.loaded = false;
                     return false;
                 }
@@ -700,6 +721,19 @@ void printConfigSummary(){
         writeSerial("  Drive / enable pin: " + String(globalConfig.passive_buzzers[i].drive_pin) + " / " + String(globalConfig.passive_buzzers[i].enable_pin));
         writeSerial("  Flags: 0x" + String(globalConfig.passive_buzzers[i].flags, HEX));
         writeSerial("  Duty %: " + String(globalConfig.passive_buzzers[i].duty_percent));
+        writeSerial("");
+    }
+    if (globalConfig.data_extended_loaded) {
+        writeSerial("--- Data Extended ---");
+        writeSerial("  manufacturer_name: " + String((char*)globalConfig.data_extended.manufacturer_name));
+        writeSerial("  model_name: "        + String((char*)globalConfig.data_extended.model_name));
+        writeSerial("  serial_number: "     + String((char*)globalConfig.data_extended.serial_number));
+        writeSerial("  friendly_name: "     + String((char*)globalConfig.data_extended.friendly_name));
+        writeSerial("  device_location: "   + String((char*)globalConfig.data_extended.device_location));
+        writeSerial("  device_id: "         + String((char*)globalConfig.data_extended.device_id));
+        writeSerial("  custom_string_1: "   + String((char*)globalConfig.data_extended.custom_string_1));
+        writeSerial("  custom_string_2: "   + String((char*)globalConfig.data_extended.custom_string_2));
+        writeSerial("  custom_string_3: "   + String((char*)globalConfig.data_extended.custom_string_3));
         writeSerial("");
     }
     writeSerial("=============================");

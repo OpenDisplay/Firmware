@@ -244,6 +244,19 @@ struct FlashConfig {
     uint8_t reserved[20];
 } __attribute__((packed));
 
+// 0x2C: data_extended (singleton)
+struct DataExtended {
+    uint8_t manufacturer_name[32];
+    uint8_t model_name[32];
+    uint8_t serial_number[32];
+    uint8_t friendly_name[32];
+    uint8_t device_location[32];
+    uint8_t device_id[32];
+    uint8_t custom_string_1[32];
+    uint8_t custom_string_2[32];
+    uint8_t custom_string_3[32];
+} __attribute__((packed));
+
 // Global configuration structure
 struct GlobalConfig {
     // Required packets (single instances)
@@ -275,6 +288,9 @@ struct GlobalConfig {
 
     struct FlashConfig flash_configs[2];
     uint8_t flash_config_count;
+
+    struct DataExtended data_extended;
+    bool data_extended_loaded;
 
     // Config metadata
     uint8_t version;            // Protocol version
