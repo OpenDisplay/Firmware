@@ -1,7 +1,7 @@
 ### C++ template
 # Prerequisites
 *.d
-
+./*.uf2
 # Compiled Object files
 *.slo
 *.lo
@@ -82,4 +82,5 @@ platformio.local.ini
 
 ### Other files
 .idea
+.claude
 
