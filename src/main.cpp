@@ -217,7 +217,6 @@ void loop() {
     ble_nrf_advertising_tick();
     processButtonEvents();
     processTouchInput();
-    writeSerial("Loop end: " + String(millis() / 100));
     #endif
 }
 
