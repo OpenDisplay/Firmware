@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE 256
+#define OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE 2048
 
 bool seeed_driver_used(void);
 int mapEpd(int id);
