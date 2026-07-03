@@ -234,7 +234,7 @@ bool loadGlobalConfig(){
     wifiEncryptionType = 0;
     globalConfig.data_extended_loaded = false;
     static uint8_t configData[MAX_CONFIG_SIZE];
-    static uint32_t configLen = MAX_CONFIG_SIZE;
+    uint32_t configLen = MAX_CONFIG_SIZE;
     if (!loadConfig(configData, &configLen)) {
         globalConfig.loaded = false;
         return false;
