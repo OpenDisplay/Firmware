@@ -387,6 +387,30 @@ static bool touch_reinit_gt911(uint8_t idx, TouchController* tc, TouchRuntime* r
     return true;
 }
 
+static bool touch_light_resume_gt911(uint8_t idx, TouchController* tc, TouchRuntime* rt) {
+    if (tc->touch_ic_type != TOUCH_IC_GT911 || !rt->ok || rt->addr7 == 0) {
+        return false;
+    }
+    if (!touch_ensure_bus(tc)) {
+        return false;
+    }
+    uint8_t id[4];
+    if (!gt911_read_reg(rt->addr7, GT911_REG_PID, id, 4, rt->reg_high_first != 0) ||
+        !gt911_product_id_match(id)) {
+        return false;
+    }
+    rt->i2c_fail_streak = 0;
+    rt->touch_latched = 0;
+    gt911_clear_status(rt->addr7, rt->reg_high_first != 0);
+    if (tc->int_pin != 0xFF) {
+        gt911_int_wake_before_irq(tc);
+        if (!rt->int_irq_attached) {
+            attach_touch_int(idx, tc->int_pin);
+        }
+    }
+    return true;
+}
+
 void touchResumeAfterEpdRefresh(void) {
     if (s_epd_refresh_suspend == 0) {
         return;
@@ -406,7 +430,9 @@ void touchResumeAfterEpdRefresh(void) {
         if (tc->touch_ic_type != TOUCH_IC_GT911 || rt->disabled) {
             continue;
         }
-        if (touch_reinit_gt911(i, tc, rt)) {
+        if (touch_light_resume_gt911(i, tc, rt)) {
+            writeSerial("Touch[" + String(i) + "]: light resume after EPD @0x" + String(rt->addr7, HEX), true);
+        } else if (touch_reinit_gt911(i, tc, rt)) {
             writeSerial("Touch[" + String(i) + "]: reinit OK after EPD @0x" + String(rt->addr7, HEX), true);
         } else {
             writeSerial("Touch[" + String(i) + "]: reinit failed after EPD refresh", true);
