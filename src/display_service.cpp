@@ -1315,7 +1315,7 @@ void updatemsdata(){
                 pAdvertising->setAdvertisementData(freshAdvertisementData);
                 pAdvertising->setScanResponse(false);
                 pAdvertising->setMinPreferred(0x06);
-                pAdvertising->setMinPreferred(0x12);
+                pAdvertising->setMaxPreferred(0x12);
                 delay(50);
                 pAdvertising->start();
             }
