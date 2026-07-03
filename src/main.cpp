@@ -134,6 +134,17 @@ void loop() {
     if (bleRestartAdvertisingPending) {
         esp32_restart_ble_advertising();
     }
+    if (bleConnectMsdUpdatePending) {
+        bleConnectMsdUpdatePending = false;
+        updatemsdata();
+    }
+    if (bleDirectWriteCleanupPending) {
+        bleDirectWriteCleanupPending = false;
+        if (directWriteActive) {
+            cleanupDirectWriteState(true);
+            touchResumeAfterEpdRefresh();
+        }
+    }
     if (directWriteActive && directWriteStartTime > 0) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
         if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)

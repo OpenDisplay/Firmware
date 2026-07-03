@@ -137,6 +137,8 @@ void ble_init() {
 
 #ifdef TARGET_ESP32
 volatile bool bleRestartAdvertisingPending = false;
+volatile bool bleConnectMsdUpdatePending = false;
+volatile bool bleDirectWriteCleanupPending = false;
 volatile bool esp32BleNotifySubscribed = false;
 #if defined(CONFIG_BLUEDROID_ENABLED)
 static BLE2902* s_bleNotifyCccd = nullptr;

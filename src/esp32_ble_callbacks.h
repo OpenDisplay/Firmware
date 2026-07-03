@@ -41,7 +41,7 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
         writeSerial("=== BLE CLIENT CONNECTED (ESP32) ===");
         rebootFlag = 0;
         esp32BleNotifySubscribed = false;
-        updatemsdata();
+        bleConnectMsdUpdatePending = true;
     }
     void onDisconnect(BLEServer* pServer) {
         (void)pServer;
@@ -50,8 +50,7 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
         if (epdRefreshInProgress) {
             writeSerial("EPD refresh in progress — deferring cleanup/advertising to main loop");
         } else if (directWriteActive) {
-            cleanupDirectWriteState(true);
-            touchResumeAfterEpdRefresh();
+            bleDirectWriteCleanupPending = true;
         }
         bleRestartAdvertisingPending = true;
     }

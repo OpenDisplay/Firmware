@@ -15,6 +15,8 @@ void esp32_restart_ble_advertising(void);
 void esp32_ble_clear_handles(void);
 bool esp32_ble_notify_enabled(void);
 extern volatile bool bleRestartAdvertisingPending;
+extern volatile bool bleConnectMsdUpdatePending;
+extern volatile bool bleDirectWriteCleanupPending;
 extern volatile bool esp32BleNotifySubscribed;
 #endif
 
