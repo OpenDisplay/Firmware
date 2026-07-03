@@ -104,7 +104,9 @@ static void touch_disable_controller(uint8_t idx, TouchController* tc, TouchRunt
             detachInterrupt(irq_num);
         }
         rt->int_irq_attached = 0;
+        noInterrupts();
         s_touch_irq_mask &= (uint8_t)~(1u << idx);
+        interrupts();
     }
     writeSerial("Touch[" + String(idx) + "]: disabled (" + String(reason) + ")", true);
 }
@@ -585,7 +587,9 @@ void processTouchInput(void) {
             }
             if (edge) {
                 from_irq = true;
+                noInterrupts();
                 s_touch_irq_mask &= (uint8_t)~(1u << i);
+                interrupts();
             }
         } else {
             timed_poll = (uint32_t)(now - rt->last_poll_ms) >= interval;
