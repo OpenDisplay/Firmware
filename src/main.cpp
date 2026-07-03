@@ -101,6 +101,7 @@ void loop() {
             enterDeepSleep();
             return;
         }
+        delay(50);
         return;
     }
     if (commandQueueTail != commandQueueHead) {
