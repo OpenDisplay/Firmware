@@ -249,7 +249,6 @@ void minimalSetup() {
     full_config_init();
     initio();
     ble_init_esp32(true); // Update manufacturer data
-    initWiFi(false);
     writeSerial("=== BLE advertising started (minimal mode) ===");
     writeSerial("Advertising for 10 seconds, waiting for connection...");
     advertising_timeout_active = true;
@@ -258,6 +257,7 @@ void minimalSetup() {
 
 void fullSetupAfterConnection() {
     writeSerial("=== Full Setup After Connection ===");
+    initWiFi(false);
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (globalConfig.display_count > 0 && seeed_driver_used()) {
         writeSerial("Panel: Seeed ED103 (bb_epaper not used)", true);
