@@ -141,6 +141,7 @@ void loop() {
             cleanupDirectWriteState(true);
         }
     }
+    checkPartialWriteTimeout();
     // WiFi handling runs after BLE queue processing to avoid blocking
     // BLE command responses (moved from top of loop in v1.6 fix).
     handleWiFiServer();

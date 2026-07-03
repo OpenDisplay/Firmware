@@ -82,6 +82,7 @@ struct PartialStreamContext {
     uint32_t bytes_received;
     uint32_t bytes_written;
     uint8_t current_plane;
+    uint32_t start_time;
 };
 
 #ifdef TARGET_ESP32
@@ -174,6 +175,15 @@ static uint32_t calc_controller_plane_bytes(uint16_t width, uint16_t height);
 static uint32_t parse_be_u32(const uint8_t* data);
 static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupState);
 static PartialStreamContext partialCtx = {};
+
+void checkPartialWriteTimeout(void) {
+    if (partialCtx.active && partialCtx.start_time > 0 &&
+        (millis() - partialCtx.start_time) > 900000UL) {
+        writeSerial("ERROR: Partial write timeout - cleaning up stuck state", true);
+        cleanup_partial_write_state();
+    }
+}
+
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define AXP2101_REG_POWER_STATUS 0x00
 #define AXP2101_REG_DC_ONOFF_DVM_CTRL 0x80
@@ -1557,6 +1567,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     partialCtx.expected_stream_size = expectedLogicalSize;
     partialCtx.plane_size = planeBytes;
     partialCtx.current_plane = 0xFF;
+    partialCtx.start_time = millis();
 
     partial_prepare_panel_ram();
     if (partialCtx.compressed) od_zlib_stream_reset(expectedLogicalSize);
