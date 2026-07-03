@@ -158,6 +158,7 @@ void sendResponseUnencrypted(uint8_t* response, uint8_t len) {
 
 void sendResponse(uint8_t* response, uint8_t len) {
     static uint8_t encrypted_response[600];
+    uint8_t errorResponse[3];
     if (isAuthenticated() && len >= 2) {
         uint16_t command = (response[0] << 8) | response[1];
         uint8_t status = (len >= 3) ? response[2] : 0x00;
@@ -175,7 +176,9 @@ void sendResponse(uint8_t* response, uint8_t len) {
                 len = encrypted_len;
             } else {
                 writeSerial("WARNING: Failed to encrypt response, sending unencrypted error response", true);
-                uint8_t errorResponse[] = {0xFF, (uint8_t)(command & 0xFF), 0x00};
+                errorResponse[0] = 0xFF;
+                errorResponse[1] = (uint8_t)(command & 0xFF);
+                errorResponse[2] = 0x00;
                 response = errorResponse;
                 len = sizeof(errorResponse);
             }
