@@ -424,9 +424,11 @@ void processButtonEvents() {
     pollConfiguredPowerOffButtons();
 #endif
     if (buttonEventPending) {
+        noInterrupts();
         buttonEventPending = false;
         uint8_t changedButtonIndex = lastChangedButtonIndex;
         lastChangedButtonIndex = 0xFF;
+        interrupts();
         writeSerial("Button event pending: " + String(changedButtonIndex));
         if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
             ButtonState* btn = &buttonStates[changedButtonIndex];
