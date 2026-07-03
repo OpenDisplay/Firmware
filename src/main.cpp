@@ -71,7 +71,7 @@ void setup() {
     ble_nrf_advertising_start();
 #endif
     #ifdef TARGET_ESP32
-    initWiFi();
+    initWiFi(false);
     #endif
     updatemsdata();
     initButtons();
