@@ -45,10 +45,6 @@ static bool factoryEmbedPresent(const factory_flash_cfg_t* fc) {
 }
 
 bool tryProvisionFactoryEmbed(void) {
-    if (hasValidStoredConfig()) {
-        return false;
-    }
-
 #ifdef FACTORY_HAS_EMBED
     if (!factoryEmbedPresent(&g_factory_embed)) {
         return false;
