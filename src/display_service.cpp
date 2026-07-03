@@ -1274,6 +1274,13 @@ void updatemsdata(){
     msd_payload[14] = batteryVoltageLowByte;
     msd_payload[15] = statusByte;
 #ifdef TARGET_NRF
+    static uint8_t prev_msd_payload_nrf[16] = {0xFF};
+    if (memcmp(prev_msd_payload_nrf, msd_payload, 16) == 0) {
+        mloopcounter++;
+        mloopcounter &= 0x0F;
+        return;
+    }
+    memcpy(prev_msd_payload_nrf, msd_payload, 16);
     Bluefruit.Advertising.clearData();
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     Bluefruit.Advertising.addName();
