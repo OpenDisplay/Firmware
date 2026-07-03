@@ -700,11 +700,9 @@ bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* cipher
                                    ad, 2, payload_with_length, total_payload_len,
                                    ciphertext + 2 + 16, auth_tag, 12);
     if (!success) return false;
-    uint8_t nonce_copy[16];
-    memcpy(nonce_copy, nonce, 16);
     ciphertext[0] = plaintext[0];
     ciphertext[1] = plaintext[1];
-    memcpy(ciphertext + 2, nonce_copy, 16);
+    memcpy(ciphertext + 2, nonce, 16);
     memcpy(ciphertext + 2 + 16 + total_payload_len, auth_tag, 12);
     *ciphertext_len = 2 + 16 + total_payload_len + 12;
     updateEncryptionSessionActivity();

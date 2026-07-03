@@ -139,6 +139,11 @@ bool clearStoredConfig(void) {
     }
     #endif
     memset(&globalConfig, 0, sizeof(globalConfig));
+    memset(&securityConfig, 0, sizeof(securityConfig));
+    wifiConfigured = false;
+    wifiSsid[0] = '\0';
+    wifiPassword[0] = '\0';
+    wifiEncryptionType = 0;
     return true;
 }
 
@@ -523,7 +528,7 @@ bool loadGlobalConfig(){
                 break;
             case 0x27: // security_config
                 {
-                    if (offset + sizeof(struct SecurityConfig) <= configLen) {
+                    if (offset + sizeof(struct SecurityConfig) <= configLen - 2) {
                         memcpy(&securityConfig, &configData[offset], sizeof(struct SecurityConfig));
                         offset += sizeof(struct SecurityConfig);
                         // Check if key is all zeros (encryption disabled)
