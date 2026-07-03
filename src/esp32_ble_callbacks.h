@@ -51,7 +51,6 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
             writeSerial("EPD refresh in progress — deferring cleanup/advertising to main loop");
         } else if (directWriteActive) {
             cleanupDirectWriteState(true);
-            touchResumeAfterEpdRefresh();
         }
         bleRestartAdvertisingPending = true;
     }
