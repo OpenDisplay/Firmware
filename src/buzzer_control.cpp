@@ -4,7 +4,7 @@
 #include <string.h>
 
 extern struct GlobalConfig globalConfig;
-void sendResponse(uint8_t* response, uint8_t len);
+void sendResponse(uint8_t* response, uint16_t len);
 
 static_assert(sizeof(PassiveBuzzerConfig) == 32, "PassiveBuzzerConfig must be 32 bytes");
 

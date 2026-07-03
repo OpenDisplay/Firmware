@@ -27,7 +27,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #include <esp_system.h>
 #endif
 
-void sendResponse(uint8_t* response, uint8_t len);
+void sendResponse(uint8_t* response, uint16_t len);
 bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, uint8_t* mac);
 bool aes_ecb_encrypt(const uint8_t* key, const uint8_t* input, uint8_t* output);
 bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,

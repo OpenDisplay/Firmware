@@ -35,7 +35,7 @@ extern volatile uint8_t lastChangedButtonIndex;
 extern "C" uint8_t pinToButtonIndex[64];
 void updatemsdata();
 void cleanupDirectWriteState(bool refreshDisplay);
-void sendResponse(uint8_t* response, uint8_t len);
+void sendResponse(uint8_t* response, uint16_t len);
 void writeSerial(String message, bool newLine = true);
 
 struct ButtonState {

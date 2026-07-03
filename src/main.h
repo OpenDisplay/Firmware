@@ -219,8 +219,8 @@ String getChipIdHex();
 #endif
 
 void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len);
-void sendResponse(uint8_t* response, uint8_t len);
-void sendResponseUnencrypted(uint8_t* response, uint8_t len);
+void sendResponse(uint8_t* response, uint16_t len);
+void sendResponseUnencrypted(uint8_t* response, uint16_t len);
 void secureEraseConfig();
 void checkResetPin();
 void reboot();

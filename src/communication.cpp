@@ -38,7 +38,7 @@ static void reloadConfigAfterSave(void) {
 bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* ciphertext,
                     uint16_t* ciphertext_len, uint8_t* nonce, uint8_t* auth_tag);
 bool isEncryptionEnabled();
-void sendResponseUnencrypted(uint8_t* response, uint8_t len);
+void sendResponseUnencrypted(uint8_t* response, uint16_t len);
 void secureEraseConfig();
 extern struct SecurityConfig securityConfig;
 typedef struct {
@@ -120,7 +120,7 @@ static constexpr uint8_t FIRMWARE_SHA_HEX_BYTES = 40;
 static const char kFirmwareShaPlaceholder[FIRMWARE_SHA_HEX_BYTES + 1] =
     "0000000000000000000000000000000000000000";
 
-void sendResponseUnencrypted(uint8_t* response, uint8_t len) {
+void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
     writeSerial("Sending unencrypted response (error/status):", true);
     writeSerial("  Length: " + String(len) + " bytes", true);
     writeSerial("  Command: 0x" + String(response[0], HEX) + String(response[1], HEX), true);
@@ -156,7 +156,7 @@ void sendResponseUnencrypted(uint8_t* response, uint8_t len) {
 #endif
 }
 
-void sendResponse(uint8_t* response, uint8_t len) {
+void sendResponse(uint8_t* response, uint16_t len) {
     static uint8_t encrypted_response[600];
     if (isAuthenticated() && len >= 2) {
         uint16_t command = (response[0] << 8) | response[1];
