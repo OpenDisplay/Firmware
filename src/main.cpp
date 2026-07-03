@@ -239,9 +239,6 @@ void idleDelay(uint32_t delayMs) {
     }
 }
 
-#ifdef TARGET_NRF
-uint8_t pinToButtonIndex[64] = {0xFF};  // Map pin number to button index (max 64 pins)
-#endif
 
 #ifdef TARGET_ESP32
 void minimalSetup() {

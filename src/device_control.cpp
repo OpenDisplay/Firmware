@@ -32,7 +32,6 @@ extern uint8_t dynamicreturndata[11];
 extern uint8_t buttonStateCount;
 extern volatile bool buttonEventPending;
 extern volatile uint8_t lastChangedButtonIndex;
-extern "C" uint8_t pinToButtonIndex[64];
 void updatemsdata();
 void cleanupDirectWriteState(bool refreshDisplay);
 void sendResponse(uint8_t* response, uint8_t len);
