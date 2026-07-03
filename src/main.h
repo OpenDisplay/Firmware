@@ -150,10 +150,8 @@ uint8_t ledFlashPosition = 0;  // Current position in LED flash pattern group
 uint8_t activeLedInstance = 0xFF;  // LED instance index for flashing (0xFF = none configured)
 bool ledFlashActive = false;  // Flag to indicate if LED flashing is active (set by command)
 
-// Static buffers for writeTextAndFill() to avoid dynamic allocation
-// Maximum pitch: 1360px / 2 = 680 bytes (4BPP), line buffer: 256 bytes
 uint8_t staticWhiteRow[680];
-uint8_t staticRowBuffer[680];
+uint8_t staticRowBuffer[BOOT_ROW_BUFFER_SIZE];
 char staticLineBuffer[256];
 
 char wifiSsid[33] = {0};  // 32 bytes + null terminator
