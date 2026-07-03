@@ -443,10 +443,10 @@ void processButtonEvents() {
                 dynamicreturndata[btn->byte_index] = buttonData;
             }
         }
-        updatemsdata();
 #ifdef TARGET_NRF
         ble_nrf_boost_advertising();
 #endif
+        updatemsdata();
     }
 }
 
