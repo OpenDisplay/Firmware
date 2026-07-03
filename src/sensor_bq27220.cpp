@@ -138,11 +138,20 @@ void initBq27220Sensors(void) {
     writeSerial("BQ27220: fuel gauge @0x" + String(bq27220_addr_7bit(s), HEX), true);
 }
 
+static constexpr uint32_t kBq27220MsdPollTtlMs = 30000u;
+
 void pollBq27220ForMsd(void) {
     const SensorData* s = bq27220_config();
     if (!s) {
         return;
     }
+    static uint32_t lastPollMs = 0;
+    static bool havePolled = false;
+    if (havePolled && (uint32_t)(millis() - lastPollMs) < kBq27220MsdPollTtlMs) {
+        return;
+    }
+    lastPollMs = millis();
+    havePolled = true;
     uint8_t raw[2];
     if (!bq27220_read_block(s, BQ27220_CMD_VOLTAGE, raw, 2)) {
         s_gauge_ok = false;

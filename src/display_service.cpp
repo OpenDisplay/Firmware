@@ -1200,7 +1200,7 @@ int getBitsPerPixel() {
     return 1;
 }
 
-float readBatteryVoltage() {
+static float readBatteryVoltageUncached() {
     if (bq27220IsConfigured()) {
         float gaugeV = bq27220BatteryVoltageVolts();
         if (gaugeV >= 0.0f) {
@@ -1229,6 +1229,20 @@ float readBatteryVoltage() {
     }
     if (scalingFactor > 0) return (adcAverage * scalingFactor) / (100000.0);
     return -1.0;
+}
+
+static constexpr uint32_t kBatteryVoltageTtlMs = 30000u;
+float readBatteryVoltage() {
+    static uint32_t lastReadMs = 0;
+    static float cachedVoltage = -1.0f;
+    static bool haveReading = false;
+    if (haveReading && (uint32_t)(millis() - lastReadMs) < kBatteryVoltageTtlMs) {
+        return cachedVoltage;
+    }
+    cachedVoltage = readBatteryVoltageUncached();
+    lastReadMs = millis();
+    haveReading = true;
+    return cachedVoltage;
 }
 
 float readChipTemperature() {

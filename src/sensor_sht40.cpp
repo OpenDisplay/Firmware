@@ -236,8 +236,17 @@ void initSht40Sensors(void) {
     }
 }
 
+static constexpr uint32_t kSht40MsdPollTtlMs = 30000u;
+
 void pollSht40SensorsForMsd(void) {
     static bool logged_fail = false;
+    static uint32_t lastPollMs = 0;
+    static bool havePolled = false;
+    if (havePolled && (uint32_t)(millis() - lastPollMs) < kSht40MsdPollTtlMs) {
+        return;
+    }
+    lastPollMs = millis();
+    havePolled = true;
     for (uint8_t i = 0; i < globalConfig.sensor_count; i++) {
         const SensorData* s = &globalConfig.sensors[i];
         if (s->sensor_type != SENSOR_TYPE_SHT40) {
