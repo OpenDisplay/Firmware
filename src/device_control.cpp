@@ -450,6 +450,12 @@ void processButtonEvents() {
     }
 }
 
+static inline void ledFlashWrite(uint8_t pin, bool level) {
+    if (pin != 0xFF) {
+        digitalWrite(pin, level ? HIGH : LOW);
+    }
+}
+
 void flashLed(uint8_t color, uint8_t brightness) {
     if (activeLedInstance == 0xFF) {
         for (uint8_t i = 0; i < globalConfig.led_count; i++) {
@@ -471,33 +477,33 @@ void flashLed(uint8_t color, uint8_t brightness) {
     uint8_t colorgreen = (color >> 2) & 0b00000111;
     uint8_t colorblue = color & 0b00000011;
     for (uint16_t i = 0; i < brightness; i++) {
-        digitalWrite(ledRedPin, invertRed ? !(colorred >= 7) : (colorred >= 7));
-        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 7) : (colorgreen >= 7));
-        digitalWrite(ledBluePin, invertBlue ? !(colorblue >= 3) : (colorblue >= 3));
+        ledFlashWrite(ledRedPin,invertRed ? !(colorred >= 7) : (colorred >= 7));
+        ledFlashWrite(ledGreenPin,invertGreen ? !(colorgreen >= 7) : (colorgreen >= 7));
+        ledFlashWrite(ledBluePin,invertBlue ? !(colorblue >= 3) : (colorblue >= 3));
         delayMicroseconds(100);
-        digitalWrite(ledRedPin, invertRed ? !(colorred >= 1) : (colorred >= 1));
-        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 1) : (colorgreen >= 1));
+        ledFlashWrite(ledRedPin,invertRed ? !(colorred >= 1) : (colorred >= 1));
+        ledFlashWrite(ledGreenPin,invertGreen ? !(colorgreen >= 1) : (colorgreen >= 1));
         delayMicroseconds(100);
-        digitalWrite(ledRedPin, invertRed ? !(colorred >= 6) : (colorred >= 6));
-        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 6) : (colorgreen >= 6));
-        digitalWrite(ledBluePin, invertBlue ? !(colorblue >= 1) : (colorblue >= 1));
+        ledFlashWrite(ledRedPin,invertRed ? !(colorred >= 6) : (colorred >= 6));
+        ledFlashWrite(ledGreenPin,invertGreen ? !(colorgreen >= 6) : (colorgreen >= 6));
+        ledFlashWrite(ledBluePin,invertBlue ? !(colorblue >= 1) : (colorblue >= 1));
         delayMicroseconds(100);
-        digitalWrite(ledRedPin, invertRed ? !(colorred >= 2) : (colorred >= 2));
-        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 2) : (colorgreen >= 2));
+        ledFlashWrite(ledRedPin,invertRed ? !(colorred >= 2) : (colorred >= 2));
+        ledFlashWrite(ledGreenPin,invertGreen ? !(colorgreen >= 2) : (colorgreen >= 2));
         delayMicroseconds(100);
-        digitalWrite(ledRedPin, invertRed ? !(colorred >= 5) : (colorred >= 5));
-        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 5) : (colorgreen >= 5));
+        ledFlashWrite(ledRedPin,invertRed ? !(colorred >= 5) : (colorred >= 5));
+        ledFlashWrite(ledGreenPin,invertGreen ? !(colorgreen >= 5) : (colorgreen >= 5));
         delayMicroseconds(100);
-        digitalWrite(ledRedPin, invertRed ? !(colorred >= 3) : (colorred >= 3));
-        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 3) : (colorgreen >= 3));
-        digitalWrite(ledBluePin, invertBlue ? !(colorblue >= 2) : (colorblue >= 2));
+        ledFlashWrite(ledRedPin,invertRed ? !(colorred >= 3) : (colorred >= 3));
+        ledFlashWrite(ledGreenPin,invertGreen ? !(colorgreen >= 3) : (colorgreen >= 3));
+        ledFlashWrite(ledBluePin,invertBlue ? !(colorblue >= 2) : (colorblue >= 2));
         delayMicroseconds(100);
-        digitalWrite(ledRedPin, invertRed ? !(colorred >= 4) : (colorred >= 4));
-        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 4) : (colorgreen >= 4));
+        ledFlashWrite(ledRedPin,invertRed ? !(colorred >= 4) : (colorred >= 4));
+        ledFlashWrite(ledGreenPin,invertGreen ? !(colorgreen >= 4) : (colorgreen >= 4));
         delayMicroseconds(100);
-        digitalWrite(ledRedPin, invertRed ? HIGH : LOW);
-        digitalWrite(ledGreenPin, invertGreen ? HIGH : LOW);
-        digitalWrite(ledBluePin, invertBlue ? HIGH : LOW);
+        ledFlashWrite(ledRedPin,invertRed ? HIGH : LOW);
+        ledFlashWrite(ledGreenPin,invertGreen ? HIGH : LOW);
+        ledFlashWrite(ledBluePin,invertBlue ? HIGH : LOW);
     }
 }
 
