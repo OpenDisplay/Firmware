@@ -12,6 +12,7 @@ static constexpr uint32_t kBuzzerFreqMinHz = 400u;
 static constexpr uint32_t kBuzzerFreqMaxHz = 12000u;
 static constexpr uint8_t kBuzzerDurationUnitMs = 5u;
 static constexpr uint32_t kBuzzerInterPatternGapMs = 20u;
+static constexpr uint32_t kBuzzerMaxTotalMs = 5000u;
 
 static uint32_t buzzer_index_to_hz(uint8_t idx) {
     if (idx == 0) {
@@ -144,19 +145,30 @@ void handleBuzzerActivate(uint8_t* data, uint16_t len) {
         return;
     }
 
-    for (uint8_t rep = 0; rep < outer; rep++) {
+    const uint32_t playStart = millis();
+    bool capped = false;
+    for (uint8_t rep = 0; rep < outer && !capped; rep++) {
         uint16_t poff = 3;
-        for (uint8_t pi = 0; pi < pattern_count; pi++) {
+        for (uint8_t pi = 0; pi < pattern_count && !capped; pi++) {
             uint8_t nsteps = data[poff++];
             for (uint8_t si = 0; si < nsteps; si++) {
+                uint32_t elapsed = millis() - playStart;
+                if (elapsed >= kBuzzerMaxTotalMs) {
+                    capped = true;
+                    break;
+                }
                 uint8_t fidx = data[poff++];
                 uint8_t dunit = data[poff++];
                 uint32_t hz = buzzer_index_to_hz(fidx);
                 uint32_t ms = (uint32_t)dunit * (uint32_t)kBuzzerDurationUnitMs;
+                uint32_t remaining = kBuzzerMaxTotalMs - elapsed;
+                if (ms > remaining) {
+                    ms = remaining;
+                }
                 buzzer_set_enable(b, true);
                 buzzer_drive_tone_sw(b, hz, ms);
             }
-            if (pi + 1 < pattern_count) {
+            if (!capped && pi + 1 < pattern_count) {
                 delay(kBuzzerInterPatternGapMs);
             }
         }
