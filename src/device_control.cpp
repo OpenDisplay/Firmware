@@ -121,6 +121,7 @@ void reboot(){
 }
 
 #define LED_DELAY_FACTOR_MS 100u
+#define LED_MIN_STEP_DELAY_MS 1u
 
 typedef enum {
     LED_PHASE_IDLE = 0,
@@ -282,9 +283,10 @@ static void led_run_step(void) {
                 if (s_led.loop1delay > 0) {
                     s_led.phase = LED_PHASE_LOOP1_DELAY;
                     led_schedule_delay_ms((uint16_t)(s_led.loop1delay * LED_DELAY_FACTOR_MS));
-                    return;
+                } else {
+                    led_schedule_delay_ms(LED_MIN_STEP_DELAY_MS);
                 }
-                break;
+                return;
 
             case LED_PHASE_LOOP1_DELAY:
                 s_led.phase = LED_PHASE_LOOP1;
@@ -309,9 +311,10 @@ static void led_run_step(void) {
                 if (s_led.loop2delay > 0) {
                     s_led.phase = LED_PHASE_LOOP2_DELAY;
                     led_schedule_delay_ms((uint16_t)(s_led.loop2delay * LED_DELAY_FACTOR_MS));
-                    return;
+                } else {
+                    led_schedule_delay_ms(LED_MIN_STEP_DELAY_MS);
                 }
-                break;
+                return;
 
             case LED_PHASE_LOOP2_DELAY:
                 s_led.phase = LED_PHASE_LOOP2;
@@ -330,16 +333,18 @@ static void led_run_step(void) {
                     }
                     s_led.group_pos++;
                     s_led.phase = LED_PHASE_GROUP;
-                    break;
+                    led_schedule_delay_ms(LED_MIN_STEP_DELAY_MS);
+                    return;
                 }
                 flashLed(s_led.c3, s_led.brightness);
                 s_led.i3++;
                 if (s_led.loop3delay > 0) {
                     s_led.phase = LED_PHASE_LOOP3_DELAY;
                     led_schedule_delay_ms((uint16_t)(s_led.loop3delay * LED_DELAY_FACTOR_MS));
-                    return;
+                } else {
+                    led_schedule_delay_ms(LED_MIN_STEP_DELAY_MS);
                 }
-                break;
+                return;
 
             case LED_PHASE_LOOP3_DELAY:
                 s_led.phase = LED_PHASE_LOOP3;
