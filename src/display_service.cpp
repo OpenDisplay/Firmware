@@ -2034,7 +2034,9 @@ static bool partial_write_to_panel(int refreshMode) {
 
     if (partialCtx.bytes_written != partialCtx.expected_stream_size) return false;
     delay(20);
+    epdRefreshInProgress = true;
     bool refreshSuccess = partial_trigger_refresh(refreshMode);
+    epdRefreshInProgress = false;
     bbepSleep(&bbep, 1);
     delay(50);
     displayPowerState = false;
