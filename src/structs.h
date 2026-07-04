@@ -332,4 +332,19 @@ struct SecurityConfig {
 #define SECURITY_FLAG_RESET_PIN_PULLUP    (1 << 4)
 #define SECURITY_FLAG_RESET_PIN_PULLDOWN  (1 << 5)
 
+#define MAX_BUTTONS 32  // Up to 4 instances * 8 pins = 32 buttons max
+struct ButtonState {
+    uint8_t button_id;          // Button ID (0-7, from instance_number + pin offset)
+    uint8_t press_count;         // Press count (0-15)
+    volatile uint8_t current_state;       // Current button state (0=released, 1=pressed, updated in ISR)
+    uint8_t byte_index;          // Byte index in dynamicreturndata
+    uint8_t pin;                 // GPIO pin number
+    uint8_t instance_index;      // BinaryInputs instance index
+    bool initialized;          // Whether this button is initialized
+    uint8_t pin_offset;         // Pin offset within instance (0-7) for faster ISR lookup
+    bool inverted;              // Inverted flag for this pin (cached for ISR)
+    bool power_off;             // Whether this button triggers a power-off
+    uint16_t power_off_hold_ms; // Hold duration (ms) required to trigger power-off
+};
+
 #endif

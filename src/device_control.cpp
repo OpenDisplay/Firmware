@@ -38,20 +38,6 @@ void cleanupDirectWriteState(bool refreshDisplay);
 void sendResponse(uint8_t* response, uint8_t len);
 void writeSerial(String message, bool newLine = true);
 
-struct ButtonState {
-    uint8_t button_id;
-    uint8_t press_count;
-    volatile uint8_t current_state;
-    uint8_t byte_index;
-    uint8_t pin;
-    uint8_t instance_index;
-    bool initialized;
-    uint8_t pin_offset;
-    bool inverted;
-    bool power_off;
-    uint16_t power_off_hold_ms;
-};
-#define MAX_BUTTONS 32
 extern ButtonState buttonStates[MAX_BUTTONS];
 
 #ifdef TARGET_ESP32
