@@ -71,6 +71,8 @@ struct PowerOption {
 #define PANEL_IC_SEEED_ED103TC2_1872X1404 3000u
 #define PANEL_IC_SEEED_ED103TC2_1872X1404_4GRAY 3001u
 
+#define BOOT_ROW_BUFFER_SIZE 960
+
 // display.color_scheme (config.yaml); use with matching panel (e.g. gray16 + panel_ic 3001).
 // add more entries to match the ColorScheme enum from bb_epaper
 #define COLOR_SCHEME_MONO 0u

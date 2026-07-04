@@ -203,7 +203,7 @@ static PartialStreamContext partialCtx = {};
 
 extern const uint8_t writelineFont[] PROGMEM;
 extern uint8_t staticWhiteRow[680];
-extern uint8_t staticRowBuffer[680];
+extern uint8_t staticRowBuffer[BOOT_ROW_BUFFER_SIZE];
 extern char staticLineBuffer[256];
 
 int bbepSetPanelType(BBEPDISP *pBBEP, int iPanel);

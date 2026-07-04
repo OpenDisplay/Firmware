@@ -18,7 +18,7 @@
 extern struct GlobalConfig globalConfig;
 extern struct SecurityConfig securityConfig;
 extern BBEPDISP bbep;
-extern uint8_t staticRowBuffer[680];
+extern uint8_t staticRowBuffer[BOOT_ROW_BUFFER_SIZE];
 
 String getChipIdHex();
 uint8_t getFirmwareMajor();
@@ -886,6 +886,10 @@ bool writeBootScreenWithQr() {
 #endif
         ;
     const int planePitch = (w + 7) / 8;
+    const size_t rowBytesNeeded = gray4Split ? (size_t)(pitch + planePitch) : (size_t)pitch;
+    if (rowBytesNeeded > sizeof(staticRowBuffer)) {
+        return false;
+    }
     const int planePasses = (gray4Split || colorSwatchPlane1) ? 2 : 1;
     for (int pass = 0; pass < planePasses; pass++) {
         const int bitSel = pass;  // pass 0 -> LSB/PLANE_0, pass 1 -> MSB/PLANE_1
