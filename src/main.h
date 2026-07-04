@@ -361,8 +361,8 @@ uint8_t responseQueueTail = 0;
 #include "esp32_ble_callbacks.h"
 
 CommandQueueItem commandQueue[COMMAND_QUEUE_SIZE];
-uint8_t commandQueueHead = 0;
-uint8_t commandQueueTail = 0;
+volatile uint8_t commandQueueHead = 0;
+volatile uint8_t commandQueueTail = 0;
 
 BLEServer* pServer = nullptr;
 BLEService* pService = nullptr;

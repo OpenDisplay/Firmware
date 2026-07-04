@@ -24,8 +24,8 @@ struct CommandQueueItem {
 };
 
 extern CommandQueueItem commandQueue[COMMAND_QUEUE_SIZE];
-extern uint8_t commandQueueHead;
-extern uint8_t commandQueueTail;
+extern volatile uint8_t commandQueueHead;
+extern volatile uint8_t commandQueueTail;
 extern uint8_t rebootFlag;
 extern volatile bool esp32BleNotifySubscribed;
 
