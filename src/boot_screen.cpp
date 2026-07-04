@@ -916,7 +916,12 @@ bool writeBootScreenWithQr() {
         const bool colorPlanePass = colorSwatchPlane1 && pass == 1;
         for (uint16_t y_native = 0; y_native < h; y_native++) {
             memset(row, colorPlanePass ? 0x00 : whiteValue, pitch);
-            for (uint16_t x_native = 0; x_native < w; x_native++) {
+            bool colorRowOutsideBand = false;
+            if (colorPlanePass && (rotation == 0 || rotation == 2)) {
+                const int rowLy = (rotation == 2) ? (int)(h_log - 1u - y_native) : (int)y_native;
+                colorRowOutsideBand = (rowLy < swatchY0 || rowLy >= swatchY1);
+            }
+            for (uint16_t x_native = 0; !colorRowOutsideBand && x_native < w; x_native++) {
                 // Map native pixel to logical (user-visible) coordinates
                 uint16_t lx, ly;
                 switch (rotation) {
