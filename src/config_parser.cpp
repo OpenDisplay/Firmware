@@ -795,10 +795,12 @@ void full_config_init() {
     return;
 #endif
 
-    tryProvisionFactoryEmbed();
-
     writeSerial("Loading global configuration...");
-    if (loadGlobalConfig()) {
+    bool configLoaded = loadGlobalConfig();
+    if (!configLoaded && tryProvisionFactoryEmbed()) {
+        configLoaded = loadGlobalConfig();
+    }
+    if (configLoaded) {
         writeSerial("Global configuration loaded successfully");
         printConfigSummary();
         clearEncryptionSession();
