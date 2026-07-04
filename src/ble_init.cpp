@@ -247,10 +247,10 @@ void ble_init_esp32(bool update_manufacturer_data) {
     pAdvertising->setAdvertisementData(*advertisementData);
     pAdvertising->setScanResponse(false);
     pAdvertising->setMinPreferred(0x0006);
-    pAdvertising->setMinPreferred(0x0012);
+    pAdvertising->setMaxPreferred(0x0012);
     writeSerial("Advertising intervals set");
     pServer->getAdvertising()->setMinPreferred(0x06);
-    pServer->getAdvertising()->setMinPreferred(0x12);
+    pServer->getAdvertising()->setMaxPreferred(0x12);
     pServer->getAdvertising()->start();
     writeSerial("=== BLE advertising started successfully ===");
     writeSerial("Device ready: " + deviceName);
