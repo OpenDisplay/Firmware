@@ -646,6 +646,10 @@ void initAXP2101(uint8_t busId){
         writeSerial("ERROR: Bus " + String(busId) + " is not an I2C bus", true);
         return;
     }
+    if(!initOrRestoreWireForBus(busId)){
+        writeSerial("ERROR: Failed to (re)init I2C bus " + String(busId) + " for AXP2101", true);
+        return;
+    }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     uint8_t error = Wire.endTransmission();
     if(error != 0){
