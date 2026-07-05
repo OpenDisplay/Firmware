@@ -42,6 +42,22 @@ bool constantTimeCompare(const uint8_t* a, const uint8_t* b, size_t len);
 void secure_random(uint8_t* output, size_t len);
 void writeSerial(String message, bool newLine = true);
 
+// AES-CCM nonce direction domain separation.
+// The 16-byte full nonce is session_id(8) || counter(8, big-endian); the CCM
+// nonce is nonce_full[3..15], which includes the counter's most-significant
+// byte (nonce[8]). Previously both directions used counters starting at 0, so
+// inbound command #0 and outbound response #0 shared an identical (key, nonce)
+// pair -- a fatal CCM nonce reuse that leaks keystream and forges tags. We now
+// reserve the most-significant bit of the counter field (bit 0x80 of nonce[8])
+// as a direction flag so the two directions can never collide on a nonce:
+//   - inbound  commands  (client -> server): bit MUST be clear
+//   - outbound responses (server -> client): bit is SET
+// The counter never grows large enough to reach this bit in practice.
+// NOTE: this changes the wire crypto and must ship in lockstep with matching
+// changes in py-opendisplay (crypto.py), Firmware_NRF (encryption.c) and
+// Firmware_Silabs, or encrypted comms break with un-updated peers.
+static constexpr uint8_t NONCE_DIRECTION_SERVER = 0x80;
+
 void getAuthDeviceIdBytes(uint8_t* device_id) {
     if (device_id == nullptr) return;
 #ifdef TARGET_NRF
@@ -112,6 +128,13 @@ bool verifyNonceReplay(uint8_t* nonce) {
     uint8_t nonce_session_id[8];
     uint64_t nonce_counter = 0;
     memcpy(nonce_session_id, nonce, 8);
+    // Inbound commands (client -> server) MUST have the direction bit clear.
+    // Responses set NONCE_DIRECTION_SERVER in the counter's high byte; rejecting
+    // it here guarantees the two directions never reuse a (key, nonce) pair.
+    if (nonce[8] & NONCE_DIRECTION_SERVER) {
+        writeSerial("ERROR: Inbound command nonce has server direction bit set (rejected)", true);
+        return false;
+    }
     for (int i = 0; i < 8; i++) {
         nonce_counter = (nonce_counter << 8) | nonce[8 + i];
     }
@@ -133,7 +156,14 @@ bool verifyNonceReplay(uint8_t* nonce) {
         writeSerial(buf, true);
         return false;
     }
-    if (nonce_counter <= encryptionSession.last_seen_counter && counter_diff != 0) {
+    // A legitimate packet always carries a strictly-increasing counter, so any
+    // counter <= last_seen (including an exact match of the current maximum, and
+    // the counter-0 command) must be checked against the replay window. The
+    // previous `&& counter_diff != 0` skipped this check on an exact match,
+    // letting the most-recent command be replayed. The window is initialised to
+    // a sentinel (see clearEncryptionSession/handleAuthenticate) so the genuine
+    // first counter-0 command is not mistaken for a replay of the zero-init.
+    if (nonce_counter <= encryptionSession.last_seen_counter) {
         bool already_seen = false;
         for (int i = 0; i < 64; i++) {
             if (encryptionSession.replay_window[i] == nonce_counter) {
@@ -165,6 +195,9 @@ void getCurrentNonce(uint8_t* nonce) {
     for (int i = 0; i < 8; i++) {
         nonce[8 + i] = (counter >> (56 - i * 8)) & 0xFF;
     }
+    // Set the direction flag for server -> client responses so a response nonce
+    // can never collide with an inbound command nonce sharing the same counter.
+    nonce[8] |= NONCE_DIRECTION_SERVER;
 }
 
 void incrementNonceCounter() {
@@ -198,7 +231,8 @@ void clearEncryptionSession() {
     encryptionSession.last_activity = 0;
     encryptionSession.auth_attempts = 0;
     encryptionSession.server_nonce_time = 0;
-    memset(encryptionSession.replay_window, 0, sizeof(encryptionSession.replay_window));
+    // Sentinel (0xFF..) marks "no counter recorded"; 0 is a valid counter value.
+    memset(encryptionSession.replay_window, 0xFF, sizeof(encryptionSession.replay_window));
     writeSerial("Encryption session cleared");
 }
 
@@ -606,7 +640,8 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         encryptionSession.integrity_failures = 0;
         encryptionSession.session_start_time = currentTime;
         encryptionSession.last_activity = currentTime;
-        memset(encryptionSession.replay_window, 0, sizeof(encryptionSession.replay_window));
+        // Sentinel (0xFF..) marks "no counter recorded"; 0 is a valid counter value.
+        memset(encryptionSession.replay_window, 0xFF, sizeof(encryptionSession.replay_window));
         memset(encryptionSession.pending_server_nonce, 0, 16);
         encryptionSession.server_nonce_time = 0;
         uint8_t server_response[16];
