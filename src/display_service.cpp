@@ -1751,7 +1751,13 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     esp32_restart_ble_advertising();
 #endif
     if (refreshSuccess) {
+        // A successful refresh changed the panel image. Commit the new etag
+        // when the client supplied a valid one; otherwise clear the stale etag
+        // (etag-less full upload / auto-complete) so a later partial update
+        // gets a clean ETAG mismatch and falls back to a full upload instead
+        // of diffing against the wrong, now-outdated base image.
         if (hasNewEtag && newEtag != 0) displayed_etag = newEtag;
+        else displayed_etag = 0;
         uint8_t refreshResponse[] = {0x00, 0x73};
         sendResponse(refreshResponse, sizeof(refreshResponse));
     } else {
