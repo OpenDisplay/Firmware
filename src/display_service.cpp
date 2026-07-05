@@ -1387,13 +1387,15 @@ static inline bool directWriteIsGray4(void) {
         ;
 }
 
-// 4-gray uploads arrive as two pre-split 1-bit controller planes concatenated
-// (plane0 then plane1), already gray-coded host-side (py-opendisplay applies the
-// panel's gray LUT, matching bbepSetPixel4Gray: plane0 <- stored bit0, plane1 <-
-// stored bit1). Stream the bytes to the panel, switching from PLANE_0 to PLANE_1
-// at the single-plane boundary - no on-device de-interleave or 2bpp frame buffer.
-// directWriteBytesWritten is the running total across both planes, so the
-// compressed and uncompressed paths share this one plane-split implementation.
+// Two-plane uploads (4-gray and BWR/BWY) arrive as two pre-split, row-padded 1-bit
+// controller planes concatenated (plane0 then plane1). 4-gray is already gray-coded
+// host-side (py-opendisplay applies the panel's gray LUT, matching bbepSetPixel4Gray:
+// plane0 <- stored bit0, plane1 <- stored bit1); BWR/BWY send plane0 = BW (palette
+// index 1) then plane1 = accent (index 2). Both share the identical byte layout, so
+// stream the bytes to the panel, switching from PLANE_0 to PLANE_1 at the single-plane
+// boundary - no on-device de-interleave or 2bpp frame buffer. directWriteBytesWritten
+// is the running total across both planes, so the compressed and uncompressed paths
+// share this one plane-split implementation.
 static void streamGray4Bytes(const uint8_t* buf, uint32_t len) {
     const uint32_t planeBytes = (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
     uint32_t off = 0;
@@ -1467,7 +1469,7 @@ if (partialCtx.active) cleanup_partial_write_state();
     directWriteWidth = globalConfig.displays[0].pixel_width;
     directWriteHeight = globalConfig.displays[0].pixel_height;
     uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
-    if (directWriteBitplanes) directWriteTotalBytes = (pixels + 7) / 8;
+    if (directWriteBitplanes) directWriteTotalBytes = 2u * (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
     else {
         int bitsPerPixel = getBitsPerPixel();
         if (bitsPerPixel == 4) directWriteTotalBytes = (pixels + 1) / 2;
@@ -1638,7 +1640,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
             directWriteBytesWritten += bytesToWrite;
         } else
 #endif
-        if (directWriteIsGray4()) {
+        if (directWriteIsGray4() || directWriteBitplanes) {
             streamGray4Bytes(data, bytesToWrite);  // advances directWriteBytesWritten, splits planes
         } else {
             bbepWriteData(&bbep, data, bytesToWrite);
@@ -1695,7 +1697,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         return;
     }
     const bool gray4 = directWriteIsGray4();
-    if (gray4) {
+    if (gray4 || directWriteBitplanes) {
         // Both planes must be present before refresh. Compressed and uncompressed
         // paths stream live as 0x71 chunks, so confirm the full two-plane payload
         // arrived before refreshing stale RAM or committing an etag.
@@ -1921,7 +1923,7 @@ static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool 
                 directWriteBytesWritten += (uint32_t)bytesOut;
             } else
 #endif
-            if (directWriteIsGray4()) {
+            if (directWriteIsGray4() || directWriteBitplanes) {
                 uint32_t before = directWriteBytesWritten;
                 streamGray4Bytes(decompressionChunk, (uint32_t)bytesOut);
                 if (directWriteBytesWritten - before != (uint32_t)bytesOut) {
