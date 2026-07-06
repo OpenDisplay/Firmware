@@ -693,6 +693,15 @@ bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* cipher
     uint8_t ad[2] = {plaintext[0], plaintext[1]};
     static uint8_t payload_with_length[513];
     uint16_t payload_len = plaintext_len - 2;
+    // The inner length prefix is a single byte, so the payload must be <= 255 B.
+    // The client (py-opendisplay crypto.decrypt_response) reads a 1-byte length,
+    // and the command direction is 1-byte too, so the wire framing must stay
+    // 1-byte. No response reaches 255 B today; refuse rather than silently wrap
+    // if one ever would.
+    if (payload_len > 255) {
+        writeSerial("ERROR: Encrypted response payload exceeds 255 bytes");
+        return false;
+    }
     payload_with_length[0] = payload_len & 0xFF;
     if (payload_len > 0) memcpy(payload_with_length + 1, plaintext + 2, payload_len);
     uint16_t total_payload_len = 1 + payload_len;
