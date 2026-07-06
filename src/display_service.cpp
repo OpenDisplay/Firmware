@@ -1473,10 +1473,16 @@ if (partialCtx.active) cleanup_partial_write_state();
     uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
     if (directWriteBitplanes) directWriteTotalBytes = (pixels + 7) / 8;
     else {
+        // Panel RAM is row-padded: each row occupies ceil(w / pixelsPerByte) bytes, and the
+        // Python sender row-pads every plane (np.packbits(axis=1)). Size FLAT and we under-count
+        // on width-not-divisible-by-8 panels (e.g. 122-wide EP213), auto-completing before the
+        // bottom rows are written. Size row-padded to match sender + the gray4/bitplane paths.
+        uint32_t w = (uint32_t)directWriteWidth;
+        uint32_t h = (uint32_t)directWriteHeight;
         int bitsPerPixel = getBitsPerPixel();
-        if (bitsPerPixel == 4) directWriteTotalBytes = (pixels + 1) / 2;
-        else if (bitsPerPixel == 2) directWriteTotalBytes = (pixels + 3) / 4;
-        else directWriteTotalBytes = (pixels + 7) / 8;
+        if (bitsPerPixel == 4) directWriteTotalBytes = ((w + 1u) / 2u) * h;       // ceil(w/2) bytes/row
+        else if (bitsPerPixel == 2) directWriteTotalBytes = ((w + 3u) / 4u) * h;  // ceil(w/4) bytes/row
+        else directWriteTotalBytes = calc_controller_plane_bytes(directWriteWidth, directWriteHeight); // ceil(w/8) bytes/row
     }
     // 4-gray arrives as two concatenated 1bpp planes (plane0 ++ plane1), streamed to
     // PLANE_0/PLANE_1. Both compressed and uncompressed transports feed bytes through
