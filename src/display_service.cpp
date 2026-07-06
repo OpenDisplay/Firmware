@@ -1366,13 +1366,13 @@ void updatemsdata(){
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
     if (len > UINT32_MAX - directWriteCompressedReceived) {
         cleanupDirectWriteState(true);
-        uint8_t errorResponse[] = {0xFF, 0xFF};
+        uint8_t errorResponse[] = {0xFF, 0x71};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     if (!zlib_stream_to_direct_write(data, len, false)) {
         cleanupDirectWriteState(true);
-        uint8_t errorResponse[] = {0xFF, 0xFF};
+        uint8_t errorResponse[] = {0xFF, 0x71};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
@@ -1487,7 +1487,7 @@ if (partialCtx.active) cleanup_partial_write_state();
         memcpy(&directWriteDecompressedTotal, data, 4);
         if (directWriteDecompressedTotal != directWriteTotalBytes) {
             cleanupDirectWriteState(false);
-            uint8_t errorResponse[] = {0xFF, 0xFF};
+            uint8_t errorResponse[] = {0xFF, 0x70};
             sendResponse(errorResponse, sizeof(errorResponse));
             return;
         }
@@ -1518,7 +1518,7 @@ if (partialCtx.active) cleanup_partial_write_state();
             uint32_t compressedDataLen = len - 4;
             if (!zlib_stream_to_direct_write(data + 4, compressedDataLen, false)) {
                 cleanupDirectWriteState(false);
-                uint8_t errorResponse[] = {0xFF, 0xFF};
+                uint8_t errorResponse[] = {0xFF, 0x70};
                 sendResponse(errorResponse, sizeof(errorResponse));
                 return;
             }
@@ -1582,7 +1582,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     uint32_t expectedLogicalSize = planeBytes * 2u;
 
     if (expectedLogicalSize == 0) {
-        uint8_t errResponse[] = {0xFF, 0xFF};
+        uint8_t errResponse[] = {0xFF, 0x76};
         sendResponse(errResponse, sizeof(errResponse));
         return;
     }
@@ -1694,7 +1694,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     directWriteStartTime = 0;
     if (directWriteCompressed && !zlib_stream_to_direct_write(nullptr, 0, true)) {
         cleanupDirectWriteState(true);
-        uint8_t errorResponse[] = {0xFF, 0xFF};
+        uint8_t errorResponse[] = {0xFF, 0x72};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
