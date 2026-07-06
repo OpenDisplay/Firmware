@@ -213,6 +213,38 @@ bool hasValidStoredConfig(void) {
     return loadConfig(buf, &len);
 }
 
+static uint16_t crc16_ccitt_feed(uint16_t crc, uint8_t b) {
+    crc ^= (uint16_t)((uint16_t)b << 8);
+    for (int j = 0; j < 8; j++) {
+        if ((crc & 0x8000U) != 0U) {
+            crc = (uint16_t)(((uint32_t)crc << 1) ^ 0x1021U);
+        } else {
+            crc = (uint16_t)((uint32_t)crc << 1);
+        }
+    }
+    return crc;
+}
+
+// CRC-16/CCITT-FALSE over the toolbox-outer config container body (excludes the
+// trailing 2 CRC bytes), with the first two (length) bytes forced to zero so the
+// value is independent of the container length. Matches the canonical helper in
+// OpenDisplay-Firmware_NRF/config_parser.c and OpenDisplay-Firmware_Silabs.
+static uint16_t config_toolbox_outer_crc16(const uint8_t* data, uint32_t body_len) {
+    uint16_t crc = 0xFFFFU;
+    if (body_len < 2U) {
+        for (uint32_t i = 0; i < body_len; i++) {
+            crc = crc16_ccitt_feed(crc, data[i]);
+        }
+        return crc;
+    }
+    crc = crc16_ccitt_feed(crc, 0);
+    crc = crc16_ccitt_feed(crc, 0);
+    for (uint32_t i = 2U; i < body_len; i++) {
+        crc = crc16_ccitt_feed(crc, data[i]);
+    }
+    return crc;
+}
+
 uint32_t calculateConfigCRC(uint8_t* data, uint32_t len){
     uint32_t crc = 0xFFFFFFFF;
     for (uint32_t i = 0; i < len; i++) {
@@ -578,8 +610,9 @@ bool loadGlobalConfig(){
     }
     if (offset < configLen - 2) {
         uint16_t crcGiven = configData[configLen - 2] | (configData[configLen - 1] << 8);
-        uint32_t crcCalculated32 = calculateConfigCRC(configData, configLen - 2);
-        uint16_t crcCalculated = (uint16_t)(crcCalculated32 & 0xFFFF);  // Use lower 16 bits for backwards compatibility
+        // Advisory (warn-only) validation using CRC-16/CCITT to match the toolbox,
+        // nRF and Silabs firmware. Not enforced: a mismatch logs a warning only.
+        uint16_t crcCalculated = config_toolbox_outer_crc16(configData, configLen - 2);
         if (crcGiven != crcCalculated) {
             writeSerial("WARNING: Config CRC mismatch (given: 0x" + String(crcGiven, HEX) + 
                        ", calculated: 0x" + String(crcCalculated, HEX) + ")");
