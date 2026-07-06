@@ -162,7 +162,6 @@ uint32_t tcpReceiveBufferPos = 0;
 bool directWriteActive = false;  // True when direct write mode is active
 bool directWriteCompressed = false;  // True if using compressed direct write
 bool directWriteBitplanes = false;  // True if using bitplanes (BWR/BWY - 2 planes)
-bool directWritePlane2 = false;  // True when writing plane 2 (R/Y) for bitplanes
 uint32_t directWriteBytesWritten = 0;  // Total bytes written to current plane
 uint32_t directWriteDecompressedTotal = 0;  // Expected decompressed size
 uint16_t directWriteWidth = 0;  // Display width in pixels

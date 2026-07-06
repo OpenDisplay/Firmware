@@ -49,7 +49,6 @@ extern uint16_t directWriteHeight;
 extern uint16_t directWriteWidth;
 extern uint32_t directWriteDecompressedTotal;
 extern uint32_t directWriteBytesWritten;
-extern bool directWritePlane2;
 extern bool directWriteBitplanes;
 extern bool directWriteCompressed;
 extern bool directWriteActive;
@@ -1391,14 +1390,28 @@ static inline bool directWriteIsGray4(void) {
         ;
 }
 
-// 4-gray uploads arrive as two pre-split 1-bit controller planes concatenated
-// (plane0 then plane1), already gray-coded host-side (py-opendisplay applies the
-// panel's gray LUT, matching bbepSetPixel4Gray: plane0 <- stored bit0, plane1 <-
-// stored bit1). Stream the bytes to the panel, switching from PLANE_0 to PLANE_1
-// at the single-plane boundary - no on-device de-interleave or 2bpp frame buffer.
-// directWriteBytesWritten is the running total across both planes, so the
-// compressed and uncompressed paths share this one plane-split implementation.
-static void streamGray4Bytes(const uint8_t* buf, uint32_t len) {
+// True when the upload is two concatenated row-padded 1bpp planes streamed to
+// PLANE_0 then PLANE_1: BWR/BWY bitplanes and 4-gray both share this transport
+// via streamTwoPlaneBytes(). The Seeed driver has its own chunk path, so exclude
+// it (same guard as gray4).
+static inline bool directWriteIsTwoPlane(void) {
+    return directWriteIsGray4() || (directWriteBitplanes
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+        && !seeed_driver_used()
+#endif
+        );
+}
+
+// BWR/BWY and 4-gray uploads arrive as two pre-split row-padded 1-bit controller
+// planes concatenated (plane0 then plane1). For 4-gray the planes are gray-coded
+// host-side (py-opendisplay applies the panel's gray LUT, matching
+// bbepSetPixel4Gray: plane0 <- stored bit0, plane1 <- stored bit1); for BWR/BWY
+// plane0 is the B/W plane and plane1 the red/yellow plane. Stream the bytes to the
+// panel, switching from PLANE_0 to PLANE_1 at the single-plane boundary - no
+// on-device de-interleave or 2bpp frame buffer. directWriteBytesWritten is the
+// running total across both planes, so the compressed and uncompressed paths share
+// this one plane-split implementation.
+static void streamTwoPlaneBytes(const uint8_t* buf, uint32_t len) {
     const uint32_t planeBytes = (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
     uint32_t off = 0;
     while (off < len && directWriteBytesWritten < 2u * planeBytes) {
@@ -1424,7 +1437,6 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteActive = false;
     directWriteCompressed = false;
     directWriteBitplanes = false;
-    directWritePlane2 = false;
     directWriteBytesWritten = 0;
     directWriteCompressedReceived = 0;
     directWriteDecompressedTotal = 0;
@@ -1466,23 +1478,21 @@ if (partialCtx.active) cleanup_partial_write_state();
 #endif
     uint8_t colorScheme = globalConfig.displays[0].color_scheme;
     directWriteBitplanes = (colorScheme == COLOR_SCHEME_BWR || colorScheme == COLOR_SCHEME_BWY);
-    directWritePlane2 = false;
     directWriteCompressed = (len >= 4);
     directWriteWidth = globalConfig.displays[0].pixel_width;
     directWriteHeight = globalConfig.displays[0].pixel_height;
     uint32_t pixels = (uint32_t)directWriteWidth * (uint32_t)directWriteHeight;
-    if (directWriteBitplanes) directWriteTotalBytes = (pixels + 7) / 8;
-    else {
+    // BWR/BWY bitplanes and 4-gray both arrive as two concatenated row-padded 1bpp
+    // planes (plane0 ++ plane1), streamed to PLANE_0/PLANE_1. Both compressed and
+    // uncompressed transports feed bytes through streamTwoPlaneBytes as chunks arrive.
+    if (directWriteIsTwoPlane()) {
+        directWriteTotalBytes = 2u * (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
+    } else {
         int bitsPerPixel = getBitsPerPixel();
         if (bitsPerPixel == 4) directWriteTotalBytes = (pixels + 1) / 2;
         else if (bitsPerPixel == 2) directWriteTotalBytes = (pixels + 3) / 4;
         else directWriteTotalBytes = (pixels + 7) / 8;
     }
-    // 4-gray arrives as two concatenated 1bpp planes (plane0 ++ plane1), streamed to
-    // PLANE_0/PLANE_1. Both compressed and uncompressed transports feed bytes through
-    // streamGray4Bytes as chunks arrive.
-    const bool gray4 = directWriteIsGray4();
-    if (gray4) directWriteTotalBytes = 2u * (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
     if (directWriteCompressed) {
         memcpy(&directWriteDecompressedTotal, data, 4);
         if (directWriteDecompressedTotal != directWriteTotalBytes) {
@@ -1642,8 +1652,8 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
             directWriteBytesWritten += bytesToWrite;
         } else
 #endif
-        if (directWriteIsGray4()) {
-            streamGray4Bytes(data, bytesToWrite);  // advances directWriteBytesWritten, splits planes
+        if (directWriteIsTwoPlane()) {
+            streamTwoPlaneBytes(data, bytesToWrite);  // advances directWriteBytesWritten, splits planes
         } else {
             bbepWriteData(&bbep, data, bytesToWrite);
             directWriteBytesWritten += bytesToWrite;
@@ -1698,8 +1708,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
-    const bool gray4 = directWriteIsGray4();
-    if (gray4) {
+    if (directWriteIsTwoPlane()) {
         // Both planes must be present before refresh. Compressed and uncompressed
         // paths stream live as 0x71 chunks, so confirm the full two-plane payload
         // arrived before refreshing stale RAM or committing an etag.
@@ -1925,9 +1934,9 @@ static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool 
                 directWriteBytesWritten += (uint32_t)bytesOut;
             } else
 #endif
-            if (directWriteIsGray4()) {
+            if (directWriteIsTwoPlane()) {
                 uint32_t before = directWriteBytesWritten;
-                streamGray4Bytes(decompressionChunk, (uint32_t)bytesOut);
+                streamTwoPlaneBytes(decompressionChunk, (uint32_t)bytesOut);
                 if (directWriteBytesWritten - before != (uint32_t)bytesOut) {
                     return false;
                 }
