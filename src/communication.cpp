@@ -324,7 +324,10 @@ void handleReadConfig() {
         uint32_t remaining = configLen;
         uint32_t offset = 0;
         uint16_t chunkNumber = 0;
-        const uint16_t maxChunks = 10;
+        // Cover the full MAX_CONFIG_SIZE. Worst-case per-chunk payload is 94 B
+        // (chunk 0 also carries the 2-byte total-length header; later chunks
+        // carry 96), so ceil(MAX_CONFIG_SIZE / 94) chunks always sends it all.
+        const uint16_t maxChunks = (MAX_CONFIG_SIZE + 93) / 94;
         while (remaining > 0 && chunkNumber < maxChunks) {
             uint16_t responseLen = 0;
             configReadResponseBuffer[responseLen++] = 0x00;
