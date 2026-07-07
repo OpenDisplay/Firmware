@@ -94,6 +94,7 @@ extern BLEService* pService;
 void pwrmgm(bool onoff);
 String getChipIdHex();
 void writeSerial(String message, bool newLine);
+void flushLog();
 void bbepInitIO(BBEPDISP *pBBEP, uint8_t u8DC, uint8_t u8RST, uint8_t u8BUSY, uint8_t u8CS, uint8_t u8MOSI, uint8_t u8SCK, uint32_t u32Speed);
 void bbepWakeUp(BBEPDISP *pBBEP);
 void bbepSendCMDSequence(BBEPDISP *pBBEP, const uint8_t *pSeq);
@@ -513,6 +514,7 @@ void initDataBuses(){
 }
 
 void initio(){
+    writeSerial("[initio] >> LEDs", true); flushLog();
     if(globalConfig.led_count > 0){
         for (uint8_t i = 0; i < globalConfig.led_count; i++) {
             struct LedConfig* led = &globalConfig.leds[i];
@@ -552,7 +554,9 @@ void initio(){
             }
         }
     }
+    writeSerial("[initio] >> initPassiveBuzzers", true); flushLog();
     initPassiveBuzzers();
+    writeSerial("[initio] >> pwr_pin", true); flushLog();
     if(globalConfig.system_config.pwr_pin != 0xFF){
     pinMode(globalConfig.system_config.pwr_pin, OUTPUT);
     digitalWrite(globalConfig.system_config.pwr_pin, LOW);
@@ -560,8 +564,11 @@ void initio(){
     else{
         writeSerial("Power pin not set", true);
     }
+    writeSerial("[initio] >> initDataBuses", true); flushLog();
     initDataBuses();
+    writeSerial("[initio] >> initSensors", true); flushLog();
     initSensors();
+    writeSerial("[initio] << done", true); flushLog();
 }
 
 void scanI2CDevices(){

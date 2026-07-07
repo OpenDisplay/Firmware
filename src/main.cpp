@@ -270,9 +270,13 @@ void idleDelay(uint32_t delayMs) {
 #ifdef TARGET_ESP32
 void minimalSetup() {
     writeSerial("=== Minimal Setup (Deep Sleep Wake) ===");
+    writeSerial("[wake] >> full_config_init"); flushLog();
     full_config_init();
+    writeSerial("[wake] << full_config_init >> initio"); flushLog();
     initio();
+    writeSerial("[wake] << initio >> ble_init_esp32"); flushLog();
     ble_init_esp32(true); // Update manufacturer data
+    writeSerial("[wake] << ble_init_esp32"); flushLog();
     writeSerial("=== BLE advertising started (minimal mode) ===");
     writeSerial("Advertising for 10 seconds, waiting for connection...");
     advertising_timeout_active = true;
@@ -461,6 +465,21 @@ void writeSerial(String message, bool newLine){
     #elif !defined(DISABLE_USB_SERIAL)
     if (newLine == true) Serial.println(message);
     else Serial.print(message);
+    #endif
+}
+
+// Blocks until the log UART has physically drained. The IDF panic handler only
+// flushes the console UART, so without this the last lines before a crash are
+// lost on the OPENDISPLAY_LOG_UART port — call after a marker to guarantee it
+// reaches the wire before a suspect call can fault.
+void flushLog(){
+    #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
+    LogSerialPort.flush();
+    #elif !defined(DISABLE_USB_SERIAL)
+    Serial.flush();
+    #endif
+    #ifdef TARGET_ESP32
+    delay(5);
     #endif
 }
 

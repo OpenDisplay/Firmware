@@ -182,6 +182,7 @@ void powerDownExternalFlashFromConfig(void);
 void xiaoinit();
 void ws_pp_init();
 void writeSerial(String message, bool newLine = true);
+void flushLog();
 void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 #ifdef TARGET_ESP32
