@@ -10,6 +10,10 @@
 #include <string.h>
 #include "ble_init.h"
 
+// Defined in display_service.cpp. True for a mid-stream image-write data frame
+// (0x0071) whose per-frame receive/queue logging should be suppressed.
+bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
+
 #ifndef COMMAND_QUEUE_SIZE
 #define COMMAND_QUEUE_SIZE 5
 #endif
@@ -67,25 +71,30 @@ public:
     }
 #endif
     void onWrite(BLECharacteristic* pCharacteristic) {
-        writeSerial("=== BLE WRITE RECEIVED (ESP32) ===");
         String value = pCharacteristic->getValue();
-        writeSerial("Received data length: " + String(value.length()) + " bytes");
+        const bool quiet = imageWriteLogQuietFrame((const uint8_t*)value.c_str(), value.length());
+        if (!quiet) {
+            writeSerial("=== BLE WRITE RECEIVED (ESP32) ===");
+            writeSerial("Received data length: " + String(value.length()) + " bytes");
+        }
         if (value.length() > 0 && value.length() <= MAX_COMMAND_SIZE) {
             uint8_t* data = (uint8_t*)value.c_str();
             uint16_t len = value.length();
-            String hexDump = "Data: ";
-            for (int i = 0; i < len && i < 16; i++) {
-                if (data[i] < 16) hexDump += "0";
-                hexDump += String(data[i], HEX) + " ";
+            if (!quiet) {
+                String hexDump = "Data: ";
+                for (int i = 0; i < len && i < 16; i++) {
+                    if (data[i] < 16) hexDump += "0";
+                    hexDump += String(data[i], HEX) + " ";
+                }
+                writeSerial(hexDump);
             }
-            writeSerial(hexDump);
             uint8_t nextHead = (commandQueueHead + 1) % COMMAND_QUEUE_SIZE;
             if (nextHead != commandQueueTail) {
                 memcpy(commandQueue[commandQueueHead].data, data, len);
                 commandQueue[commandQueueHead].len = len;
                 commandQueue[commandQueueHead].pending = true;
                 commandQueueHead = nextHead;
-                writeSerial("ESP32: Command queued for processing");
+                if (!quiet) writeSerial("ESP32: Command queued for processing");
             } else {
                 writeSerial("ERROR: Command queue full, dropping command");
             }

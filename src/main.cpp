@@ -131,22 +131,24 @@ void loop() {
         return;
     }
     if (commandQueueTail != commandQueueHead) {
-        writeSerial("ESP32: Processing queued command (" + String(commandQueue[commandQueueTail].len) + " bytes)");
+        const bool quietCmd = imageWriteLogQuietFrame(commandQueue[commandQueueTail].data, commandQueue[commandQueueTail].len);
+        if (!quietCmd) writeSerial("ESP32: Processing queued command (" + String(commandQueue[commandQueueTail].len) + " bytes)");
         imageDataWritten(NULL, NULL, commandQueue[commandQueueTail].data, commandQueue[commandQueueTail].len);
         commandQueue[commandQueueTail].pending = false;
         commandQueueTail = (commandQueueTail + 1) % COMMAND_QUEUE_SIZE;
-        writeSerial("Command processed");
+        if (!quietCmd) writeSerial("Command processed");
     }
     if (responseQueueTail != responseQueueHead) {
         if (esp32_ble_notify_enabled()) {
             uint8_t bleDrain = 0;
             while (responseQueueTail != responseQueueHead && bleDrain < 16) {
-                writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
+                const bool quietAck = imageWriteLogQuietFrame(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
+                if (!quietAck) writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
                 pTxCharacteristic->setValue(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
                 pTxCharacteristic->notify();
                 responseQueue[responseQueueTail].pending = false;
                 responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
-                writeSerial("Response sent successfully");
+                if (!quietAck) writeSerial("Response sent successfully");
                 bleDrain++;
             }
         } else if (pServer && pServer->getConnectedCount() > 0) {

@@ -74,6 +74,10 @@ void opendisplay_seeed_gfx_load_pins_from_display(const struct DisplayConfig* d,
 
 static EPaper g_seeed_epaper;
 static uint32_t seeed_direct_offset;
+// Plain RAM (deliberately NOT RTC_DATA_ATTR): false after every reset, including
+// deep-sleep wake — which is exactly when the power-cycled IT8951 TCON needs a full
+// begin()/hostTconInit() rather than a cheap wake(). Set true once fully inited per boot.
+static bool seeed_gfx_hw_initialized = false;
 
 static bool seeed_gfx_panel_is_4gray(void) {
     if (globalConfig.display_count < 1) return false;
@@ -109,6 +113,7 @@ void seeed_gfx_epaper_begin(void) {
         }
     }
     g_seeed_epaper.begin(0);
+    seeed_gfx_hw_initialized = true;
 }
 
 void seeed_gfx_full_update(void) {
@@ -139,7 +144,18 @@ void seeed_gfx_boot_skip_planes(void) {
 
 void seeed_gfx_direct_write_reset(void) {
     seeed_gfx_prepare_hardware();
-    g_seeed_epaper.wake();
+    if (!seeed_gfx_hw_initialized) {
+        // First render this boot (cold boot before any boot-screen init, or — the case
+        // this fixes — the first push after a deep-sleep wake): the IT8951 TCON was
+        // power-cycled, so a full begin() is required. hostTconInit() reprograms VCOM,
+        // panel dimensions, and I80CPCR packed-pixel mode; wake() alone only sends
+        // tconWake() and would leave the TCON unconfigured (garbled/blank first refresh
+        // or a busy stall). seeed_gfx_epaper_begin() also restores the correct gray-mode
+        // sprite and sets seeed_gfx_hw_initialized = true.
+        seeed_gfx_epaper_begin();
+    } else {
+        g_seeed_epaper.wake();
+    }
     seeed_direct_offset = 0;
     void* p = g_seeed_epaper.getPointer();
     if (p) {

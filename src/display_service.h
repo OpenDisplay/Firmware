@@ -34,6 +34,11 @@ void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
 void cleanupDirectWriteState(bool refreshDisplay);
 void handleDirectWriteEnd(uint8_t* data, uint16_t len);
+// True while an image push is mid-stream and the per-frame command/ack logging
+// should be suppressed (chunk 1 still logs in full; the meter covers the rest).
+bool imageWriteLogQuietCmd(void);
+bool imageWriteLogQuietAck(void);
+bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
 extern volatile bool epdRefreshInProgress;
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
 void checkPartialWriteTimeout(void);

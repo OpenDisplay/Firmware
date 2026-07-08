@@ -1370,6 +1370,99 @@ void updatemsdata(){
     mloopcounter &= 0x0F;
 }
 
+// --- Quiet image-write logging ---------------------------------------------
+// An image push arrives as a 0x70 start, many 0x71 data frames, and a 0x72 end.
+// Logging every frame + its ack floods the UART (~1 MB of text for a 1.3 MB
+// image) and, once the TX buffer fills, throttles the transfer itself. Instead
+// we log the first frame in full, a 5%-step percentage meter thereafter, and
+// the final frame + chunk total at completion. imageWriteLogQuiet{Cmd,Ack}()
+// let communication.cpp suppress the per-frame command/ack spam accordingly.
+static uint32_t imgLogTotalBytes;    // expected payload for this stream
+static uint32_t imgLogChunks;        // 0x71 frames seen this stream
+static uint8_t  imgLogLastStep;      // last 5% step printed (pct/5)
+static uint16_t imgLogLastLen;       // length of most recent frame
+static uint8_t  imgLogLastHead[16];  // first bytes of most recent frame
+static uint8_t  imgLogLastHeadLen;   // valid bytes in imgLogLastHead
+static uint32_t imgLogStartMs;       // millis() at stream start (for throughput)
+
+static String imgLogHex(const uint8_t* buf, uint8_t n) {
+    String s;
+    for (uint8_t i = 0; i < n; i++) {
+        if (i > 0) s += " ";
+        if (buf[i] < 16) s += "0";
+        s += String(buf[i], HEX);
+    }
+    return s;
+}
+
+static void imageWriteLogReset(void) {
+    imgLogTotalBytes = 0;
+    imgLogChunks = 0;
+    imgLogLastStep = 0;
+    imgLogLastLen = 0;
+    imgLogLastHeadLen = 0;
+    imgLogStartMs = 0;
+}
+
+static void imageWriteLogStart(uint32_t totalBytes) {
+    imgLogTotalBytes = totalBytes;
+    imgLogStartMs = millis();
+    writeSerial("DW start: " + String(totalBytes) + " bytes expected", true);
+}
+
+static void imageWriteLogChunk(const uint8_t* data, uint16_t len) {
+    imgLogChunks++;
+    imgLogLastLen = len;
+    imgLogLastHeadLen = (len < sizeof(imgLogLastHead)) ? (uint8_t)len : (uint8_t)sizeof(imgLogLastHead);
+    memcpy(imgLogLastHead, data, imgLogLastHeadLen);
+    if (imgLogChunks == 1) {
+        writeSerial("DW frame 1: " + String(len) + " bytes: " + imgLogHex(imgLogLastHead, imgLogLastHeadLen), true);
+        if (len > 0 && imgLogTotalBytes > 0) {
+            uint32_t est = (imgLogTotalBytes + len - 1) / len;
+            writeSerial("DW expecting ~" + String(est) + " chunks", true);
+        }
+    }
+}
+
+static void imageWriteLogProgress(uint32_t written, uint32_t total) {
+    if (total == 0) return;
+    uint32_t pct = (uint64_t)written * 100u / total;
+    if (pct >= 100) return;                 // completion summary covers 100%
+    uint8_t step = (uint8_t)(pct / 5u);
+    if (step <= imgLogLastStep) return;
+    imgLogLastStep = step;
+    writeSerial("DW " + String(pct) + "% (" + String(imgLogChunks) + " chunks, " +
+                String(written) + "/" + String(total) + " bytes)", true);
+}
+
+static void imageWriteLogFinish(uint32_t written, uint32_t total) {
+    writeSerial("DW final frame " + String(imgLogChunks) + ": " + String(imgLogLastLen) +
+                " bytes: " + imgLogHex(imgLogLastHead, imgLogLastHeadLen), true);
+    uint32_t elapsedMs = millis() - imgLogStartMs;   // unsigned wrap-safe over one stream
+    String rate = "n/a";
+    if (elapsedMs > 0) rate = String((float)written / 1.024f / (float)elapsedMs, 1);  // bytes/ms /1.024 = KB/s
+    writeSerial("DW complete: " + String(imgLogChunks) + " chunks, " +
+                String(written) + "/" + String(total) + " bytes, " +
+                String(elapsedMs / 1000.0f, 2) + " s, " + rate + " KB/s", true);
+}
+
+bool imageWriteLogQuietCmd(void) {
+    return (directWriteActive || partialCtx.active) && imgLogChunks >= 1;
+}
+
+bool imageWriteLogQuietAck(void) {
+    return (directWriteActive || partialCtx.active) && imgLogChunks >= 2;
+}
+
+// True when this raw frame is a mid-stream image-write data chunk (command
+// header 0x0071, unencrypted) whose per-frame BLE-receive/queue logging should
+// be suppressed. Lets the receive callback and queue drain in the other files
+// silence their spam without duplicating the stream-state check.
+bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len) {
+    return len >= 2 && data[0] == 0x00 && data[1] == 0x71 && imageWriteLogQuietCmd();
+}
+// ---------------------------------------------------------------------------
+
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
     if (len > UINT32_MAX - directWriteCompressedReceived) {
         cleanupDirectWriteState(true);
@@ -1384,6 +1477,7 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
         return;
     }
     directWriteCompressedReceived += len;
+    imageWriteLogProgress(directWriteBytesWritten, directWriteTotalBytes);
     uint8_t ackResponse[] = {0x00, 0x71};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
@@ -1466,6 +1560,7 @@ if (partialCtx.active) cleanup_partial_write_state();
     if (directWriteActive) {
         cleanupDirectWriteState(false);
     }
+    imageWriteLogReset();
     touchSuspendForEpdRefresh();
     directWriteTouchSuspended = true;
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
@@ -1510,6 +1605,7 @@ if (partialCtx.active) cleanup_partial_write_state();
     directWriteActive = true;
     directWriteBytesWritten = 0;
     directWriteStartTime = millis();
+    imageWriteLogStart(directWriteTotalBytes);
     if (displayPowerState) {
         pwrmgm(false);
         delay(50);
@@ -1547,6 +1643,7 @@ if (partialCtx.active) cleanup_partial_write_state();
 void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     if (directWriteActive) cleanupDirectWriteState(false);
     if (partialCtx.active) cleanup_partial_write_state();
+    imageWriteLogReset();
 
     if (len < 17) {
         send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, false);
@@ -1615,6 +1712,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     partialCtx.plane_size = planeBytes;
     partialCtx.current_plane = 0xFF;
     partialCtx.start_time = millis();
+    imageWriteLogStart(expectedLogicalSize);
 
     partial_prepare_panel_ram();
     if (partialCtx.compressed) od_zlib_stream_reset(expectedLogicalSize);
@@ -1635,15 +1733,18 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (partialCtx.active) {
         if (len == 0) return;
+        imageWriteLogChunk(data, len);
         if (!partial_consume_bytes(data, (uint32_t)len)) {
             send_direct_write_nack(0x71, ERR_PARTIAL_STREAM, true);
             return;
         }
+        imageWriteLogProgress(partialCtx.bytes_received, partialCtx.expected_stream_size);
         uint8_t ackResponse[] = {0x00, 0x71};
         sendResponse(ackResponse, sizeof(ackResponse));
         return;
     }
     if (!directWriteActive || len == 0) return;
+    imageWriteLogChunk(data, len);
     if (directWriteCompressed) {
         handleDirectWriteCompressedData(data, len);
         return;
@@ -1664,6 +1765,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
             directWriteBytesWritten += bytesToWrite;
         }
     }
+    imageWriteLogProgress(directWriteBytesWritten, directWriteTotalBytes);
     if (directWriteBytesWritten >= directWriteTotalBytes) {
         handleDirectWriteEnd(nullptr, 0);
     } else {
@@ -1687,6 +1789,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
             send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
             return;
         }
+        imageWriteLogFinish(partialCtx.bytes_received, partialCtx.expected_stream_size);
         uint8_t ackResponse[] = {0x00, 0x72};
         sendResponse(ackResponse, sizeof(ackResponse));
         int refreshMode = REFRESH_PARTIAL;
@@ -1725,6 +1828,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
             return;
         }
     }
+    imageWriteLogFinish(directWriteBytesWritten, directWriteTotalBytes);
     int refreshMode = REFRESH_FULL;
     if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
     writeSerial("EPD refresh: ", false);

@@ -81,7 +81,7 @@ static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
 }
 
 /** Mirror responses to BLE only when a central is connected; LAN already got send_wifi_lan_frame. */
-static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len) {
+static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
     if (len > MAX_RESPONSE_SIZE_LOCAL) {
         writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE_LOCAL) + ")", true);
         return;
@@ -98,7 +98,7 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len) {
     responseQueue[responseQueueHead].len = len;
     responseQueue[responseQueueHead].pending = true;
     responseQueueHead = nextHead;
-    writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE_LOCAL) % RESPONSE_QUEUE_SIZE_LOCAL) + ")", true);
+    if (!quiet) writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE_LOCAL) % RESPONSE_QUEUE_SIZE_LOCAL) + ")", true);
 }
 #endif
 
@@ -159,6 +159,11 @@ void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
 void sendResponse(uint8_t* response, uint16_t len) {
     static uint8_t encrypted_response[600];
     uint8_t errorResponse[3];
+    // Suppress the 4-line dump for the per-frame 0x0071 image-write ack once the
+    // stream is past its first chunk (chunk 1's ack still logs). Computed before
+    // `response` is swapped to the encrypted buffer. Errors/NACKs start with 0xFF
+    // and never match, so they always log.
+    const bool quietAck = (len == 2 && response[0] == 0x00 && response[1] == 0x71 && imageWriteLogQuietAck());
     if (isAuthenticated() && len >= 2) {
         uint16_t command = (response[0] << 8) | response[1];
         uint8_t status = (len >= 3) ? response[2] : 0x00;
@@ -169,9 +174,11 @@ void sendResponse(uint8_t* response, uint16_t len) {
             uint8_t auth_tag[12];
             uint16_t encrypted_len = 0;
             if (encryptResponse(response, len, encrypted_response, &encrypted_len, nonce, auth_tag)) {
-                writeSerial("Sending encrypted response:", true);
-                writeSerial("  Original length: " + String(len) + " bytes", true);
-                writeSerial("  Encrypted length: " + String(encrypted_len) + " bytes", true);
+                if (!quietAck) {
+                    writeSerial("Sending encrypted response:", true);
+                    writeSerial("  Original length: " + String(len) + " bytes", true);
+                    writeSerial("  Encrypted length: " + String(encrypted_len) + " bytes", true);
+                }
                 response = encrypted_response;
                 len = encrypted_len;
             } else {
@@ -182,37 +189,41 @@ void sendResponse(uint8_t* response, uint16_t len) {
                 response = errorResponse;
                 len = sizeof(errorResponse);
             }
-        } else {
+        } else if (!quietAck) {
             writeSerial("Sending unencrypted response (authentication/firmware version/error)", true);
         }
     }
 
-    writeSerial("Sending response:", true);
-    writeSerial("  Length: " + String(len) + " bytes", true);
-    writeSerial("  Command: 0x" + String(response[0], HEX) + String(response[1], HEX), true);
-    String hexDump = "  Full command: ";
-    for (int i = 0; i < len && i < 32; i++) {
-        if (i > 0) hexDump += " ";
-        if (response[i] < 16) hexDump += "0";
-        hexDump += String(response[i], HEX);
+    if (!quietAck) {
+        writeSerial("Sending response:", true);
+        writeSerial("  Length: " + String(len) + " bytes", true);
+        writeSerial("  Command: 0x" + String(response[0], HEX) + String(response[1], HEX), true);
+        String hexDump = "  Full command: ";
+        for (int i = 0; i < len && i < 32; i++) {
+            if (i > 0) hexDump += " ";
+            if (response[i] < 16) hexDump += "0";
+            hexDump += String(response[i], HEX);
+        }
+        if (len > 32) hexDump += " ...";
+        writeSerial(hexDump, true);
     }
-    if (len > 32) hexDump += " ...";
-    writeSerial(hexDump, true);
 #ifdef TARGET_ESP32
     send_wifi_lan_frame(response, len);
-    esp32_queue_ble_notify_copy(response, len);
+    esp32_queue_ble_notify_copy(response, len, quietAck);
 #endif
 #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
-        String nrfHexDump = "NRF: Sending response: ";
-        for (int i = 0; i < len && i < 32; i++) {
-            if (i > 0) nrfHexDump += " ";
-            if (response[i] < 16) nrfHexDump += "0";
-            nrfHexDump += String(response[i], HEX);
+        if (!quietAck) {
+            String nrfHexDump = "NRF: Sending response: ";
+            for (int i = 0; i < len && i < 32; i++) {
+                if (i > 0) nrfHexDump += " ";
+                if (response[i] < 16) nrfHexDump += "0";
+                nrfHexDump += String(response[i], HEX);
+            }
+            if (len > 32) nrfHexDump += "...";
+            writeSerial(nrfHexDump, true);
+            writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)", true);
         }
-        if (len > 32) nrfHexDump += "...";
-        writeSerial(nrfHexDump, true);
-        writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)", true);
         imageCharacteristic.notify(response, len);
         delay(20);
     } else {
@@ -477,7 +488,10 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     }
 
     uint16_t command = (data[0] << 8) | data[1];
-    writeSerial("Processing command: 0x" + String(command, HEX));
+    // Silence the per-frame command spam for image-write data (0x0071) once the
+    // stream is past its first chunk; the display handler's 5% meter reports it.
+    const bool quietCmd = (command == 0x0071) && imageWriteLogQuietCmd();
+    if (!quietCmd) writeSerial("Processing command: 0x" + String(command, HEX));
 
     if (command == 0x0050) {
         writeSerial("=== AUTHENTICATE COMMAND (0x0050) ===");
@@ -516,17 +530,19 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
 
         uint16_t encrypted_data_len = len - 2 - 16 - 12;
 
-        static char data_buf[256];
-        snprintf(data_buf, sizeof(data_buf), "Encrypted command: len=%u, command=0x%04X, encrypted_data_len=%u",
-                 (unsigned int)len, (unsigned int)command, (unsigned int)encrypted_data_len);
-        writeSerial(data_buf);
-        static char nonce_buf[64];
-        snprintf(nonce_buf, sizeof(nonce_buf), "Full nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
-                 nonce_full[0], nonce_full[1], nonce_full[2], nonce_full[3],
-                 nonce_full[4], nonce_full[5], nonce_full[6], nonce_full[7],
-                 nonce_full[8], nonce_full[9], nonce_full[10], nonce_full[11],
-                 nonce_full[12], nonce_full[13], nonce_full[14], nonce_full[15]);
-        writeSerial(nonce_buf);
+        if (!quietCmd) {
+            static char data_buf[256];
+            snprintf(data_buf, sizeof(data_buf), "Encrypted command: len=%u, command=0x%04X, encrypted_data_len=%u",
+                     (unsigned int)len, (unsigned int)command, (unsigned int)encrypted_data_len);
+            writeSerial(data_buf);
+            static char nonce_buf[64];
+            snprintf(nonce_buf, sizeof(nonce_buf), "Full nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                     nonce_full[0], nonce_full[1], nonce_full[2], nonce_full[3],
+                     nonce_full[4], nonce_full[5], nonce_full[6], nonce_full[7],
+                     nonce_full[8], nonce_full[9], nonce_full[10], nonce_full[11],
+                     nonce_full[12], nonce_full[13], nonce_full[14], nonce_full[15]);
+            writeSerial(nonce_buf);
+        }
 
         if (!decryptCommand(data + 2 + 16, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
             writeSerial("ERROR: Decryption failed");
@@ -613,5 +629,5 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             writeSerial("Expected: 0x0011 (read config), 0x0064 (image info), 0x0065 (block data), or 0x0003 (finalize)");
             break;
     }
-    writeSerial("Command processing completed successfully");
+    if (!quietCmd) writeSerial("Command processing completed successfully");
 }
