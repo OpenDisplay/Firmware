@@ -192,7 +192,6 @@ void flushLog();
 void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 #ifdef TARGET_ESP32
-void minimalSetup();
 void fullSetupAfterConnection();
 void enterDeepSleep();
 extern bool advertising_timeout_active;

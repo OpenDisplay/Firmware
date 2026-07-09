@@ -60,19 +60,19 @@ void setup() {
     } else {
         writeSerial("Git SHA: (not set)");
     }
+    // Set only by the ESP32 wake-cause check below; NRF has no deep-sleep wake path.
+    bool is_deep_sleep_wake = false;
     #ifdef TARGET_ESP32
     esp_reset_reason_t reset_reason = esp_reset_reason();
     writeSerial("Reset reason: " + String(resetReasonName(reset_reason)) + " (" + String((int)reset_reason) + ")");
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    bool is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
+    is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
     if (is_deep_sleep_wake) {
         woke_from_deep_sleep = true;
         deep_sleep_count++;
         writeSerial("=== WOKE FROM DEEP SLEEP ===");
         writeSerial("Wake-up reason: " + String(wakeup_reason));
         writeSerial("Deep sleep count: " + String(deep_sleep_count));
-        minimalSetup();
-        return;
     } else {
         woke_from_deep_sleep = false;
         writeSerial("=== NORMAL BOOT ===");
@@ -82,26 +82,48 @@ void setup() {
     }
     #endif
     writeSerial("Starting setup...");
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> full_config_init"); flushLog(); }
     full_config_init();
+    if (is_deep_sleep_wake) { writeSerial("[wake] << full_config_init >> initio"); flushLog(); }
     initio();
 #ifdef TARGET_NRF
     // SoftDevice must start before display/SPI; advertising starts after boot screen.
     ble_nrf_stack_init();
 #endif
-    initDisplay();
-    writeSerial("Display initialized");
+    if (!is_deep_sleep_wake) {
+        // Wake keeps the panel image; skipping initDisplay() (EPD rail power +
+        // full refresh) is the wake path's main energy saving.
+        initDisplay();
+        writeSerial("Display initialized");
+    }
 #ifdef TARGET_ESP32
     // Full BLE after display: ESP32 queues commands for loop() until setup returns.
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> ble_init"); flushLog(); }
     ble_init();
+    if (is_deep_sleep_wake) { writeSerial("[wake] << ble_init"); flushLog(); }
 #elif defined(TARGET_NRF)
     ble_nrf_advertising_start();
 #endif
     #ifdef TARGET_ESP32
-    initWiFi(false);
+    if (!is_deep_sleep_wake) {
+        initWiFi(false);  // wake: WiFi stays deferred to fullSetupAfterConnection()
+    }
     #endif
     updatemsdata();
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> initButtons"); flushLog(); }
     initButtons();
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> initTouchInput"); flushLog(); }
     initTouchInput();
+    #ifdef TARGET_ESP32
+    if (is_deep_sleep_wake) {
+        // Arm the awake window LAST so buttons/GT911 bring-up doesn't shrink the
+        // host's connection window. Without this, loop() falls into the idle
+        // branch and re-enters deep sleep almost immediately.
+        writeSerial("Advertising for " + String(globalConfig.power_option.sleep_timeout_ms) + " ms (sleep_timeout_ms), waiting for connection...");
+        advertising_timeout_active = true;
+        advertising_start_time = millis();
+    }
+    #endif
     writeSerial("=== Setup completed successfully ===");
 }
 
@@ -270,20 +292,6 @@ void idleDelay(uint32_t delayMs) {
 
 
 #ifdef TARGET_ESP32
-void minimalSetup() {
-    writeSerial("=== Minimal Setup (Deep Sleep Wake) ===");
-    writeSerial("[wake] >> full_config_init"); flushLog();
-    full_config_init();
-    writeSerial("[wake] << full_config_init >> initio"); flushLog();
-    initio();
-    writeSerial("[wake] << initio >> ble_init_esp32"); flushLog();
-    ble_init_esp32(true); // Update manufacturer data
-    writeSerial("[wake] << ble_init_esp32"); flushLog();
-    writeSerial("Advertising for " + String(globalConfig.power_option.sleep_timeout_ms) + " ms (sleep_timeout_ms), waiting for connection...");
-    advertising_timeout_active = true;
-    advertising_start_time = millis();
-}
-
 void fullSetupAfterConnection() {
     writeSerial("=== Full Setup After Connection ===");
     initWiFi(false);
@@ -299,6 +307,7 @@ void fullSetupAfterConnection() {
         int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
         writeSerial("Panel type: " + String(panelType));
         bbepSetPanelType(&bbep, panelType);
+        bbepSetRotation(&bbep, globalConfig.displays[0].rotation * 90);
     }
     writeSerial("=== Full setup completed ===");
 }
