@@ -60,19 +60,19 @@ void setup() {
     } else {
         writeSerial("Git SHA: (not set)");
     }
+    // Set only by the ESP32 wake-cause check below; NRF has no deep-sleep wake path.
+    bool is_deep_sleep_wake = false;
     #ifdef TARGET_ESP32
     esp_reset_reason_t reset_reason = esp_reset_reason();
     writeSerial("Reset reason: " + String(resetReasonName(reset_reason)) + " (" + String((int)reset_reason) + ")");
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    bool is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
+    is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
     if (is_deep_sleep_wake) {
         woke_from_deep_sleep = true;
         deep_sleep_count++;
         writeSerial("=== WOKE FROM DEEP SLEEP ===");
         writeSerial("Wake-up reason: " + String(wakeup_reason));
         writeSerial("Deep sleep count: " + String(deep_sleep_count));
-        minimalSetup();
-        return;
     } else {
         woke_from_deep_sleep = false;
         writeSerial("=== NORMAL BOOT ===");
@@ -82,31 +82,116 @@ void setup() {
     }
     #endif
     writeSerial("Starting setup...");
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> full_config_init"); flushLog(); }
     full_config_init();
+    if (is_deep_sleep_wake) { writeSerial("[wake] << full_config_init >> initio"); flushLog(); }
     initio();
 #ifdef TARGET_NRF
     // SoftDevice must start before display/SPI; advertising starts after boot screen.
     ble_nrf_stack_init();
 #endif
-    initDisplay();
-    writeSerial("Display initialized");
+    if (!is_deep_sleep_wake) {
+        // Arm here rather than at declaration: this branch is the boot screen
+        // redraw, and every real reset (power-on, panic, WDT, SW) clears the
+        // wake cause and lands here. A deep-sleep wake skips it and keeps the
+        // pre-sleep flag, so a wake never advertises as a reboot.
+        rebootFlag = 1;
+        // Wake keeps the panel image; skipping initDisplay() (EPD rail power +
+        // full refresh) is the wake path's main energy saving.
+        initDisplay();
+        writeSerial("Display initialized");
+    }
 #ifdef TARGET_ESP32
     // Full BLE after display: ESP32 queues commands for loop() until setup returns.
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> ble_init"); flushLog(); }
     ble_init();
+    if (is_deep_sleep_wake) { writeSerial("[wake] << ble_init"); flushLog(); }
 #elif defined(TARGET_NRF)
     ble_nrf_advertising_start();
 #endif
     #ifdef TARGET_ESP32
-    initWiFi(false);
+    if (!is_deep_sleep_wake) {
+        initWiFi(false);  // wake: WiFi stays deferred to fullSetupAfterConnection()
+    }
     #endif
     updatemsdata();
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> initButtons"); flushLog(); }
     initButtons();
+    if (is_deep_sleep_wake) { writeSerial("[wake] >> initTouchInput"); flushLog(); }
     initTouchInput();
+    #ifdef TARGET_ESP32
+    if (is_deep_sleep_wake) {
+        // Arm the awake window LAST so buttons/GT911 bring-up doesn't shrink the
+        // host's connection window. Without this, loop() falls into the idle
+        // branch and re-enters deep sleep almost immediately.
+        writeSerial("Advertising for " + String(globalConfig.power_option.sleep_timeout_ms) + " ms (sleep_timeout_ms), waiting for connection...");
+        advertising_timeout_active = true;
+        advertising_start_time = millis();
+    }
+    // Both sleep paths measure quiet time from here, not from power-on.
+    lastActivityMs = millis();
+    #endif
     writeSerial("=== Setup completed successfully ===");
 }
 
+#ifdef TARGET_ESP32
+// Single point of activity detection. Rather than have every producer (BLE host
+// task, buttons, touch, LAN) stamp a timestamp, sample the state they already
+// mutate and treat any change since the previous pass as activity.
+//
+// Runs at the top of loop() so an event raised during the previous pass always
+// lands before this pass decides to sleep.
+static void pollActivity() {
+    static bool activityPrimed = false;
+    static uint8_t prevCommandHead = 0;
+    static uint8_t prevResponseHead = 0;
+    static uint8_t prevConnCount = 0;
+    static bool prevLanSession = false;
+    static uint8_t prevDynamic[sizeof(dynamicreturndata)] = {0};
+
+    // Queue heads are producer-side, so a command that arrived and drained within
+    // a single pass still registers. The heads wrap (mod 5 and 10), but aliasing
+    // needs a whole queue of traffic inside one pass, and queues only fill while a
+    // client is connected — which stamps below regardless.
+    const uint8_t commandHead = commandQueueHead;
+    const uint8_t responseHead = responseQueueHead;
+    // Covers connect and disconnect. The disconnect edge is what re-arms the
+    // window so a dropped client gets a full reconnect opportunity.
+    const uint8_t connCount = (pServer != nullptr) ? (uint8_t)pServer->getConnectedCount() : 0;
+    const bool lanSession = wifiInitialized && wifiServerConnected && wifiClient.connected();
+
+    if (!activityPrimed) {
+        activityPrimed = true;
+    } else if (commandHead != prevCommandHead ||
+               responseHead != prevResponseHead ||
+               connCount != prevConnCount ||
+               lanSession != prevLanSession ||
+               // Button presses and touch events land here before advertising.
+               memcmp(prevDynamic, dynamicreturndata, sizeof(prevDynamic)) != 0 ||
+               // Set by onDisconnect and cleared further down this loop, so it is
+               // the only trace of a connect+drop that lands entirely between two
+               // passes — connCount reads 0 on both sides of such a blip.
+               bleRestartAdvertisingPending ||
+               // A live link or unfinished work is activity in itself, not just its edges.
+               connCount > 0 || lanSession ||
+               commandQueueTail != commandHead ||
+               responseQueueTail != responseHead) {
+        lastActivityMs = millis();
+    }
+
+    prevCommandHead = commandHead;
+    prevResponseHead = responseHead;
+    prevConnCount = connCount;
+    prevLanSession = lanSession;
+    memcpy(prevDynamic, dynamicreturndata, sizeof(prevDynamic));
+}
+#endif
+
 void loop() {
     processLedFlash();
+    #ifdef TARGET_ESP32
+    pollActivity();
+    #endif
     #ifdef TARGET_ESP32
     if (woke_from_deep_sleep && advertising_timeout_active) {
         if (pServer && pServer->getConnectedCount() > 0) {
@@ -116,13 +201,21 @@ void loop() {
             woke_from_deep_sleep = false;
             return;
         }
-        uint32_t advertising_duration = millis() - advertising_start_time;
+        // A connect+drop entirely inside one poll gap leaves the radio dark for the
+        // rest of the window; the flag is otherwise only serviced past this return.
+        if (bleRestartAdvertisingPending) {
+            esp32_restart_ble_advertising();
+        }
         uint32_t advertising_timeout_ms = globalConfig.power_option.sleep_timeout_ms;
         if (advertising_timeout_ms == 0) {
-            advertising_timeout_ms = 10000;
+            advertising_timeout_ms = DEFAULT_IDLE_HOLD_MS;
         }
-        if (advertising_duration >= advertising_timeout_ms) {
-            writeSerial("BLE advertising timeout (" + String(advertising_duration) + " ms) - no connection, returning to deep sleep");
+        // Measured from the last activity, not from window start: a client that
+        // connects and drops re-arms the full window instead of inheriting it.
+        uint32_t idle_duration = millis() - lastActivityMs;
+        if (idle_duration >= advertising_timeout_ms) {
+            writeSerial("BLE advertising timeout (idle " + String(idle_duration) + " ms of " +
+                        String(millis() - advertising_start_time) + " ms window) - no connection, returning to deep sleep");
             advertising_timeout_active = false;
             enterDeepSleep();
             return;
@@ -194,13 +287,16 @@ void loop() {
     #else
     const bool wifiLanSession = false;
     #endif
-    bool bleActive = (commandQueueTail != commandQueueHead) ||
-                     (responseQueueTail != responseQueueHead) ||
-                     (pServer && pServer->getConnectedCount() > 0) ||
-                     bleRestartAdvertisingPending ||
-                     epdRefreshInProgress ||
-                     wifiLanSession;
-    if (bleActive) {
+    // Work in flight *this iteration* only. Every term below is transient and most
+    // are cleared earlier in this same loop pass, so this must never be the sole
+    // gate on deep sleep — lastActivityMs supplies the quiet window.
+    bool workInFlight = (commandQueueTail != commandQueueHead) ||
+                        (responseQueueTail != responseQueueHead) ||
+                        (pServer && pServer->getConnectedCount() > 0) ||
+                        bleRestartAdvertisingPending ||
+                        epdRefreshInProgress ||
+                        wifiLanSession;
+    if (workInFlight) {
         processButtonEvents();
         processTouchInput();
         delay(1);
@@ -223,7 +319,17 @@ void loop() {
             }
         }
         if(globalConfig.power_option.deep_sleep_time_seconds > 0 && globalConfig.power_option.power_mode == 1){
-            enterDeepSleep();
+            uint32_t idleHoldMs = globalConfig.power_option.sleep_timeout_ms;
+            if (idleHoldMs == 0) {
+                idleHoldMs = DEFAULT_IDLE_HOLD_MS;
+            }
+            uint32_t idleMs = millis() - lastActivityMs;
+            if (idleMs < idleHoldMs) {
+                idleDelay(5);
+            } else {
+                writeSerial("Idle " + String(idleMs) + " ms (hold " + String(idleHoldMs) + " ms) - entering deep sleep");
+                enterDeepSleep();
+            }
         }
         else{
             idleDelay(2000);
@@ -270,21 +376,6 @@ void idleDelay(uint32_t delayMs) {
 
 
 #ifdef TARGET_ESP32
-void minimalSetup() {
-    writeSerial("=== Minimal Setup (Deep Sleep Wake) ===");
-    writeSerial("[wake] >> full_config_init"); flushLog();
-    full_config_init();
-    writeSerial("[wake] << full_config_init >> initio"); flushLog();
-    initio();
-    writeSerial("[wake] << initio >> ble_init_esp32"); flushLog();
-    ble_init_esp32(true); // Update manufacturer data
-    writeSerial("[wake] << ble_init_esp32"); flushLog();
-    writeSerial("=== BLE advertising started (minimal mode) ===");
-    writeSerial("Advertising for 10 seconds, waiting for connection...");
-    advertising_timeout_active = true;
-    advertising_start_time = millis();
-}
-
 void fullSetupAfterConnection() {
     writeSerial("=== Full Setup After Connection ===");
     initWiFi(false);
@@ -300,11 +391,12 @@ void fullSetupAfterConnection() {
         int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
         writeSerial("Panel type: " + String(panelType));
         bbepSetPanelType(&bbep, panelType);
+        bbepSetRotation(&bbep, globalConfig.displays[0].rotation * 90);
     }
     writeSerial("=== Full setup completed ===");
 }
 
-void enterDeepSleep() {
+void enterDeepSleep(bool force) {
     if (globalConfig.power_option.power_mode != 1) {
         writeSerial("Skipping deep sleep - not battery powered (power_mode: " + String(globalConfig.power_option.power_mode) + ")");
         delay(2000);
@@ -313,6 +405,13 @@ void enterDeepSleep() {
     if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
         writeSerial("Skipping deep sleep - deep_sleep_time_seconds is 0");
         delay(2000);
+        return;
+    }
+    // Callers sample their idle state before getting here; a central can connect in
+    // that gap. Re-check so we never tear down the stack on a live link.
+    if (!force && pServer != nullptr && pServer->getConnectedCount() > 0) {
+        writeSerial("Skipping deep sleep - BLE client connected");
+        lastActivityMs = millis();
         return;
     }
     writeSerial("Entering deep sleep for " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");

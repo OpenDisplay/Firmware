@@ -122,8 +122,20 @@ void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
 
 uint8_t decompressionChunk[OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE];
 uint8_t bleResponseBuffer[94];
+#ifdef TARGET_ESP32
+// Rolling MSD sequence nibble; persists across deep sleep so advertisements
+// stay distinguishable across sleep/wake cycles.
+RTC_DATA_ATTR uint8_t mloopcounter = 0;
+#else
 uint8_t mloopcounter = 0;
+#endif
+#ifdef TARGET_ESP32
+// Persists across deep sleep so a wake is not mistaken for a reboot. Re-armed
+// on the boot-screen path in setup(), which is the only path a real reset takes.
+RTC_DATA_ATTR uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection
+#else
 uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection
+#endif
 uint8_t connectionRequested = 0;  // Reserved for future features (connection requested flag)
 uint8_t dynamicreturndata[11] = {0};  // Dynamic return data blocks (bytes 2-12 in advertising payload)
 uint8_t msd_payload[16] = {0};  // Manufacturer Specific Data payload (public, updated by updatemsdata())
@@ -186,9 +198,9 @@ void flushLog();
 void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 #ifdef TARGET_ESP32
-void minimalSetup();
 void fullSetupAfterConnection();
-void enterDeepSleep();
+// force: sleep even with a client connected (explicit host request 0x0052).
+void enterDeepSleep(bool force = false);
 extern bool advertising_timeout_active;
 extern uint32_t advertising_start_time;
 #endif
@@ -298,6 +310,14 @@ RTC_DATA_ATTR uint32_t deep_sleep_count = 0;
 // Advertising timeout state variables
 bool advertising_timeout_active = false;
 uint32_t advertising_start_time = 0;
+
+// Stamped by pollActivity() at the top of every loop() pass. Both sleep paths
+// require a continuous quiet window since this stamp, so a dropped link, an
+// in-flight command, or a pending ack extends the window rather than racing a
+// single idle iteration.
+uint32_t lastActivityMs = 0;
+// Quiet window required before deep sleep when sleep_timeout_ms is unset.
+static constexpr uint32_t DEFAULT_IDLE_HOLD_MS = 10000;
 
 // First-boot holdoff before allowing deep sleep (2 minutes)
 static constexpr uint32_t FIRST_BOOT_DEEP_SLEEP_DELAY_MS = 120000;

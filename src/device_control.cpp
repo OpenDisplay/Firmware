@@ -6,7 +6,7 @@
 #include <string.h>
 
 #ifdef TARGET_ESP32
-void enterDeepSleep();
+void enterDeepSleep(bool force = false);
 #endif
 
 #ifdef TARGET_NRF
@@ -698,7 +698,8 @@ void handleDeepSleepCommand() {
         powerLatchPowerOff();
         return;
     }
-    enterDeepSleep();
+    // Explicit host request: sleep even though the requesting client is connected.
+    enterDeepSleep(true);
 #else
     writeSerial("Deep sleep command not supported on this target", true);
 #endif

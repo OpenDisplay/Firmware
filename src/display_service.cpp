@@ -1281,6 +1281,7 @@ float readChipTemperature() {
 }
 
 void updatemsdata(){
+    // writeSerial("updatemsdata() called (mloopcounter: " + String(mloopcounter) + ")", true);
     pollSht40SensorsForMsd();
     pollBq27220ForMsd();
     float batteryVoltage = readBatteryVoltage();
