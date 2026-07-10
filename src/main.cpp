@@ -425,7 +425,6 @@ void enterDeepSleep(bool force) {
         lastActivityMs = millis();
         return;
     }
-    writeSerial("Entering deep sleep for " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");
     woke_from_deep_sleep = true; // Will be true on next boot
     if (pServer != nullptr) {
         BLEAdvertising *pAdvertising = pServer->getAdvertising();
@@ -441,7 +440,9 @@ void enterDeepSleep(bool force) {
     writeSerial("BLE deinitialized");
     uint64_t sleep_timeout_us = (uint64_t)globalConfig.power_option.deep_sleep_time_seconds * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleep_timeout_us);
-    writeSerial("Entering deep sleep...");
+    // consider adding code to enable button wake-up from deep sleep
+    writeSerial("Entering deep sleep for " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");
+    flushLog(); // Arduino drain UART/Serial prior to deep sleep
     delay(100); // Brief delay to ensure serial output is sent
     powerLatchHoldForSleep();
     esp_deep_sleep_start();
