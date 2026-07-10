@@ -193,6 +193,7 @@ void loop() {
     pollActivity();
     #endif
     #ifdef TARGET_ESP32
+    // THIS IS THE MAIN (FIRST) LOOP FOR A DEEP SLEEP ENABLED ESP32
     if (woke_from_deep_sleep && advertising_timeout_active) {
         if (pServer && pServer->getConnectedCount() > 0) {
             writeSerial("BLE connection established - switching to full mode");
@@ -220,15 +221,25 @@ void loop() {
             enterDeepSleep();
             return;
         }
-        delay(50);
+        // idleDelay() services buttons + touch (and LED flash) while it waits, so a
+        // wake-time touch is polled during this window even though the branch returns
+        // on every pass until a client connects. It lands in dynamicreturndata, reaches
+        // a mid-window client, and pollActivity picks it up next pass to hold the window
+        // open — none of which happens if we just delay() here without servicing input.
+        idleDelay(50); // idleDelay() polls touch and buttons while waiting
         return;
     }
+    // THIS IS THE END OF THE MAIN LOOP() FOR DEEP SLEEP ESP32.  Loop starts over.
+    // IF CONNECTION OCCURED THEN SET woke_from_deep_sleep=false and escape above on next loop
+    // BELOW THIS IS WHERE ESP32 DOES WORK
     if (commandQueueTail != commandQueueHead) {
         const bool quietCmd = imageWriteLogQuietFrame(commandQueue[commandQueueTail].data, commandQueue[commandQueueTail].len);
         if (!quietCmd) writeSerial("ESP32: Processing queued command (" + String(commandQueue[commandQueueTail].len) + " bytes)");
+    // imageDataWritten (misleading name) actually services any BLE command
+    // services up to 1 command per pass
         imageDataWritten(NULL, NULL, commandQueue[commandQueueTail].data, commandQueue[commandQueueTail].len);
         commandQueue[commandQueueTail].pending = false;
-        commandQueueTail = (commandQueueTail + 1) % COMMAND_QUEUE_SIZE;
+        commandQueueTail = (commandQueueTail + 1) % COMMAND_QUEUE_SIZE; // WRAP THE QUEUE
         if (!quietCmd) writeSerial("Command processed");
     }
     if (responseQueueTail != responseQueueHead) {
