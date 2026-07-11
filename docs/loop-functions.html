@@ -1,0 +1,449 @@
+<title>loop() Callees — Function Reference</title>
+<style>
+  :root {
+    --bg:#f4f6f5; --panel:#ffffff; --ink:#16201f; --ink-soft:#4a5654; --ink-faint:#7c8785;
+    --hair:#dde3e1; --rail:#c9d2cf;
+    --teal:#0f8f80; --teal-bg:#e6f4f1;
+    --amber:#b8730a; --amber-bg:#fbf0dd;
+    --rose:#c43a53; --rose-bg:#fbe6ea;
+    --indigo:#4f57c9; --indigo-bg:#e9eafb;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0e1414; --panel:#141c1b; --ink:#e7eeec; --ink-soft:#a7b3b0; --ink-faint:#6f7c79;
+      --hair:#223029; --rail:#2c3a37;
+      --teal:#35d6c1; --teal-bg:#10322d; --amber:#f0b45e; --amber-bg:#33260f;
+      --rose:#fb7185; --rose-bg:#35141c; --indigo:#9aa2f5; --indigo-bg:#1c1e3a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0e1414; --panel:#141c1b; --ink:#e7eeec; --ink-soft:#a7b3b0; --ink-faint:#6f7c79;
+    --hair:#223029; --rail:#2c3a37;
+    --teal:#35d6c1; --teal-bg:#10322d; --amber:#f0b45e; --amber-bg:#33260f;
+    --rose:#fb7185; --rose-bg:#35141c; --indigo:#9aa2f5; --indigo-bg:#1c1e3a;
+  }
+  :root[data-theme="light"] {
+    --bg:#f4f6f5; --panel:#ffffff; --ink:#16201f; --ink-soft:#4a5654; --ink-faint:#7c8785;
+    --hair:#dde3e1; --rail:#c9d2cf;
+    --teal:#0f8f80; --teal-bg:#e6f4f1; --amber:#b8730a; --amber-bg:#fbf0dd;
+    --rose:#c43a53; --rose-bg:#fbe6ea; --indigo:#4f57c9; --indigo-bg:#e9eafb;
+  }
+
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+    line-height:1.6; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1040px; margin:0 auto; padding:clamp(1.5rem,4vw,4rem) clamp(1rem,4vw,2.5rem) 5rem; }
+
+  .eyebrow { font-family:var(--mono); font-size:.72rem; letter-spacing:.22em;
+    text-transform:uppercase; color:var(--teal); margin:0 0 .9rem; }
+  h1 { font-family:var(--mono); font-weight:600; font-size:clamp(1.7rem,4.5vw,2.6rem);
+    line-height:1.14; letter-spacing:-.01em; text-wrap:balance; margin:0 0 1rem; }
+  h1 .paren { color:var(--ink-faint); font-weight:400; }
+  .lede { max-width:64ch; color:var(--ink-soft); font-size:1.02rem; margin:0 0 1.5rem; }
+  .source { font-family:var(--mono); font-size:.82rem; color:var(--ink-soft);
+    display:inline-flex; align-items:center; gap:.5rem; padding:.4rem .7rem;
+    border:1px solid var(--hair); border-radius:7px; background:var(--panel); }
+  .source b { color:var(--teal); font-weight:600; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:.5rem 1.4rem; margin:1.6rem 0 0;
+    padding:.9rem 1.2rem; border:1px solid var(--hair); border-radius:10px; background:var(--panel); }
+  .legend .item { display:inline-flex; align-items:center; gap:.55rem;
+    font-family:var(--mono); font-size:.78rem; color:var(--ink-soft); }
+  .badge { font-family:var(--mono); font-size:.66rem; letter-spacing:.08em; text-transform:uppercase;
+    padding:.16rem .5rem; border-radius:5px; white-space:nowrap; font-weight:600; }
+  .b-esp { color:var(--teal); background:var(--teal-bg); }
+  .b-nrf { color:var(--indigo); background:var(--indigo-bg); }
+  .b-both { color:var(--ink-soft); background:var(--hair); }
+
+  section { margin-top:3rem; }
+  .sec-head { display:flex; align-items:baseline; gap:.8rem; padding-bottom:.6rem;
+    margin-bottom:1.3rem; border-bottom:1px solid var(--hair); }
+  .sec-num { font-family:var(--mono); font-size:.82rem; color:var(--ink-faint); }
+  .sec-head h2 { font-family:var(--mono); font-size:1.12rem; font-weight:600; margin:0; letter-spacing:.01em; }
+  .sec-head .count { margin-left:auto; font-family:var(--mono); font-size:.72rem; color:var(--ink-faint); }
+
+  .grid { display:flex; flex-direction:column; gap:1rem; }
+  .fn { border:1px solid var(--hair); border-left:3px solid var(--teal); background:var(--panel);
+    border-radius:9px; padding:1rem 1.15rem; }
+  .fn.nrf { border-left-color:var(--indigo); }
+  .fn.both { border-left-color:var(--rail); }
+  .fn-top { display:flex; flex-wrap:wrap; align-items:baseline; gap:.6rem .8rem; }
+  .fn-name { font-family:var(--mono); font-size:.98rem; font-weight:600; color:var(--ink); }
+  .fn-name .args { color:var(--ink-faint); font-weight:400; }
+  .fn-loc { font-family:var(--mono); font-size:.72rem; color:var(--ink-faint); }
+  .fn-loc a { color:var(--ink-faint); text-decoration:none; border-bottom:1px dotted var(--rail); }
+  .fn-badges { margin-left:auto; display:inline-flex; gap:.4rem; }
+  .fn-desc { margin:.7rem 0 0; color:var(--ink-soft); font-size:.93rem; }
+  .fn-desc b { color:var(--ink); font-weight:600; }
+  .fn-note { margin:.55rem 0 0; font-family:var(--mono); font-size:.76rem; color:var(--amber);
+    background:var(--amber-bg); border-radius:6px; padding:.4rem .6rem; display:inline-block; }
+  code { font-family:var(--mono); font-size:.86em; background:var(--hair);
+    padding:.05rem .3rem; border-radius:4px; }
+
+  .foot { margin-top:3.5rem; padding-top:1.3rem; border-top:1px solid var(--hair);
+    color:var(--ink-faint); font-size:.82rem; font-family:var(--mono); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    section { animation:rise .5s ease both; }
+    @keyframes rise { from{opacity:0; transform:translateY(8px);} to{opacity:1; transform:none;} }
+  }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Firmware · loop() call reference</p>
+  <h1>What each function in <span class="paren">loop()</span> does</h1>
+  <p class="lede">
+    Every function invoked from the <code>loop()</code> body, grouped by subsystem. For each:
+    where it lives, which build it runs on, and what it actually does — including the side effects
+    and guards that matter when reasoning about the main loop. Standard Arduino core calls
+    (<code>millis()</code>, <code>delay()</code>) and raw BLE library methods
+    (<code>setValue()</code>/<code>notify()</code>) are noted inline rather than catalogued.
+  </p>
+  <span class="source">Callees of loop() · src/main.cpp <b>L190–357</b></span>
+
+  <div class="legend">
+    <span class="item"><span class="badge b-esp">ESP32</span> ESP32-only path</span>
+    <span class="item"><span class="badge b-nrf">nRF</span> nRF-only path</span>
+    <span class="item"><span class="badge b-both">Both</span> compiled on both targets</span>
+  </div>
+
+  <!-- ============ POWER & SLEEP ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">01</span>
+      <h2>Power &amp; sleep lifecycle</h2>
+      <span class="count">4 functions</span>
+    </div>
+    <div class="grid">
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">pollActivity<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/main.cpp#L144">main.cpp:144</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Runs first on every ESP32 pass. Compares BLE queue heads, connection count, LAN-session
+          state, the dynamic advertising payload, and the <code>bleRestartAdvertisingPending</code>
+          flag against their previous values; if <b>anything changed — or work is simply in
+          flight — it stamps <code>lastActivityMs = millis()</code></b>. That timestamp is the sole
+          input to the deep-sleep quiet window, so this function is what keeps the device awake
+          while it's busy.
+        </p>
+        <p class="fn-note">Edge-detects connect+drop blips that leave connCount at 0 on both sides.</p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">enterDeepSleep<span class="args">(bool force = false)</span></span>
+          <span class="fn-loc"><a href="../src/main.cpp#L399">main.cpp:399</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Puts the ESP32 into timer-wake deep sleep. <b>Bails early</b> if not battery-powered
+          (<code>power_mode != 1</code>), if <code>deep_sleep_time_seconds == 0</code>, or — unless
+          <code>force</code> — if a BLE client is connected (re-checked here to avoid tearing down a
+          live link). Otherwise sets <code>woke_from_deep_sleep</code>, stops advertising,
+          deinits the BLE stack, arms the wake timer, latches power for sleep, and calls
+          <code>esp_deep_sleep_start()</code> — which does not return.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">fullSetupAfterConnection<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/main.cpp#L379">main.cpp:379</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Called once when a client connects during the post-wake advertising window. Promotes the
+          device from the lightweight wake state to full operation: brings up WiFi
+          (<code>initWiFi(false)</code>) and, for bb_epaper panels, zeroes and re-initializes the
+          panel driver (<code>bbepSetPanelType</code> / rotation). Seeed-GFX panels skip the
+          bb_epaper re-init.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">idleDelay<span class="args">(uint32_t delayMs)</span></span>
+          <span class="fn-loc"><a href="../src/main.cpp#L361">main.cpp:361</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          An <b>interruptible replacement for <code>delay()</code></b>. Sleeps in 100 ms chunks, and
+          between chunks keeps the device responsive: nRF advertising tick, button events, touch
+          input, and LED flash all get serviced. Used everywhere the loop wants to pause without
+          going deaf to input.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ BLE & COMMAND PATH ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">02</span>
+      <h2>BLE &amp; command path</h2>
+      <span class="count">5 functions</span>
+    </div>
+    <div class="grid">
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">imageDataWritten<span class="args">(conn, chr, data, len)</span></span>
+          <span class="fn-loc"><a href="../src/communication.cpp#L482">communication.cpp:482</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          The <b>central command dispatcher</b>. Reads a 2-byte big-endian opcode and routes to the
+          matching handler (authenticate, firmware version, image write, etc.), enforcing the
+          authentication/encryption gate for everything except 0x0050 and 0x0043. In the loop it's
+          driven from the ESP32 command queue; it's also the BLE write callback on nRF and the LAN
+          frame handler on WiFi — the single funnel all commands pass through.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">esp32_ble_notify_enabled<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/ble_init.cpp#L153">ble_init.cpp:153</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Predicate: true only when a client is connected <i>and</i> has subscribed to notifications
+          (CCCD 0x2902 enabled, or the NimBLE subscribe flag). The loop uses it to decide whether the
+          response queue can actually be flushed — if a client is connected but hasn't enabled
+          notifications yet, responses stay queued rather than being dropped.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">esp32_restart_ble_advertising<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/ble_init.cpp#L165">ble_init.cpp:165</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Restarts BLE advertising after a disconnect — but <b>defers via
+          <code>bleRestartAdvertisingPending</code></b> if the server isn't ready or an e-paper
+          refresh is in progress, and no-ops if a client is already connected. On success it
+          restarts advertising and refreshes the manufacturer data. The loop calls it both inside
+          the post-wake window and in normal servicing to drain that pending flag.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">ble_nrf_advertising_tick<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/ble_init.cpp#L67">ble_init.cpp:67</a></span>
+          <span class="fn-badges"><span class="badge b-nrf">nRF</span></span>
+        </div>
+        <p class="fn-desc">
+          The nRF counterpart to the ESP32 advertising housekeeping. After a button press temporarily
+          <i>boosts</i> the advertising interval for faster discovery, this tick <b>reverts to the
+          normal interval</b> once the boost window expires, restarting advertising with the slower
+          timing. Does nothing while the boost is still active.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">imageWriteLogQuietFrame<span class="args">(data, len)</span></span>
+          <span class="fn-loc"><a href="../src/display_service.cpp#L1462">display_service.cpp:1462</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          A tiny logging predicate: true when the frame is an image-write chunk (opcode 0x0071) that's
+          past the first chunk and should be logged quietly. The loop uses it purely to <b>suppress
+          per-frame serial spam</b> during an image upload — the 5% progress meter reports instead.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ WIFI / LAN ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">03</span>
+      <h2>WiFi / LAN session</h2>
+      <span class="count">3 functions</span>
+    </div>
+    <div class="grid">
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">handleWiFiServer<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/wifi_service.cpp#L170">wifi_service.cpp:170</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          The LAN TCP server pump, run every pass. Detects the WiFi-up edge and starts the server;
+          <b>accepts an incoming client</b> (replacing any previous one), reads available bytes into a
+          receive buffer, and de-frames the stream (2-byte length prefix) — handing each complete
+          frame to <code>imageDataWritten()</code>. Tears the session down on WiFi loss, buffer
+          overflow, or an invalid frame length.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">disconnectWiFiServer<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/wifi_service.cpp#L160">wifi_service.cpp:160</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Closes the active LAN client: clears the encryption session, stops the socket, resets the
+          server-connected flag and receive-buffer position. The loop calls it when the 10-second
+          WiFi check sees the connection has dropped.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">restartWiFiLanAfterReconnect<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/wifi_service.cpp#L249">wifi_service.cpp:249</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Recovery path after WiFi comes back: closes any stale client, re-<code>begin()</code>s the
+          TCP server on its port, and restarts the LAN service. Invoked from the loop's reconnect
+          branch so the server is listening again after an outage.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ DISPLAY & WRITE STATE ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">04</span>
+      <h2>Display &amp; write-state watchdogs</h2>
+      <span class="count">2 functions</span>
+    </div>
+    <div class="grid">
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">checkPartialWriteTimeout<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/display_service.cpp#L180">display_service.cpp:180</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          Watchdog for a stalled partial-write transfer. If one has been active longer than
+          <b>15 minutes</b> (900 000 ms), it logs an error and calls
+          <code>cleanup_partial_write_state()</code> so a client that vanished mid-transfer can't
+          wedge the device permanently.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">cleanupDirectWriteState<span class="args">(bool refreshDisplay)</span></span>
+          <span class="fn-loc"><a href="../src/display_service.cpp#L1527">display_service.cpp:1527</a></span>
+          <span class="fn-badges"><span class="badge b-esp">ESP32</span></span>
+        </div>
+        <p class="fn-desc">
+          Resets the entire direct-write upload state machine (all the <code>directWrite*</code>
+          counters and flags back to zero). When <code>refreshDisplay</code> is set and the panel is
+          powered, it also <b>puts the panel to sleep</b> (bb_epaper or Seeed path). The loop invokes
+          it via the 15-minute direct-write timeout guard to recover stuck uploads.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ INPUT, SENSORS, HOUSEKEEPING ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">05</span>
+      <h2>Input, sensors &amp; housekeeping</h2>
+      <span class="count">5 functions</span>
+    </div>
+    <div class="grid">
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">processButtonEvents<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/device_control.cpp#L411">device_control.cpp:411</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          Polls power buttons (and, on ESP32, configured power-off buttons), then handles any pending
+          button-ISR event: reads the pin, resolves logical press state (honoring inversion), packs
+          <code>button_id / press_count / state</code> into the dynamic return data, and <b>refreshes
+          the advertising payload</b> via <code>updatemsdata()</code>. On nRF it also boosts
+          advertising so a press is discoverable quickly.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">processTouchInput<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/touch_input.cpp#L575">touch_input.cpp:575</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          Services GT911 touch controllers, <b>rate-limited</b> to a minimum interval and — on ESP32 —
+          skipped entirely while a direct write or e-paper refresh is in progress (to keep the SPI/I2C
+          buses clear). Supports both IRQ-edge and timed polling, with an I2C-failure backoff. No-ops
+          when no touch controller is configured.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">updatemsdata<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/display_service.cpp#L1283">display_service.cpp:1283</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          Rebuilds the 16-byte BLE <b>manufacturer-data advertising payload</b>. Polls SHT40 / BQ27220
+          sensors, reads battery voltage and chip temperature, encodes them alongside the dynamic
+          button data and a status byte (reboot flag, connection-requested, loop counter). The loop
+          runs it on a 60-second cadence, and it's also triggered on button/sensor changes so the
+          advertised state stays fresh.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">processLedFlash<span class="args">()</span></span>
+          <span class="fn-loc"><a href="../src/device_control.cpp#L350">device_control.cpp:350</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          The <b>first call in every loop iteration</b>. Advances a non-blocking LED flash animation by
+          one step — but only if a flash is active and any inter-step delay has elapsed. Returns
+          immediately otherwise, so it's essentially free when no LED sequence is running.
+        </p>
+      </div>
+
+      <div class="fn">
+        <div class="fn-top">
+          <span class="fn-name">writeSerial<span class="args">(String, bool newLine = true)</span></span>
+          <span class="fn-loc"><a href="../src/main.cpp#L562">main.cpp:562</a></span>
+          <span class="fn-badges"><span class="badge b-both">Both</span></span>
+        </div>
+        <p class="fn-desc">
+          The logging helper used throughout the loop. Writes to the dedicated log UART when
+          <code>OPENDISPLAY_LOG_UART</code> is configured, otherwise to USB serial — and compiles to
+          nothing when serial is disabled. Not control flow, but it's the most-called name in the
+          function.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <p class="foot">
+    19 project functions called from loop() · src/main.cpp L190–357 ·
+    Arduino core (millis/delay) and raw BLE characteristic setValue/notify omitted as library calls.
+  </p>
+</div>
