@@ -12,6 +12,7 @@ void ble_nrf_advertising_tick(void);
 // Link diagnostics: log negotiated PHY / ATT MTU / DLE (LL PDU octets) / conn interval.
 void ble_nrf_log_link_params(uint16_t conn_handle, const char* phase);
 void ble_nrf_arm_link_diag(uint16_t conn_handle);   // one-shot: re-log ~2.5 s after connect
+void ble_nrf_request_fast_link(uint16_t conn_handle); // request 2M PHY + 251-octet DLE (max throughput)
 #endif
 #ifdef TARGET_ESP32
 void ble_init();

@@ -117,12 +117,38 @@ static void ble_nrf_link_diag_cb(TimerHandle_t /*xTimer*/) {
     }
 }
 
+// Proactively upgrade the link for throughput: the nRF peripheral only auto-accepts
+// the central's PHY/DLE requests, so if the phone never asks we stay at 1M / 27 octets.
+// Requesting here (both are no-ops if the peer already negotiated the same or better).
+void ble_nrf_request_fast_link(uint16_t conn_handle) {
+    BLEConnection* conn = Bluefruit.Connection(conn_handle);
+    if (conn == nullptr) return;
+
+    // 2 Mbps PHY (tx + rx). Peer may decline and stay at 1M.
+    conn->requestPHY(BLE_GAP_PHY_2MBPS);
+
+    // 251-octet Link-Layer PDUs (max DLE). AUTO time lets the controller derive the
+    // PHY-appropriate on-air duration.
+    ble_gap_data_length_params_t dl;
+    dl.max_tx_octets  = 251;
+    dl.max_rx_octets  = 251;
+    dl.max_tx_time_us = BLE_GAP_DATA_LENGTH_AUTO;
+    dl.max_rx_time_us = BLE_GAP_DATA_LENGTH_AUTO;
+    ble_gap_data_length_limitation_t limit = { 0, 0, 0 };
+    if (!conn->requestDataLengthUpdate(&dl, &limit)) {
+        writeSerial("DLE 251 request rejected (tx_lim=" + String(limit.tx_payload_limited_octets) +
+                    " rx_lim=" + String(limit.rx_payload_limited_octets) +
+                    " time_lim_us=" + String(limit.tx_rx_time_limited_us) + ")");
+    }
+    writeSerial("Requested fast link: 2M PHY + 251-octet DLE");
+}
+
 void ble_nrf_arm_link_diag(uint16_t conn_handle) {
     s_link_diag_conn = conn_handle;
     static bool created = false;
     if (!created) {
         // Create the one-shot (repeating=false) on the first connection only.
-        s_link_diag_timer.begin(2500, ble_nrf_link_diag_cb, NULL, false);
+        s_link_diag_timer.begin(500, ble_nrf_link_diag_cb, NULL, false);
         created = true;
     }
     s_link_diag_timer.reset();   // start/restart the one-shot from now; fires ~2.5 s later

@@ -88,6 +88,7 @@ void connect_callback(uint16_t conn_handle) {
     updatemsdata();
 #ifdef TARGET_NRF
     ble_nrf_log_link_params(conn_handle, "at connect");  // baseline (pre-negotiation)
+    ble_nrf_request_fast_link(conn_handle);              // request 2M PHY + 251-octet DLE
     ble_nrf_arm_link_diag(conn_handle);                  // re-log once negotiation settles
 #endif
 }
