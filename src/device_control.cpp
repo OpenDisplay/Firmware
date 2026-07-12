@@ -6,7 +6,7 @@
 #include <string.h>
 
 #ifdef TARGET_ESP32
-void enterDeepSleep(bool force = false);
+void enterDeepSleep(bool force = false, uint16_t overrideSleepSeconds = 0);
 #endif
 
 #ifdef TARGET_NRF
@@ -697,19 +697,45 @@ void enterDFUMode() {
 #endif
 }
 
-void handleDeepSleepCommand() {
+void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
     writeSerial("=== DEEP SLEEP COMMAND (0x0052) ===", true);
 #ifdef TARGET_ESP32
+    // Optional 2-byte big-endian seconds payload overrides the configured
+    // deep-sleep duration for exactly one cycle. 0x0000 = explicit no-override.
+    uint16_t overrideSeconds = 0;
+    if (payloadLen >= 2) {
+        overrideSeconds = ((uint16_t)payload[0] << 8) | payload[1];
+        // Bytes beyond 2 ignored for forward compatibility.
+    } else if (payloadLen == 1) {
+        writeSerial("WARNING: malformed 0x0052 payload length 1 - ignoring", true);
+    }
     if (powerLatchDffConfigured()) {
+        if (overrideSeconds != 0) {
+            writeSerial("0x0052 duration payload ignored (D-FF hard power off has no timer)", true);
+        }
         uint8_t ok[] = {0x00, 0x52, 0x00, 0x00};
         sendResponse(ok, sizeof(ok));
         delay(100);
         powerLatchPowerOff();
         return;
     }
+    if (globalConfig.power_option.power_mode != 1) {
+        writeSerial("Device not battery powered - 0x0052 rejected", true);
+        uint8_t errorResponse[] = {0xFF, 0x52, 0x02, 0x00};
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
+    if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
+        writeSerial("Deep sleep disabled in config - 0x0052 rejected", true);
+        uint8_t errorResponse[] = {0xFF, 0x52, 0x01, 0x00};
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
     // Explicit host request: sleep even though the requesting client is connected.
-    enterDeepSleep(true);
+    enterDeepSleep(true, overrideSeconds);
 #else
+    (void)payload;
+    (void)payloadLen;
     writeSerial("Deep sleep command not supported on this target", true);
 #endif
 }

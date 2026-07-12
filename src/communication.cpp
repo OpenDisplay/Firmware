@@ -653,7 +653,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             enterDFUMode();
             break;
         case 0x0052:
-            handleDeepSleepCommand();
+            handleDeepSleepCommand(data + 2, len - 2);
             break;
         default:
             writeSerial("ERROR: Unknown command: 0x" + String(command, HEX));

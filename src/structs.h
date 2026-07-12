@@ -57,11 +57,16 @@ struct PowerOption {
     uint8_t charge_enable_pin;      // BQ25616 CE (0 or 0xFF = unused)
     uint8_t charge_state_pin;       // BQ25616 charge-state GPIO (0 or 0xFF = unused)
     uint8_t charger_flags;          // bit0 enable active-low; bit1 state active-low when charging
-    uint8_t reserved[7];
+    uint16_t min_wake_time_seconds; // Min awake window after first boot or button wake; 0 = default 120 s
+    uint8_t reserved[5];
 } __attribute__((packed));
 
 #define CHARGER_FLAG_ENABLE_ACTIVE_LOW (1u << 0)
 #define CHARGER_FLAG_STATE_ACTIVE_LOW  (1u << 1)
+
+// sleep_flags (power_option): button wake from timer deep sleep is default-on;
+// bit 0 opts a device out (e.g. buttons sharing pads with wake-hostile hardware).
+#define SLEEP_FLAG_BUTTON_WAKE_DISABLE (1u << 0)
 
 // battery_sense_flags (power_option)
 #define BATTERY_SENSE_FLAG_ENABLE_INVERTED (1 << 0)  // Enable active-low (e.g. XIAO ~READ_BAT on P0.14)

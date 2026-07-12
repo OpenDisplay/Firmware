@@ -4,6 +4,7 @@
 #include "device_control.h"
 #include "display_service.h"
 #include "power_latch.h"
+#include "wake_button.h"
 #include "touch_input.h"
 #include "encryption.h"
 #include "ble_init.h"
@@ -38,6 +39,10 @@ static const char* resetReasonName(esp_reset_reason_t reason) {
         default:                return "UNKNOWN";
     }
 }
+
+// Defined with the sleep helpers below loop()'s activity poller; setup() logs
+// the window length when arming the button-wake hold.
+static uint32_t minWakeTimeMs();
 #endif
 
 void setup() {
@@ -62,6 +67,7 @@ void setup() {
     }
     // Set only by the ESP32 wake-cause check below; NRF has no deep-sleep wake path.
     bool is_deep_sleep_wake = false;
+    bool woke_by_button = false;
     #ifdef TARGET_ESP32
     esp_reset_reason_t reset_reason = esp_reset_reason();
     writeSerial("Reset reason: " + String(resetReasonName(reset_reason)) + " (" + String((int)reset_reason) + ")");
@@ -71,13 +77,16 @@ void setup() {
         woke_from_deep_sleep = true;
         deep_sleep_count++;
         writeSerial("=== WOKE FROM DEEP SLEEP ===");
-        writeSerial("Wake-up reason: " + String(wakeup_reason));
+        woke_by_button = detectButtonWake(wakeup_reason);  // logs the named cause + pin(s)
         writeSerial("Deep sleep count: " + String(deep_sleep_count));
     } else {
         woke_from_deep_sleep = false;
         writeSerial("=== NORMAL BOOT ===");
-        // RTC memory survives soft resets (panic/WDT/esp_restart) but not power
-        // loss: a non-zero count on a NORMAL BOOT means a hidden mid-cycle reset.
+        // The bootloader reloads RTC memory segments from the app image on every
+        // reset except a deep-sleep wake, so RTC_DATA_ATTR does NOT survive
+        // panic/WDT/SW/brownout resets: a hidden mid-cycle reset lands here with
+        // count 0, indistinguishable from a true first boot (captured on hardware
+        // in docs/FINDINGS_DEEP_SLEEP_WAKE_BOOT_SCREEN_2026-07-07.md).
         writeSerial("Deep sleep count (RTC): " + String(deep_sleep_count));
     }
     #endif
@@ -127,6 +136,19 @@ void setup() {
         writeSerial("Advertising for " + String(globalConfig.power_option.sleep_timeout_ms) + " ms (sleep_timeout_ms), waiting for connection...");
         advertising_timeout_active = true;
         advertising_start_time = millis();
+        if (woke_by_button) {
+            // A button press means a user is present: hold awake for at least
+            // the minimum window so they (or a host) get time to interact.
+            minWakeWindowActive = true;
+            minWakeWindowStartMs = millis();
+            writeSerial("Button wake: holding awake >= " + String(minWakeTimeMs()) + " ms");
+        }
+    } else if (deep_sleep_count == 0) {
+        // First boot — or a hidden mid-cycle reset, which reloads the RTC count
+        // to 0 (see the NORMAL BOOT comment above). Inert on wired devices:
+        // every consumer of the hold is power_mode/deep-sleep gated.
+        minWakeWindowActive = true;
+        minWakeWindowStartMs = millis();
     }
     // Both sleep paths measure quiet time from here, not from power-on.
     lastActivityMs = millis();
@@ -135,6 +157,26 @@ void setup() {
 }
 
 #ifdef TARGET_ESP32
+// Minimum awake window (first boot / button wake). A floor layered UNDER the
+// quiet-window logic, not a replacement: sleep requires both the existing
+// idle/advertising quiet condition AND this hold expired, so interaction keeps
+// extending the quiet window inside and beyond the floor. Timer wakes never
+// arm the hold — their behavior is unchanged.
+static uint32_t minWakeTimeMs() {
+    uint16_t s = globalConfig.power_option.min_wake_time_seconds;
+    return (uint32_t)(s ? s : DEFAULT_MIN_WAKE_TIME_SECONDS) * 1000UL;
+}
+
+static bool minWakeHoldActive() {
+    if (!minWakeWindowActive) return false;
+    if (millis() - minWakeWindowStartMs >= minWakeTimeMs()) {
+        minWakeWindowActive = false;
+        writeSerial("Minimum wake window elapsed, deep sleep permitted");
+        return false;
+    }
+    return true;
+}
+
 // Single point of activity detection. Rather than have every producer (BLE host
 // task, buttons, touch, LAN) stamp a timestamp, sample the state they already
 // mutate and treat any change since the previous pass as activity.
@@ -243,7 +285,9 @@ void loop() {
         // Measured from the last activity, not from window start: a client that
         // connects and drops re-arms the full window instead of inheriting it.
         uint32_t idle_duration = millis() - lastActivityMs;
-        if (idle_duration >= advertising_timeout_ms) {
+        // On a button wake the min-wake hold keeps this window open past the
+        // quiet timeout; idleDelay(50) below services buttons/touch throughout.
+        if (idle_duration >= advertising_timeout_ms && !minWakeHoldActive()) {
             writeSerial("BLE advertising timeout (idle " + String(idle_duration) + " ms of " +
                         String(millis() - advertising_start_time) + " ms window) - no connection, returning to deep sleep");
             advertising_timeout_active = false;
@@ -333,30 +377,15 @@ void loop() {
         processTouchInput();
         delay(1);
     } else {
-        if (!woke_from_deep_sleep && deep_sleep_count == 0 && globalConfig.power_option.power_mode == 1) {
-            if (!firstBootDelayInitialized) {
-                firstBootDelayInitialized = true;
-                firstBootDelayStart = millis();
-                processButtonEvents();
-                writeSerial("First boot: waiting 2 minutes before entering deep sleep");
-            }
-            uint32_t elapsed = millis() - firstBootDelayStart;
-            if (elapsed < FIRST_BOOT_DEEP_SLEEP_DELAY_MS) {
-                idleDelay(5);
-                return;
-            }
-            if (!firstBootDelayElapsed) {
-                firstBootDelayElapsed = true;
-                writeSerial("First boot delay elapsed, deep sleep permitted");
-            }
-        }
         if(globalConfig.power_option.deep_sleep_time_seconds > 0 && globalConfig.power_option.power_mode == 1){
             uint32_t idleHoldMs = globalConfig.power_option.sleep_timeout_ms;
             if (idleHoldMs == 0) {
                 idleHoldMs = DEFAULT_IDLE_HOLD_MS;
             }
             uint32_t idleMs = millis() - lastActivityMs;
-            if (idleMs < idleHoldMs) {
+            // The min-wake hold covers first boot and connect-then-drop during a
+            // button-wake window (woke_from_deep_sleep cleared on connect above).
+            if (idleMs < idleHoldMs || minWakeHoldActive()) {
                 idleDelay(5);
             } else {
                 writeSerial("Idle " + String(idleMs) + " ms (hold " + String(idleHoldMs) + " ms) - entering deep sleep");
@@ -428,7 +457,7 @@ void fullSetupAfterConnection() {
     writeSerial("=== Full setup completed ===");
 }
 
-void enterDeepSleep(bool force) {
+void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     if (globalConfig.power_option.power_mode != 1) {
         writeSerial("Skipping deep sleep - not battery powered (power_mode: " + String(globalConfig.power_option.power_mode) + ")");
         delay(2000);
@@ -446,6 +475,14 @@ void enterDeepSleep(bool force) {
         lastActivityMs = millis();
         return;
     }
+    // Defense in depth for the min-wake hold (first boot / button wake). MUST
+    // stay ahead of the advertising stop below: everything past that point
+    // commits to esp_deep_sleep_start(), so a late abort would leave the device
+    // awake with the radio dark. force (host 0x0052) bypasses the hold.
+    if (!force && minWakeHoldActive()) {
+        writeSerial("Skipping deep sleep - minimum wake window active");
+        return;
+    }
     woke_from_deep_sleep = true; // Will be true on next boot
     if (pServer != nullptr) {
         BLEAdvertising *pAdvertising = pServer->getAdvertising();
@@ -459,10 +496,18 @@ void enterDeepSleep(bool force) {
     esp32_ble_clear_handles();
     delay(100);
     writeSerial("BLE deinitialized");
-    uint64_t sleep_timeout_us = (uint64_t)globalConfig.power_option.deep_sleep_time_seconds * 1000000ULL;
+    // Host override (0x0052 payload) applies to this one cycle only: it is a
+    // parameter, never stored, so an aborted or later sleep reverts to config.
+    uint16_t sleepSeconds = overrideSleepSeconds ? overrideSleepSeconds
+                                                 : globalConfig.power_option.deep_sleep_time_seconds;
+    uint64_t sleep_timeout_us = (uint64_t)sleepSeconds * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleep_timeout_us);
-    // consider adding code to enable button wake-up from deep sleep
-    writeSerial("Entering deep sleep for " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");
+    // After the timer arm, before powerLatchHoldForSleep(): the latch-hold
+    // manipulation then cannot disturb freshly configured RTC pulls, and its
+    // gpio_hold_en() touches only the latch pin, never the wake pads.
+    armButtonWakeSources();
+    writeSerial("Entering deep sleep for " + String(sleepSeconds) + " seconds" +
+                (overrideSleepSeconds ? " (host override, one cycle)" : " (config)"));
     flushLog(); // Arduino drain UART/Serial prior to deep sleep
     delay(100); // Brief delay to ensure serial output is sent
     powerLatchHoldForSleep();

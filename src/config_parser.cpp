@@ -679,8 +679,10 @@ void printConfigSummary(){
                " " + String(globalConfig.power_option.battery_capacity_mah[2]) + " mAh");
     writeSerial("Awake Timeout: " + String(globalConfig.power_option.sleep_timeout_ms) + " ms");
     writeSerial("Deep Sleep Time: " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");
+    writeSerial("Min Wake Time: " + String(globalConfig.power_option.min_wake_time_seconds) + " seconds");
     writeSerial("TX Power: " + String(globalConfig.power_option.tx_power));
     writeSerial("Sleep Flags: 0x" + String(globalConfig.power_option.sleep_flags, HEX));
+    writeSerial("Button Wake: " + String((globalConfig.power_option.sleep_flags & SLEEP_FLAG_BUTTON_WAKE_DISABLE) ? "disabled" : "enabled") + " (sleep_flags bit0)");
     writeSerial("Battery Sense Pin: " + String(globalConfig.power_option.battery_sense_pin));
     writeSerial("Battery Sense Enable Pin: " + String(globalConfig.power_option.battery_sense_enable_pin));
     writeSerial("Battery Sense Flags: 0x" + String(globalConfig.power_option.battery_sense_flags, HEX));
