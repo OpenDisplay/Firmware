@@ -188,59 +188,23 @@ static uint32_t epdKeepAliveWindowMs(void) {
     return EPD_KEEPALIVE_MS;
 }
 
-// Bring the panel up for a transfer/refresh. Returns true iff it was COLD (rail
-// was off) — callers may need to (re)open the address window regardless.
-static bool epdSessionAcquire(bool partialInit) {
-    if (pwrmgmState == PWR_OFF) {
-        writeSerial("[EPD session] acquire: COLD bring-up", true);
-        pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
-        if (!epdSessionUsesSeeed()) {
-            const DisplayConfig& d = globalConfig.displays[0];
-            bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
-            bbepWakeUp(&bbep);
-            const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
-                                                 : bbep.pInitFull;
-            bbepSendCMDSequence(&bbep, initSeq);
-            epdSessionInitWasPartial = partialInit;
-        }
-        return true;
-    }
-    // WARM re-acquire (or, defensively, an already-ACTIVE re-entry).
-    writeSerial(pwrmgmState == PWR_ACTIVE ? "[EPD session] acquire: already ACTIVE (defensive)"
-                                          : "[EPD session] acquire: WARM re-acquire", true);
-    pwrmgmState = PWR_ACTIVE;
-    pwrmgmOffDeadlineMs = 0;   // cancel keep-alive
-    // Phase 1: full re-init on warm re-acquire (HW reset => registers identical to
-    // cold, safest). Phase 2a will skip bbepWakeUp + only resend on init-type change.
-    if (!epdSessionUsesSeeed()) {
-        bbepWakeUp(&bbep);
-        const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
-                                             : bbep.pInitFull;
-        bbepSendCMDSequence(&bbep, initSeq);
-        epdSessionInitWasPartial = partialInit;
-    }
-    return false;
+// Cross-task try-lock. On nRF the SoftDevice BLE task and the loop() task can both
+// touch the session (a transfer begins Acquire on one while the keep-alive tick
+// fires ForceOff on the other). Acquire/Release/ForceOff take it (short spin); the
+// tick TRY-locks and skips its pass if held, so it can never rail-cut mid-init.
+static void pwrmgmLockTake(void) {
+    while (__atomic_exchange_n(&pwrmgmLock, 1, __ATOMIC_ACQUIRE)) { /* spin */ }
+}
+static bool pwrmgmLockTryTake(void) {
+    return __atomic_exchange_n(&pwrmgmLock, 1, __ATOMIC_ACQUIRE) == 0;
+}
+static void pwrmgmLockGive(void) {
+    __atomic_store_n(&pwrmgmLock, 0, __ATOMIC_RELEASE);
 }
 
-// Finish a transfer/refresh. On success (and when keep-alive is enabled) the panel
-// stays powered + AWAKE and enters PWR_WARM with an armed deadline; otherwise it is
-// powered fully down now.
-static void epdSessionRelease(bool refreshSuccess) {
-    if (pwrmgmState == PWR_OFF) return;   // nothing to release
-    uint32_t window = epdKeepAliveWindowMs();
-    if (window == 0 || !refreshSuccess) {
-        writeSerial(refreshSuccess ? "[EPD session] release: keep-alive disabled, powering off"
-                                   : "[EPD session] release: refresh failed, powering off", true);
-        epdSessionForceOff();
-        return;
-    }
-    pwrmgmState = PWR_WARM;
-    pwrmgmOffDeadlineMs = millis() + window;
-    // Controller stays AWAKE (no bbepSleep; is_awake stays 1); rail/SPI/Wire stay up.
-    writeSerial("[EPD session] release: panel warm-idle, off in " + String(window) + " ms", true);
-}
-
-void epdSessionForceOff(void) {
+// Lock-held core (callers must hold pwrmgmLock). Split out so Release/Tick can
+// power off without re-taking the non-recursive lock.
+static void epdSessionForceOffLocked(void) {
     if (pwrmgmState == PWR_OFF) return;   // idempotent
     writeSerial("[EPD session] force off", true);
     if (epdSessionUsesSeeed()) {
@@ -255,12 +219,80 @@ void epdSessionForceOff(void) {
     epdPlanesPrepared = false;
 }
 
-void epdSessionTick(void) {
-    if (pwrmgmState != PWR_WARM) return;   // only WARM arms the timer
-    if ((int32_t)(millis() - pwrmgmOffDeadlineMs) >= 0) {
-        writeSerial("[EPD session] keep-alive expired — powering panel off", true);
-        epdSessionForceOff();
+// Bring the panel up for a transfer/refresh. Returns true iff it was COLD (rail
+// was off) — callers may need to (re)open the address window regardless.
+static bool epdSessionAcquire(bool partialInit) {
+    pwrmgmLockTake();
+    bool cold;
+    if (pwrmgmState == PWR_OFF) {
+        writeSerial("[EPD session] acquire: COLD bring-up", true);
+        pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
+        if (!epdSessionUsesSeeed()) {
+            const DisplayConfig& d = globalConfig.displays[0];
+            bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
+            bbepWakeUp(&bbep);
+            const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
+                                                 : bbep.pInitFull;
+            bbepSendCMDSequence(&bbep, initSeq);
+            epdSessionInitWasPartial = partialInit;
+        }
+        cold = true;
+    } else {
+        // WARM re-acquire (or, defensively, an already-ACTIVE re-entry).
+        writeSerial(pwrmgmState == PWR_ACTIVE ? "[EPD session] acquire: already ACTIVE (defensive)"
+                                              : "[EPD session] acquire: WARM re-acquire", true);
+        pwrmgmState = PWR_ACTIVE;
+        pwrmgmOffDeadlineMs = 0;   // cancel keep-alive
+        // Phase 1: full re-init on warm re-acquire (HW reset => registers identical
+        // to cold, safest). Phase 2a will skip bbepWakeUp + resend only on change.
+        if (!epdSessionUsesSeeed()) {
+            bbepWakeUp(&bbep);
+            const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
+                                                 : bbep.pInitFull;
+            bbepSendCMDSequence(&bbep, initSeq);
+            epdSessionInitWasPartial = partialInit;
+        }
+        cold = false;
     }
+    pwrmgmLockGive();
+    return cold;
+}
+
+// Finish a transfer/refresh. On success (and when keep-alive is enabled) the panel
+// stays powered + AWAKE and enters PWR_WARM with an armed deadline; otherwise it is
+// powered fully down now.
+static void epdSessionRelease(bool refreshSuccess) {
+    pwrmgmLockTake();
+    if (pwrmgmState == PWR_OFF) { pwrmgmLockGive(); return; }   // nothing to release
+    uint32_t window = epdKeepAliveWindowMs();
+    if (window == 0 || !refreshSuccess) {
+        writeSerial(refreshSuccess ? "[EPD session] release: keep-alive disabled, powering off"
+                                   : "[EPD session] release: refresh failed, powering off", true);
+        epdSessionForceOffLocked();
+    } else {
+        pwrmgmState = PWR_WARM;
+        pwrmgmOffDeadlineMs = millis() + window;
+        // Controller stays AWAKE (no bbepSleep; is_awake stays 1); rail/SPI stay up.
+        writeSerial("[EPD session] release: panel warm-idle, off in " + String(window) + " ms", true);
+    }
+    pwrmgmLockGive();
+}
+
+void epdSessionForceOff(void) {
+    pwrmgmLockTake();
+    epdSessionForceOffLocked();
+    pwrmgmLockGive();
+}
+
+void epdSessionTick(void) {
+    if (pwrmgmState != PWR_WARM) return;   // fast pre-check (only WARM arms the timer)
+    if (!pwrmgmLockTryTake()) return;      // held by a transfer -> skip this pass
+    // Re-check under the lock: a transfer may have moved us out of WARM meanwhile.
+    if (pwrmgmState == PWR_WARM && (int32_t)(millis() - pwrmgmOffDeadlineMs) >= 0) {
+        writeSerial("[EPD session] keep-alive expired — powering panel off", true);
+        epdSessionForceOffLocked();
+    }
+    pwrmgmLockGive();
 }
 
 bool epdSessionIsWarm(void) {
@@ -1294,9 +1326,9 @@ void initDisplay(){
             touchSuspendForEpdRefresh();
             seeed_gfx_full_update();
             waitforrefresh(60);
-            seeed_gfx_sleep_after_refresh();
-            delay(200);
-            pwrmgm(false);
+            // Boot ends PWR_OFF (no keep-alive at boot). ForceOff sleeps the TCON
+            // (+ clears the Seeed hw-init flag, Commit 5) and cuts the rail.
+            epdSessionForceOff();
             touchResumeAfterEpdRefresh();
         } else {
             pwrmgm(false);
@@ -1326,9 +1358,9 @@ void initDisplay(){
             if (!bootOk) {
                 writeSerial("Boot screen refresh did not complete", true);
             }
-            bbepSleep(&bbep, 1);
-            delay(200);
-            pwrmgm(false);
+            // Boot ends PWR_OFF (no keep-alive at boot). pwrmgm(true) in boot set
+            // PWR_ACTIVE, so ForceOff sleeps the controller + cuts the rail cleanly.
+            epdSessionForceOff();
             touchResumeAfterEpdRefresh();
         } else {
             pwrmgm(false);

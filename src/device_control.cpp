@@ -98,6 +98,11 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
     (void)reason;
     writeSerial("=== BLE CLIENT DISCONNECTED ===", true);
     writeSerial("Disconnect reason: " + String(reason), true);
+    // Panel power on disconnect follows the ACTIVE-only-teardown invariant, so no
+    // logic change is needed here: a WARM (post-successful-refresh) panel SURVIVES
+    // disconnect and keeps its keep-alive window — a reconnect < 30 s pays only a
+    // warm re-acquire. Only a disconnect mid-transfer (still PWR_ACTIVE) tears the
+    // panel down, via the cleanup calls below (which no-op on power when WARM).
     cleanupDirectWriteState(true);
     cleanupPartialWriteOnDisconnect();   // 0x76 / pipe-partial session bookkeeping + panel power
     resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect

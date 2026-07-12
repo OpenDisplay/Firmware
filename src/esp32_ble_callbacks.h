@@ -59,6 +59,10 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
         if (epdRefreshInProgress) {
             writeSerial("EPD refresh in progress — deferring cleanup/advertising to main loop");
         } else {
+            // ACTIVE-only-teardown invariant: a WARM (post-successful-refresh) panel
+            // SURVIVES disconnect and keeps its keep-alive window, so the cleanups
+            // below no-op on power when WARM and only tear down a mid-transfer
+            // (PWR_ACTIVE) session. No logic change needed for keep-alive.
             if (directWriteActive) cleanupDirectWriteState(true);
             // Partial sessions (0x76 or pipe-partial) power the panel without
             // setting directWriteActive; release it here instead of waiting on
