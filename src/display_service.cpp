@@ -496,9 +496,13 @@ bool waitforrefresh(int timeout){
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) return seeed_gfx_wait_refresh(timeout);
 #endif
-    for (size_t i = 0; i < (size_t)(timeout * 10); i++){
-        delay(100);
-        if(i % 5 == 0) writeSerial(".", false);
+    // Poll at 10 ms (was 100 ms) so a ~0.5 s refresh returns up to ~90 ms sooner.
+    // BUSY asserts within µs of MASTER_ACTIVATE, so the i==0 "never went busy"
+    // error check stays valid at a 10 ms first poll. Loop bound scales x10
+    // (timeout*100 iterations of 10 ms); dot cadence every 50 iters keeps ~0.5 s/dot.
+    for (size_t i = 0; i < (size_t)(timeout * 100); i++){
+        delay(10);
+        if(i % 50 == 0) writeSerial(".", false);
         if(!bbepIsBusy(&bbep)){
             if(i == 0){
                 writeSerial("ERROR: Epaper not busy after refresh command - refresh may not have started", true);
@@ -506,7 +510,7 @@ bool waitforrefresh(int timeout){
             }
             writeSerial(".", true);
             writeSerial("Refresh took ", false);
-            writeSerial((String)((float)i / 10), false);
+            writeSerial((String)((float)i / 100), false);
             writeSerial(" seconds", true);
 //            delay(200);   // EXTRA DELAY HERE IS UNNEEDED AND JUST SLOWS THINGS DOWN
             return true;
