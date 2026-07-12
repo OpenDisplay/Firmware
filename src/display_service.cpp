@@ -210,6 +210,9 @@ static void epdSessionForceOffLocked(void) {
     if (epdSessionUsesSeeed()) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
         seeed_gfx_direct_sleep();
+        // Rail is about to drop: force the next push to fully re-init the TCON
+        // rather than wake() a power-cycled IT8951 (garbled refresh otherwise).
+        seeed_gfx_mark_hw_deinitialized();
 #endif
     } else {
         bbepSleep(&bbep, 1);

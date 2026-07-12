@@ -35,6 +35,10 @@ void seeed_gfx_direct_write_chunk(const uint8_t* data, uint32_t len);
 /** refresh_mode: 0 = REFRESH_FULL (two GC16 passes, less ghosting), 1 = REFRESH_FAST (single pass). */
 void seeed_gfx_direct_refresh(int refresh_mode);
 void seeed_gfx_direct_sleep(void);
+/** Clear the hw-init flag so the next push runs a full begin()/hostTconInit()
+ *  instead of wake()-ing a power-cycled IT8951 TCON. Call whenever the panel rail
+ *  is cut (epdSessionForceOff), else the next refresh comes up garbled. */
+void seeed_gfx_mark_hw_deinitialized(void);
 
 #endif
 

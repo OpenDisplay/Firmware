@@ -187,4 +187,10 @@ void seeed_gfx_direct_sleep(void) {
     g_seeed_epaper.sleep();
 }
 
+void seeed_gfx_mark_hw_deinitialized(void) {
+    // Rail cut: the IT8951 TCON will lose its VCOM/dimension/I80 config, so the next
+    // seeed_gfx_direct_write_reset() must take the full begin() path, not wake().
+    seeed_gfx_hw_initialized = false;
+}
+
 #endif
