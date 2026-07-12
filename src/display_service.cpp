@@ -1673,19 +1673,15 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteTotalBytes = 0;
     directWriteRefreshMode = 0;
     directWriteStartTime = 0;
-    if (refreshDisplay && displayPowerState) {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        if (seeed_driver_used()) {
-            seeed_gfx_direct_sleep();
-        } else
-#endif
-        {
-            bbepSleep(&bbep, 1);
-        }
-        delay(200);
+    // Panel power acts only while a transfer/refresh is actually in flight
+    // (PWR_ACTIVE). refreshDisplay==true is a terminal teardown (disconnect,
+    // 15-min timeout, mid-stream error) -> power fully off. refreshDisplay==false
+    // is the post-refresh path from directWriteFinishAndRefresh -> release to WARM
+    // so keep-alive holds the rail for the next push.
+    if (pwrmgmState == PWR_ACTIVE) {
+        if (refreshDisplay) epdSessionForceOff();
+        else                epdSessionRelease(true);
     }
-    displayPowerState = false;
-    pwrmgm(false);
     if (directWriteTouchSuspended) {
         touchResumeAfterEpdRefresh();
         directWriteTouchSuspended = false;
@@ -1730,20 +1726,18 @@ static void directWriteActivatePanel(void) {
     directWriteBytesWritten = 0;
     directWriteStartTime = millis();
     imageWriteLogStart(directWriteTotalBytes);
-    if (displayPowerState) {
-        pwrmgm(false);
-        delay(50);
-    }
-    pwrmgm(true);
+    // Full-frame write: acquire the session with the FULL init sequence. A warm
+    // re-acquire skips the ~900 ms rail bring-up + bbepInitIO (replaces the old
+    // force power-cycle, which under keep-alive would fire on every push). A
+    // full-frame direct write does not preserve partial plane consistency.
+    epdSessionAcquire(false);
+    epdPlanesPrepared = false;
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
         seeed_gfx_direct_write_reset();
     } else
 #endif
     {
-        bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
-        bbepWakeUp(&bbep);
-        bbepSendCMDSequence(&bbep, bbep.pInitFull);
         bbepSetAddrWindow(&bbep, 0, 0, globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height);
         bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
     }
@@ -2040,10 +2034,10 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     {
         bbepRefresh(&bbep, refreshMode);
         refreshSuccess = waitforrefresh(60);
-        bbepSleep(&bbep, 1);
+        // No bbepSleep here: cleanupDirectWriteState(false) releases the session,
+        // keeping the controller awake + rail up when keep-alive holds it warm.
     }
     epdRefreshInProgress = false;
-    delay(50);
     cleanupDirectWriteState(false);
 #ifdef TARGET_ESP32
     esp32_restart_ble_advertising();
