@@ -1,5 +1,6 @@
 #include "main.h"
 #include "boot_screen.h"
+#include "buzzer_control.h"
 #include "communication.h"
 #include "device_control.h"
 #include "display_service.h"
@@ -260,6 +261,7 @@ static void flushResponseQueueToBle() {
 
 void loop() {
     processLedFlash();
+    buzzerService();
     #ifdef TARGET_ESP32
     pollActivity();
     #endif
@@ -375,6 +377,7 @@ void loop() {
     if (workInFlight) {
         processButtonEvents();
         processTouchInput();
+        buzzerService();
         delay(1);
     } else {
         if(globalConfig.power_option.deep_sleep_time_seconds > 0 && globalConfig.power_option.power_mode == 1){
@@ -402,6 +405,7 @@ void loop() {
         }
         processButtonEvents();
         processTouchInput();
+        buzzerService();
     }
     #else
     if(globalConfig.power_option.sleep_timeout_ms > 0){
@@ -414,6 +418,7 @@ void loop() {
     ble_nrf_advertising_tick();
     processButtonEvents();
     processTouchInput();
+    buzzerService();
     #endif
 }
 
@@ -429,6 +434,7 @@ void idleDelay(uint32_t delayMs) {
         processButtonEvents();
         processTouchInput();
         processLedFlash();
+        buzzerService();
         uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
         delay(chunkDelay);
         remainingDelay -= chunkDelay;
