@@ -465,26 +465,17 @@ void initOrRestoreWireForOpenDisplay(void) {
         }
     }
 #else
-    if (globalConfig.data_bus_count > 0) {
+    if (!openDisplayI2cBusConfigured()) {
+        return;
+    }
+    if (i2cDataBusValid(0)) {
         const struct DataBus& bus = globalConfig.data_buses[0];
-        if (bus.bus_type == 0x01 && bus.pin_1 != 0xFF && bus.pin_2 != 0xFF) {
-            uint32_t hz = bus.bus_speed_hz ? bus.bus_speed_hz : 100000u;
-            pinMode(bus.pin_1, INPUT);
-            pinMode(bus.pin_2, INPUT);
-            if (bus.pullups & 0x01) {
-                pinMode(bus.pin_1, INPUT_PULLUP);
-            }
-            if (bus.pullups & 0x02) {
-                pinMode(bus.pin_2, INPUT_PULLUP);
-            }
-        }
+        pinMode(bus.pin_1, (bus.pullups & 0x01) ? INPUT_PULLUP : INPUT);
+        pinMode(bus.pin_2, (bus.pullups & 0x02) ? INPUT_PULLUP : INPUT);
     }
     Wire.begin();
-    if (globalConfig.data_bus_count > 0) {
-        const struct DataBus& bus = globalConfig.data_buses[0];
-        if (bus.bus_speed_hz > 0) {
-            Wire.setClock(bus.bus_speed_hz);
-        }
+    if (i2cDataBusValid(0) && globalConfig.data_buses[0].bus_speed_hz > 0) {
+        Wire.setClock(globalConfig.data_buses[0].bus_speed_hz);
     }
 #endif
 }
