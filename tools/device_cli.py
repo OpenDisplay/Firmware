@@ -536,7 +536,12 @@ def _require_yaml() -> Any:
 
 def dump_yaml(doc: dict[str, Any]) -> str:
     yaml = _require_yaml()
-    return yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
+
+    class IndentedDumper(yaml.SafeDumper):
+        def increase_indent(self, flow: bool = False, indentless: bool = False) -> None:
+            return super().increase_indent(flow, False)
+
+    return "---\n" + yaml.dump(doc, Dumper=IndentedDumper, sort_keys=False, default_flow_style=False)
 
 
 def load_yaml_doc(text: str) -> dict[str, Any]:
