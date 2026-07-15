@@ -23,6 +23,9 @@ void epdSessionTick(void);       // millis()-poll from loop()/idleDelay(): expir
 bool epdSessionIsWarm(void);     // true when the panel is powered-idle (PWR_WARM)
 
 bool seeed_driver_used(void);
+/** True when displays[0] is the E1004 13.3" T133A01 dual-controller panel. */
+bool e1004_panel_used(void);
+uint8_t e1004_cs2_pin(void);
 int mapEpd(int id);
 bool waitforrefresh(int timeout);
 float readBatteryVoltage();

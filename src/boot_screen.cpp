@@ -29,6 +29,7 @@ void writeSerial(String message, bool newLine);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
+int bbepWritePlane(BBEPDISP *pBBEP, int iPlane, int bInvert);
 
 typedef struct { char c; uint8_t col[5]; } BootGlyph5x7;
 static const BootGlyph5x7 BOOT_FONT5X7[] = {
@@ -878,6 +879,14 @@ bool writeBootScreenWithQr() {
     int textStartY = textY;
     const uint16_t footerInfoY = (uint16_t)(footerY0 + (footerPadTop + footerInfoH - 7 * footerInfoScale) / 2);
 
+    // Dual-controller E1004: rows go to the framebuffer (same packed-4bpp
+    // pitch) and bbepWritePlane() sends them; rows cannot be streamed.
+    const bool e1004Framebuffered = e1004_panel_used();
+    if (e1004Framebuffered && bbep.ucScreen == NULL) {
+        writeSerial("Boot screen: E1004 framebuffer not allocated", true);
+        return false;
+    }
+
     uint8_t* row = staticRowBuffer;
     // bb_epaper 4-gray (scheme 5) needs the packed 2bpp image split into two
     // 1-bit controller planes, so render the frame once per plane and
@@ -899,13 +908,15 @@ bool writeBootScreenWithQr() {
                                            : (colorSwatchPlane1 ? (pass == 0 ? PLANE_0 : PLANE_1)
                                                                  : (useBitplanes ? PLANE_0 : getplane()));
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        if (!seeed_driver_used()) {
+        if (!seeed_driver_used() && !e1004Framebuffered) {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
             bbepStartWrite(&bbep, targetPlane);
         }
 #else
-        bbepSetAddrWindow(&bbep, 0, 0, w, h);
-        bbepStartWrite(&bbep, targetPlane);
+        if (!e1004Framebuffered) {
+            bbepSetAddrWindow(&bbep, 0, 0, w, h);
+            bbepStartWrite(&bbep, targetPlane);
+        }
 #endif
         const int ls = bootLineStep(middleScaleText);
         const uint16_t domY  = (uint16_t)textStartY;
@@ -975,12 +986,16 @@ bool writeBootScreenWithQr() {
                 seeed_gfx_boot_write_row(y_native, row, pitch);
             } else if (gray4Split) {
                 writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
+            } else if (e1004Framebuffered) {
+                memcpy(&bbep.ucScreen[(size_t)y_native * pitch], row, pitch);
             } else {
                 bbepWriteData(&bbep, row, pitch);
             }
 #else
             if (gray4Split) {
                 writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
+            } else if (e1004Framebuffered) {
+                memcpy(&bbep.ucScreen[(size_t)y_native * pitch], row, pitch);
             } else {
                 bbepWriteData(&bbep, row, pitch);
             }
@@ -988,6 +1003,11 @@ bool writeBootScreenWithQr() {
         }
     }
 
+    if (e1004Framebuffered) {
+        bbepWritePlane(&bbep, PLANE_0, 0);
+        writeSerial("Boot screen with QR rendered", true);
+        return true;
+    }
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
     if (seeed_driver_used()) {
         seeed_gfx_boot_skip_planes();

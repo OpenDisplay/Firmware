@@ -541,6 +541,10 @@ static void configureDisplayPinsLowPower() {
         pinMode(pin, OUTPUT);
         digitalWrite(pin, LOW);
     }
+    if (e1004_panel_used()) {
+        pinMode(e1004_cs2_pin(), OUTPUT);
+        digitalWrite(e1004_cs2_pin(), LOW);
+    }
     if (d.busy_pin != 0xFF) {
         pinMode(d.busy_pin, INPUT);
     }
@@ -620,6 +624,11 @@ void pwrmgm(bool onoff){
             if (disp.cs_pin != 0xFF) {
                 pinMode(disp.cs_pin, OUTPUT);
                 digitalWrite(disp.cs_pin, HIGH);
+            }
+            if (e1004_panel_used()) {
+                // Park the second controller's CS HIGH before any SPI traffic.
+                pinMode(e1004_cs2_pin(), OUTPUT);
+                digitalWrite(e1004_cs2_pin(), HIGH);
             }
             if (disp.dc_pin != 0xFF) {
                 pinMode(disp.dc_pin, OUTPUT);
