@@ -283,7 +283,7 @@ void ble_init_esp32(bool update_manufacturer_data) {
     }
     writeSerial("Characteristic created with properties: READ, NOTIFY, WRITE, WRITE_NR");
     // NimBLE auto-adds the 0x2902 CCCD for NOTIFY characteristics; no BLE2902 needed.
-    pTxCharacteristic->setCallbacks(&staticCharCallbacks);
+    pTxCharacteristic->setCallbacks(&staticCharCallbacks, false);
     pRxCharacteristic = pTxCharacteristic;
     // NimBLE starts services automatically when the server starts advertising; no
     // explicit pService->start() (deprecated no-op in NimBLE 2.x).
