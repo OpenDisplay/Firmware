@@ -27,8 +27,7 @@ extern "C" {
 #endif
 
 #ifdef TARGET_ESP32
-#include <BLEDevice.h>
-#include "ble_init.h"
+#include "ble_init.h"   // NimBLE-Arduino + BLE* aliases
 #include "wifi_service.h"
 #endif
 
@@ -1528,30 +1527,27 @@ void updatemsdata(){
             return;
         }
         memcpy(prev_msd_payload, msd_payload, 16);
-        String manufacturerDataStr;
-        manufacturerDataStr.reserve(16);
-        for (int i = 0; i < 16; i++) manufacturerDataStr += (char)msd_payload[i];
-        advertisementData->setManufacturerData(manufacturerDataStr);
+        advertisementData->setManufacturerData(msd_payload, 16);
         BLEAdvertising *pAdvertising = (pServer != nullptr) ? pServer->getAdvertising() : BLEDevice::getAdvertising();
         if (pAdvertising != nullptr) {
             if (pServer != nullptr && pServer->getConnectedCount() > 0) {
                 *advertisementData = BLEAdvertisementData();
-                advertisementData->setName("OD" + getChipIdHex());
+                advertisementData->setName(("OD" + getChipIdHex()).c_str());
                 advertisementData->setFlags(0x06);
-                advertisementData->setManufacturerData(manufacturerDataStr);
+                advertisementData->setManufacturerData(msd_payload, 16);
             } else {
                 pAdvertising->stop();
                 BLEAdvertisementData freshAdvertisementData;
                 static String savedDeviceName = "";
                 if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
-                freshAdvertisementData.setName(savedDeviceName);
+                freshAdvertisementData.setName(savedDeviceName.c_str());
                 freshAdvertisementData.setFlags(0x06);
-                freshAdvertisementData.setManufacturerData(manufacturerDataStr);
+                freshAdvertisementData.setManufacturerData(msd_payload, 16);
                 *advertisementData = freshAdvertisementData;
+                // setAdvertisementData() must be the last data call before start():
+                // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
+                // flag and would make start() drop this manufacturer-data payload.
                 pAdvertising->setAdvertisementData(freshAdvertisementData);
-                pAdvertising->setScanResponse(false);
-                pAdvertising->setMinPreferred(0x06);
-                pAdvertising->setMaxPreferred(0x12);
                 delay(50);
                 pAdvertising->start();
             }

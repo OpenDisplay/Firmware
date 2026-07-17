@@ -20,14 +20,7 @@ void writeSerial(String message, bool newLine = true);
 #endif
 
 #ifdef TARGET_ESP32
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLEAdvertising.h>
-#if defined(CONFIG_BLUEDROID_ENABLED)
-#include <BLE2902.h>
-#endif
-
+// NimBLE-Arduino + BLE* aliases arrive via ble_init.h (included above).
 String getChipIdHex();
 void writeSerial(String message, bool newLine = true);
 #include "esp32_ble_callbacks.h"
@@ -215,9 +208,6 @@ void ble_init() {
 #ifdef TARGET_ESP32
 volatile bool bleRestartAdvertisingPending = false;
 volatile bool esp32BleNotifySubscribed = false;
-#if defined(CONFIG_BLUEDROID_ENABLED)
-static BLE2902* s_bleNotifyCccd = nullptr;
-#endif
 
 void esp32_ble_clear_handles(void) {
     pServer = nullptr;
@@ -231,12 +221,8 @@ bool esp32_ble_notify_enabled(void) {
     if (pTxCharacteristic == nullptr || pServer == nullptr || pServer->getConnectedCount() == 0) {
         return false;
     }
-#if defined(CONFIG_NIMBLE_ENABLED)
+    // NimBLE auto-creates the 0x2902 CCCD; onSubscribe tracks the client's toggle.
     return esp32BleNotifySubscribed;
-#else
-    BLE2902* cccd = (BLE2902*)pTxCharacteristic->getDescriptorByUUID((uint16_t)0x2902);
-    return cccd != nullptr && cccd->getNotifications();
-#endif
 }
 
 void esp32_restart_ble_advertising(void) {
@@ -261,12 +247,6 @@ void esp32_restart_ble_advertising(void) {
 
 void ble_init_esp32(bool update_manufacturer_data) {
     esp32_ble_clear_handles();
-#if defined(CONFIG_BLUEDROID_ENABLED)
-    if (s_bleNotifyCccd != nullptr) {
-        delete s_bleNotifyCccd;
-        s_bleNotifyCccd = nullptr;
-    }
-#endif
     writeSerial("=== Initializing ESP32 BLE ===");
     String deviceName = "OD" + getChipIdHex();
     writeSerial("Device name will be: " + deviceName);
@@ -278,7 +258,9 @@ void ble_init_esp32(bool update_manufacturer_data) {
         writeSerial("ERROR: Failed to create BLE server");
         return;
     }
-    pServer->setCallbacks(&staticServerCallbacks);
+    // deleteCallbacks=false: staticServerCallbacks is a static object; NimBLE must
+    // not delete it on deinit()/replacement.
+    pServer->setCallbacks(&staticServerCallbacks, false);
     writeSerial("Server callbacks configured");
     BLEUUID serviceUUID("00002446-0000-1000-8000-00805F9B34FB");
     pService = pServer->createService(serviceUUID);
@@ -290,24 +272,21 @@ void ble_init_esp32(bool update_manufacturer_data) {
     BLEUUID charUUID("00002446-0000-1000-8000-00805F9B34FB");
     pTxCharacteristic = pService->createCharacteristic(
         charUUID,
-        BLECharacteristic::PROPERTY_READ |
-        BLECharacteristic::PROPERTY_NOTIFY |
-        BLECharacteristic::PROPERTY_WRITE |
-        BLECharacteristic::PROPERTY_WRITE_NR
+        NIMBLE_PROPERTY::READ |
+        NIMBLE_PROPERTY::NOTIFY |
+        NIMBLE_PROPERTY::WRITE |
+        NIMBLE_PROPERTY::WRITE_NR
     );
     if (pTxCharacteristic == nullptr) {
         writeSerial("ERROR: Failed to create BLE characteristic");
         return;
     }
     writeSerial("Characteristic created with properties: READ, NOTIFY, WRITE, WRITE_NR");
-#if defined(CONFIG_BLUEDROID_ENABLED)
-    s_bleNotifyCccd = new BLE2902();
-    pTxCharacteristic->addDescriptor(s_bleNotifyCccd);
-    writeSerial("CCCD (0x2902) descriptor added for notifications");
-#endif
+    // NimBLE auto-adds the 0x2902 CCCD for NOTIFY characteristics; no BLE2902 needed.
     pTxCharacteristic->setCallbacks(&staticCharCallbacks);
     pRxCharacteristic = pTxCharacteristic;
-    pService->start();
+    // NimBLE starts services automatically when the server starts advertising; no
+    // explicit pService->start() (deprecated no-op in NimBLE 2.x).
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
     if (pAdvertising == nullptr) {
         writeSerial("ERROR: Failed to get advertising object");
@@ -315,19 +294,18 @@ void ble_init_esp32(bool update_manufacturer_data) {
     }
     pAdvertising->addServiceUUID(serviceUUID);
     writeSerial("Service UUID added to advertising");
-    advertisementData->setName(deviceName);
+    advertisementData->setName(deviceName.c_str());
     advertisementData->setFlags(0x06);
     writeSerial("Device name added to advertising");
     if (update_manufacturer_data) {
         updatemsdata();
     }
+    // setAdvertisementData() must be the LAST advertising-data call before start():
+    // NimBLE's enableScanResponse()/setPreferredParams()/etc. reset the internal
+    // "custom data set" flag, which would make start() discard this payload and
+    // re-advertise the piecemeal builder (no manufacturer data / no name). Scan
+    // response is off by default in NimBLE 2.x, so no enableScanResponse() needed.
     pAdvertising->setAdvertisementData(*advertisementData);
-    pAdvertising->setScanResponse(false);
-    pAdvertising->setMinPreferred(0x0006);
-    pAdvertising->setMaxPreferred(0x0012);
-    writeSerial("Advertising intervals set");
-    pServer->getAdvertising()->setMinPreferred(0x06);
-    pServer->getAdvertising()->setMaxPreferred(0x12);
     pServer->getAdvertising()->start();
     writeSerial("=== BLE advertising started successfully ===");
     writeSerial("Device ready: " + deviceName);

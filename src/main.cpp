@@ -241,8 +241,16 @@ static void flushResponseQueueToBle() {
         while (responseQueueTail != responseQueueHead && bleDrain < 16) {
             const bool quietAck = imageWriteLogQuietFrame(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
             if (!quietAck) writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
-            pTxCharacteristic->setValue(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
-            pTxCharacteristic->notify();
+            // notify(data,len) copies the payload into an mbuf immediately, so a
+            // concurrent client WRITE_NR on this shared RX/TX characteristic cannot
+            // corrupt the outgoing ACK (as setValue()+notify() could, since no-arg
+            // notify sends whatever value is currently stored). On mbuf exhaustion
+            // notify() returns false: stop draining and leave the entry queued to
+            // retry next pass rather than advancing past a dropped ACK (which stalls
+            // the pipe window).
+            if (!pTxCharacteristic->notify(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len)) {
+                break;
+            }
             responseQueue[responseQueueTail].pending = false;
             responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
             if (!quietAck) writeSerial("Response sent successfully");
@@ -397,7 +405,12 @@ void loop() {
             }
         }
         else{
-            idleDelay(2000);
+            // Non-battery (USB) idle: keep the loop responsive. A 2000 ms idle here
+            // stalls BLE command/response servicing for up to 2 s when a client
+            // connects mid-delay (the queued write waits out the delay before the
+            // loop re-evaluates), which reads as a sluggish/unreliable first
+            // exchange. Use the same short cadence as the battery idle-hold path.
+            idleDelay(5);
         }
         static uint32_t lastMsdUpdate = 0;
         if (millis() - lastMsdUpdate >= 60000) {

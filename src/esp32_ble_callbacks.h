@@ -4,11 +4,8 @@
 #ifdef TARGET_ESP32
 
 #include <Arduino.h>
-#include <BLECharacteristic.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
 #include <string.h>
-#include "ble_init.h"
+#include "ble_init.h"   // NimBLE-Arduino + BLE* aliases
 
 // Defined in display_service.cpp. True for a mid-stream image-write data frame
 // (0x0071) whose per-frame receive/queue logging should be suppressed.
@@ -45,15 +42,18 @@ extern volatile bool epdRefreshInProgress;
 extern bool directWriteActive;
 
 class MyBLEServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
         (void)pServer;
+        (void)connInfo;
         writeSerial("=== BLE CLIENT CONNECTED (ESP32) ===");
         rebootFlag = 0;
         esp32BleNotifySubscribed = false;
         updatemsdata();
     }
-    void onDisconnect(BLEServer* pServer) {
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         (void)pServer;
+        (void)connInfo;
+        (void)reason;
         writeSerial("=== BLE CLIENT DISCONNECTED (ESP32) ===");
         esp32BleNotifySubscribed = false;
         if (epdRefreshInProgress) {
@@ -76,16 +76,19 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
 
 class MyBLECharacteristicCallbacks : public BLECharacteristicCallbacks {
 public:
-#if defined(CONFIG_NIMBLE_ENABLED)
-    void onSubscribe(BLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) {
+    void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
         (void)pCharacteristic;
-        (void)desc;
+        (void)connInfo;
         esp32BleNotifySubscribed = (subValue & 0x0001) != 0;
         writeSerial("BLE notify subscription: " + String(esp32BleNotifySubscribed ? "enabled" : "disabled"));
     }
-#endif
-    void onWrite(BLECharacteristic* pCharacteristic) {
-        String value = pCharacteristic->getValue();
+    void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+        (void)connInfo;
+        // Keep the raw NimBLEAttValue: converting to Arduino String uses the C-string
+        // (strlen) constructor, which truncates at the first 0x00 byte. Pipe-write
+        // frames start with 0x00 (00 70 / 00 71 / 00 81), so String() would report
+        // length 0. .length()/.c_str() on NimBLEAttValue preserve the binary payload.
+        NimBLEAttValue value = pCharacteristic->getValue();
         const bool quiet = imageWriteLogQuietFrame((const uint8_t*)value.c_str(), value.length());
         if (!quiet) {
             writeSerial("=== BLE WRITE RECEIVED (ESP32) ===");

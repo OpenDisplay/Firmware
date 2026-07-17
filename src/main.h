@@ -84,10 +84,7 @@ extern "C" {
 #endif
 
 #ifdef TARGET_ESP32
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLEAdvertising.h>
+// BLE types come from ble_init.h (NimBLE-Arduino + BLE* aliases), included above.
 #include <esp_system.h>
 #include <esp_mac.h>
 #include <esp_timer.h>

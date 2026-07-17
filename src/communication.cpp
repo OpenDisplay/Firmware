@@ -10,7 +10,7 @@
 #include <string.h>
 
 #ifdef TARGET_ESP32
-#include <BLEServer.h>
+#include "ble_init.h"   // NimBLE-Arduino + BLE* aliases
 #include <WiFi.h>
 #include "wifi_service.h"
 extern BLEServer* pServer;
