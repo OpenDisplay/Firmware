@@ -300,10 +300,12 @@ void ble_init_esp32(bool update_manufacturer_data) {
     if (update_manufacturer_data) {
         updatemsdata();
     }
+    // setAdvertisementData() must be the LAST advertising-data call before start():
+    // NimBLE's enableScanResponse()/setPreferredParams()/etc. reset the internal
+    // "custom data set" flag, which would make start() discard this payload and
+    // re-advertise the piecemeal builder (no manufacturer data / no name). Scan
+    // response is off by default in NimBLE 2.x, so no enableScanResponse() needed.
     pAdvertising->setAdvertisementData(*advertisementData);
-    pAdvertising->enableScanResponse(false);
-    pAdvertising->setPreferredParams(0x0006, 0x0012);
-    writeSerial("Advertising intervals set");
     pServer->getAdvertising()->start();
     writeSerial("=== BLE advertising started successfully ===");
     writeSerial("Device ready: " + deviceName);

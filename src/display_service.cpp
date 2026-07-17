@@ -1544,9 +1544,10 @@ void updatemsdata(){
                 freshAdvertisementData.setFlags(0x06);
                 freshAdvertisementData.setManufacturerData(msd_payload, 16);
                 *advertisementData = freshAdvertisementData;
+                // setAdvertisementData() must be the last data call before start():
+                // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
+                // flag and would make start() drop this manufacturer-data payload.
                 pAdvertising->setAdvertisementData(freshAdvertisementData);
-                pAdvertising->enableScanResponse(false);
-                pAdvertising->setPreferredParams(0x06, 0x12);
                 delay(50);
                 pAdvertising->start();
             }
