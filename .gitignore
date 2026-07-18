@@ -87,3 +87,6 @@ __pycache__/
 .idea
 .claude
 
+
+### VS Code workspace
+*.code-workspace

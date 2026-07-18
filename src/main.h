@@ -39,25 +39,10 @@ using namespace Adafruit_LittleFS_Namespace;
 #define FONT_BASE_WIDTH 8   // Base font width (7 columns + 1 spacing)
 #define FONT_BASE_HEIGHT 8  // Base font height (8 rows)
 #define FONT_SMALL_THRESHOLD 264  // Use 1x scale for displays narrower than this
-// Config chunked write constants
-#define CONFIG_CHUNK_SIZE 200  // Maximum size of a config chunk
-#define CONFIG_CHUNK_SIZE_WITH_PREFIX 202  // Chunk size with 2-byte size prefix
-#define MAX_CONFIG_CHUNKS 20  // Maximum number of chunks allowed
-// Response buffer constants
-#define MAX_RESPONSE_DATA_SIZE 100  // Maximum data size in response buffer
-// PIPE_WRITE grants/constants (PIPE_MAX_*, PIPE_VERSION, PIPE_FLAG_*) live in structs.h.
-
-// BLE response codes (second byte only, first byte is always 0x00 for success, 0xFF for error)
-#define RESP_DIRECT_WRITE_START_ACK  0x70  // Direct write start acknowledgment
-#define RESP_DIRECT_WRITE_DATA_ACK   0x71  // Direct write data acknowledgment
-#define RESP_DIRECT_WRITE_END_ACK    0x72  // Direct write end acknowledgment
-#define RESP_DIRECT_WRITE_REFRESH_SUCCESS 0x73  // Display refresh completed successfully
-#define RESP_DIRECT_WRITE_REFRESH_TIMEOUT 0x74  // Display refresh timed out
-#define RESP_DIRECT_WRITE_ERROR      0xFF  // Direct write error response
-#define RESP_CONFIG_READ             0x40  // Config read response
-#define RESP_CONFIG_WRITE             0x41  // Config write response
-#define RESP_CONFIG_CHUNK             0x42  // Config chunk response
-#define RESP_MSD_READ                 0x44  // MSD (Manufacturer Specific Data) read response
+// Config chunked write constants (CONFIG_CHUNK_SIZE, CONFIG_CHUNK_SIZE_WITH_PREFIX,
+// MAX_CONFIG_CHUNKS), response buffer size (MAX_RESPONSE_DATA_SIZE), BLE response
+// codes (RESP_*), and PIPE_WRITE constants all come from the canonical
+// opendisplay_protocol.h (vendored, included via structs.h). Do not redefine here.
 
 // Communication mode bit definitions (for system_config.communication_modes)
 #define COMM_MODE_BLE           (1 << 0)  // Bit 0: BLE transfer supported

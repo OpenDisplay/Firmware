@@ -2,6 +2,7 @@
 #define STRUCTS_H
 
 #include <stdint.h>
+#include "opendisplay_protocol.h"  // canonical wire-protocol constants (CMD_*, RESP_*, PIPE_*, config limits)
 
 // Image transfer state variables
 struct ImageData {
@@ -123,17 +124,12 @@ struct PowerOption {
 #define PIPE_MAX_N      32
 #endif
 #define PIPE_REORDER_SLOT_SIZE  248    // >= max plaintext data payload (241 @ frame 244; 212 encrypted)
-#define PIPE_ACK_MASK_BITS      32
 
-// PIPE_WRITE device grants / protocol constants (plan Part 1 & 3).
-// frame cap = HA ATT write ceiling (244 B); window cap = ACK-mask width (32).
-#define PIPE_MAX_FRAME  244
-#define PIPE_VERSION    0x01
-#define PIPE_FLAG_COMPRESSED 0x01
-// bit1: partial-region refresh. START carries a 12-byte LE extension
+// PIPE_WRITE protocol constants (PIPE_ACK_MASK_BITS, PIPE_MAX_FRAME, PIPE_VERSION,
+// PIPE_FLAG_COMPRESSED, PIPE_FLAG_PARTIAL) come from the canonical opendisplay_protocol.h.
+// PIPE_FLAG_PARTIAL bit1: partial-region refresh. START carries a 12-byte LE extension
 // [old_etag:4][x:2][y:2][w:2][h:2]; geometry/etag validated like 0x76, refresh
 // mode + new_etag ride the 0x0082 END. See PIPE_WRITE section in display_service.cpp.
-#define PIPE_FLAG_PARTIAL 0x02
 
 struct PipeReorderSlot {
     bool     occupied;

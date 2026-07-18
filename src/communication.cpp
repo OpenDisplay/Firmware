@@ -184,7 +184,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
         uint8_t status = (len >= 3 && !pipeDataAck) ? response[2] : 0x00;
         // Encrypt all authenticated responses except auth/version handshakes and FE/FF status.
         // Direct-write / partial-write / LED acks must be encrypted too; LAN/BLE clients decrypt every response.
-        if (command != 0x0050 && command != 0x0043 && status != 0xFE && status != 0xFF) {
+        if (command != CMD_AUTHENTICATE && command != CMD_FIRMWARE_VERSION && status != 0xFE && status != 0xFF) {
             uint8_t nonce[16];
             uint8_t auth_tag[12];
             uint16_t encrypted_len = 0;
@@ -397,7 +397,7 @@ void handleWriteConfig(uint8_t* data, uint16_t len) {
     if (isEncryptionEnabled() && !isAuthenticated()) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
-            uint8_t response[] = {0x00, (uint8_t)(0x0041 & 0xFF), 0xFE};
+            uint8_t response[] = {0x00, (uint8_t)(CMD_CONFIG_WRITE & 0xFF), 0xFE};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
@@ -460,7 +460,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
             chunkedWriteState.active = false;
-            uint8_t response[] = {0x00, (uint8_t)(0x0042 & 0xFF), 0xFE};
+            uint8_t response[] = {0x00, (uint8_t)(CMD_CONFIG_CHUNK & 0xFF), 0xFE};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
@@ -511,16 +511,16 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     uint16_t command = (data[0] << 8) | data[1];
     // Silence the per-frame command spam for image-write data (0x0071) once the
     // stream is past its first chunk; the display handler's 5% meter reports it.
-    const bool quietCmd = (command == 0x0071 || command == 0x0081) && imageWriteLogQuietCmd();
+    const bool quietCmd = (command == CMD_DIRECT_WRITE_DATA || command == CMD_PIPE_WRITE_DATA) && imageWriteLogQuietCmd();
     if (!quietCmd) writeSerial("Processing command: 0x" + String(command, HEX));
 
-    if (command == 0x0050) {
+    if (command == CMD_AUTHENTICATE) {
         writeSerial("=== AUTHENTICATE COMMAND (0x0050) ===");
         handleAuthenticate(data + 2, len - 2);
         return;
     }
 
-    if (command == 0x0043) {
+    if (command == CMD_FIRMWARE_VERSION) {
         writeSerial("=== FIRMWARE VERSION COMMAND (0x0043) ===");
         handleFirmwareVersion();
         return;
@@ -581,83 +581,83 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     }
 
     switch (command) {
-        case 0x0040:
+        case CMD_CONFIG_READ:
             writeSerial("=== READ CONFIG COMMAND (0x0040) ===");
             writeSerial("Command received at time: " + String(millis()));
             handleReadConfig();
             writeSerial("Returned from handleReadConfig");
             break;
-        case 0x0041:
+        case CMD_CONFIG_WRITE:
             writeSerial("=== WRITE CONFIG COMMAND (0x0041) ===");
             handleWriteConfig(data + 2, len - 2);
             break;
-        case 0x0042:
+        case CMD_CONFIG_CHUNK:
             writeSerial("=== WRITE CONFIG CHUNK COMMAND (0x0042) ===");
             handleWriteConfigChunk(data + 2, len - 2);
             break;
-        case 0x0045:
+        case CMD_CONFIG_CLEAR:
             writeSerial("=== CLEAR CONFIG COMMAND (0x0045) ===");
             handleClearConfig();
             break;
-        case 0x000F:
+        case CMD_REBOOT:
             writeSerial("=== Reboot COMMAND (0x000F) ===");
             delay(100);
             reboot();
             break;
-        case 0x0043:
+        case CMD_FIRMWARE_VERSION:
             writeSerial("=== FIRMWARE VERSION COMMAND (0x0043) ===");
             handleFirmwareVersion();
             break;
-        case 0x0044:
+        case CMD_READ_MSD:
             writeSerial("=== READ MSD COMMAND (0x0044) ===");
             handleReadMSD();
             break;
-        case 0x0070:
+        case CMD_DIRECT_WRITE_START:
             writeSerial("=== DIRECT WRITE START COMMAND (0x0070) ===");
             handleDirectWriteStart(data + 2, len - 2);
             break;
-        case 0x0071:
+        case CMD_DIRECT_WRITE_DATA:
             handleDirectWriteData(data + 2, len - 2);
             break;
-        case 0x0072:
+        case CMD_DIRECT_WRITE_END:
             writeSerial("=== DIRECT WRITE END COMMAND (0x0072) ===");
             handleDirectWriteEnd(data + 2, len - 2);
             break;
-        case 0x0080:
+        case CMD_PIPE_WRITE_START:
             writeSerial("=== PIPE WRITE START COMMAND (0x0080) ===");
             handlePipeWriteStart(data + 2, len - 2);
             break;
-        case 0x0081:
+        case CMD_PIPE_WRITE_DATA:
             // The replay counter (verifyNonceReplay) already advanced at decrypt time,
             // above this switch, for every 0x0081 frame — including ones the handler
             // then queues or discards — so drops/dupes never desync it and the counter
             // delta stays within in-flight <= W <= 32 <= the +-32 replay window.
             handlePipeWriteData(data + 2, len - 2);
             break;
-        case 0x0082:
+        case CMD_PIPE_WRITE_END:
             writeSerial("=== PIPE WRITE END COMMAND (0x0082) ===");
             handlePipeWriteEnd(data + 2, len - 2);
             break;
-        case 0x0076:
+        case CMD_PARTIAL_WRITE_START:
             handlePartialWriteStart(data + 2, len - 2);
             break;
-        case 0x0073:
+        case CMD_LED_ACTIVATE:
             writeSerial("=== LED ACTIVATE COMMAND (0x0073) ===");
             handleLedActivate(data + 2, len - 2);
             break;
-        case 0x0075:
+        case CMD_LED_STOP:
             writeSerial("=== LED STOP COMMAND (0x0075) ===");
             handleLedStop(data + 2, len - 2);
             break;
-        case 0x0077:
+        case CMD_BUZZER:
             writeSerial("=== BUZZER ACTIVATE COMMAND (0x0077) ===");
             handleBuzzerActivate(data + 2, len - 2);
             break;
-        case 0x0051:
+        case CMD_ENTER_DFU:
             writeSerial("=== ENTER DFU MODE COMMAND (0x0051) ===");
             enterDFUMode();
             break;
-        case 0x0052:
+        case CMD_DEEP_SLEEP:
             handleDeepSleepCommand(data + 2, len - 2);
             break;
         default:
