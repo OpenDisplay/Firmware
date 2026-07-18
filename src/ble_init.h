@@ -36,6 +36,10 @@ void esp32_ble_clear_handles(void);
 bool esp32_ble_notify_enabled(void);
 extern volatile bool bleRestartAdvertisingPending;
 extern volatile bool esp32BleNotifySubscribed;
+// Set flag-only by MyBLEServerCallbacks (NimBLE host task); serviced from loop()
+// so the heavyweight teardown / I2C+advertisement work never races loop().
+extern volatile bool bleDisconnectCleanupPending;
+extern volatile bool msdUpdatePending;
 #endif
 
 #endif

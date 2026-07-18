@@ -48,7 +48,10 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
         writeSerial("=== BLE CLIENT CONNECTED (ESP32) ===");
         rebootFlag = 0;
         esp32BleNotifySubscribed = false;
-        updatemsdata();
+        // Flag-only: updatemsdata() polls I2C and mutates the shared advertisement
+        // vector, which loop() also drives (60 s cadence) — running it inline on the
+        // NimBLE host task would corrupt the heap. Serviced from loop() instead.
+        msdUpdatePending = true;
     }
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         (void)pServer;
@@ -56,20 +59,12 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
         (void)reason;
         writeSerial("=== BLE CLIENT DISCONNECTED (ESP32) ===");
         esp32BleNotifySubscribed = false;
-        if (epdRefreshInProgress) {
-            writeSerial("EPD refresh in progress — deferring cleanup/advertising to main loop");
-        } else {
-            // ACTIVE-only-teardown invariant: a WARM (post-successful-refresh) panel
-            // SURVIVES disconnect and keeps its keep-alive window, so the cleanups
-            // below no-op on power when WARM and only tear down a mid-transfer
-            // (PWR_ACTIVE) session. No logic change needed for keep-alive.
-            if (directWriteActive) cleanupDirectWriteState(true);
-            // Partial sessions (0x76 or pipe-partial) power the panel without
-            // setting directWriteActive; release it here instead of waiting on
-            // the 15-min partial watchdog.
-            cleanupPartialWriteOnDisconnect();
-        }
-        resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect
+        // Flag-only: the session teardown below (EPD force-off with SPI.end()/rail
+        // cut, partial + pipe cleanup) is heavyweight, state-mutating work that races
+        // loop()'s SPI streaming and pipe-frame processing on the Arduino task. Defer
+        // it — and the epdRefreshInProgress deferral — to loop() where it is
+        // single-task-safe (see serviceBleDisconnectCleanup in main.cpp).
+        bleDisconnectCleanupPending = true;
         bleRestartAdvertisingPending = true;
     }
 };

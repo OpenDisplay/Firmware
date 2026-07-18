@@ -1716,28 +1716,24 @@ void updatemsdata(){
         memcpy(prev_msd_payload, msd_payload, 16);
         advertisementData->setManufacturerData(msd_payload, 16);
         BLEAdvertising *pAdvertising = (pServer != nullptr) ? pServer->getAdvertising() : BLEDevice::getAdvertising();
-        if (pAdvertising != nullptr) {
-            if (pServer != nullptr && pServer->getConnectedCount() > 0) {
-                *advertisementData = BLEAdvertisementData();
-                advertisementData->setName(("OD" + getChipIdHex()).c_str());
-                advertisementData->setFlags(0x06);
-                advertisementData->setManufacturerData(msd_payload, 16);
-            } else {
-                pAdvertising->stop();
-                BLEAdvertisementData freshAdvertisementData;
-                static String savedDeviceName = "";
-                if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
-                freshAdvertisementData.setName(savedDeviceName.c_str());
-                freshAdvertisementData.setFlags(0x06);
-                freshAdvertisementData.setManufacturerData(msd_payload, 16);
-                *advertisementData = freshAdvertisementData;
-                // setAdvertisementData() must be the last data call before start():
-                // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
-                // flag and would make start() drop this manufacturer-data payload.
-                pAdvertising->setAdvertisementData(freshAdvertisementData);
-                delay(50);
-                pAdvertising->start();
-            }
+        // Only rebuild+restart advertising while disconnected. The former connected
+        // branch rebuilt *advertisementData but never pushed it via
+        // setAdvertisementData(), so it was dead work — dropped.
+        if (pAdvertising != nullptr && !(pServer != nullptr && pServer->getConnectedCount() > 0)) {
+            pAdvertising->stop();
+            BLEAdvertisementData freshAdvertisementData;
+            static String savedDeviceName = "";
+            if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
+            freshAdvertisementData.setName(savedDeviceName.c_str());
+            freshAdvertisementData.setFlags(0x06);
+            freshAdvertisementData.setManufacturerData(msd_payload, 16);
+            *advertisementData = freshAdvertisementData;
+            // setAdvertisementData() must be the last data call before start():
+            // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
+            // flag and would make start() drop this manufacturer-data payload.
+            pAdvertising->setAdvertisementData(freshAdvertisementData);
+            delay(50);
+            pAdvertising->start();
         }
     }
     opendisplay_mdns_update_msd_txt();

@@ -265,6 +265,26 @@ static void flushResponseQueueToBle() {
         }
     }
 }
+
+// Services the deferred BLE-disconnect session teardown flagged by
+// MyBLEServerCallbacks::onDisconnect. Runs on the loop() task so the heavyweight
+// EPD force-off (bbepSleep/delay/SPI.end/rail cut) and partial/pipe cleanup never
+// race SPI streaming or pipe-frame processing on the NimBLE host task. Deferred
+// while a refresh is mid-flight — the same epdRefreshInProgress gate the callback
+// used to apply inline; the flag stays set until a later pass clears it.
+static void serviceBleDisconnectCleanup() {
+    if (!bleDisconnectCleanupPending || epdRefreshInProgress) return;
+    bleDisconnectCleanupPending = false;
+    // ACTIVE-only-teardown invariant: a WARM (post-successful-refresh) panel
+    // SURVIVES disconnect and keeps its keep-alive window, so the cleanups below
+    // no-op on power when WARM and only tear down a mid-transfer (PWR_ACTIVE)
+    // session. No logic change needed for keep-alive.
+    if (directWriteActive) cleanupDirectWriteState(true);
+    // Partial sessions (0x76 or pipe-partial) power the panel without setting
+    // directWriteActive; release it here instead of waiting on the 15-min watchdog.
+    cleanupPartialWriteOnDisconnect();
+    resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect
+}
 #endif
 
 void loop() {
@@ -285,7 +305,8 @@ void loop() {
             return;
         }
         // A connect+drop entirely inside one poll gap leaves the radio dark for the
-        // rest of the window; the flag is otherwise only serviced past this return.
+        // rest of the window; the flags are otherwise only serviced past this return.
+        serviceBleDisconnectCleanup();   // tear down before re-advertising
         if (bleRestartAdvertisingPending) {
             esp32_restart_ble_advertising();
         }
@@ -340,6 +361,14 @@ void loop() {
         }
     }
     flushResponseQueueToBle();
+    // Service the flag-only BLE callbacks on this (single) task. Cleanup runs
+    // before the advertising restart so a disconnected session is fully torn down
+    // before the radio re-arms.
+    serviceBleDisconnectCleanup();
+    if (msdUpdatePending) {
+        msdUpdatePending = false;
+        updatemsdata();
+    }
     if (bleRestartAdvertisingPending) {
         esp32_restart_ble_advertising();
     }
