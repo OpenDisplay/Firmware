@@ -8,7 +8,7 @@ back to the same wire format:
     [2B LE length] [1B version] { [1B separator] [1B tag] [NB struct] }* [2B LE CRC-16]
 
 Commands: read-config, write-config, decode-config, encode-config, add-sensor, read-msd
-Run `device_cli.py <command> --help` for command-specific examples.
+Run `od-device-cli.py <command> --help` for command-specific examples.
 
 Dependencies:
     - bleak         BLE communication (read-config/write-config/read-msd/add-sensor over --addr)
@@ -933,15 +933,15 @@ def main() -> int:
     p_read = sub.add_parser(
         "read-config",
         help="Read a device's config over BLE and print it as YAML\n"
-        "  e.g. device_cli.py read-config --addr AA:BB:CC:DD:EE:FF -o config.yaml\n",
+        "  e.g. od-device-cli.py read-config --addr AA:BB:CC:DD:EE:FF -o config.yaml\n",
         description="Read a device's config over BLE (command 0x0040) and decode it to YAML.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py read-config --addr AA:BB:CC:DD:EE:FF -o config.yaml
+    od-device-cli.py read-config --addr AA:BB:CC:DD:EE:FF -o config.yaml
         Read the config and save it as YAML instead of printing to stdout.
 
-    device_cli.py read-config --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71
+    od-device-cli.py read-config --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71
         Same, for a device with BLE encryption enabled (security_config.encryption_enabled) -
         authenticates via the 0x0050 handshake first, then prints YAML to stdout.
 """,
@@ -954,15 +954,15 @@ Examples:
     p_write = sub.add_parser(
         "write-config",
         help="Write a YAML config to a device over BLE\n"
-        "  e.g. device_cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml\n",
+        "  e.g. od-device-cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml\n",
         description="Encode a YAML config and push it to a device over BLE (commands 0x0041/0x0042).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml
+    od-device-cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml
         Push config.yaml to the device, chunked automatically if it exceeds 200 bytes.
 
-    device_cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml --key 1e6d01ca00803339d31ee98ca052da71
+    od-device-cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml --key 1e6d01ca00803339d31ee98ca052da71
         Same, authenticating first for a device with BLE encryption enabled.
 """,
     )
@@ -974,15 +974,15 @@ Examples:
     p_decode = sub.add_parser(
         "decode-config",
         help="Decode a hex config packet to YAML (offline)\n"
-        '  e.g. device_cli.py decode-config --config-hex "1D 00 01 ... EC 58"\n',
+        '  e.g. od-device-cli.py decode-config --config-hex "1D 00 01 ... EC 58"\n',
         description="Decode a config packet's hex bytes to YAML, offline - no device or BLE required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py decode-config --config-hex "1D 00 01 ... EC 58"
+    od-device-cli.py decode-config --config-hex "1D 00 01 ... EC 58"
         Decode a hex string pasted directly on the command line.
 
-    device_cli.py decode-config --config-file dump.bin -o config.yaml
+    od-device-cli.py decode-config --config-file dump.bin -o config.yaml
         Decode a binary config dump file and save the result as YAML.
 """,
     )
@@ -993,12 +993,12 @@ Examples:
     p_encode = sub.add_parser(
         "encode-config",
         help="Encode a YAML config to a hex packet (offline)\n"
-        "  e.g. device_cli.py encode-config --input config.yaml\n",
+        "  e.g. od-device-cli.py encode-config --input config.yaml\n",
         description="Encode a YAML config to hex packet bytes, offline - no device or BLE required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py encode-config --input config.yaml
+    od-device-cli.py encode-config --input config.yaml
         Print the encoded packet as hex bytes to stdout, e.g. for OPENDISPLAY_FACTORY_CONFIG_HEX.
 """,
     )
@@ -1008,16 +1008,16 @@ Examples:
     p_add = sub.add_parser(
         "add-sensor",
         help="Add a sensor_data (0x23) block, over BLE or offline\n"
-        "  e.g. device_cli.py add-sensor --addr AA:BB:CC:DD:EE:FF --sensor-type 0x0003 --bus-id 0\n",
+        "  e.g. od-device-cli.py add-sensor --addr AA:BB:CC:DD:EE:FF --sensor-type 0x0003 --bus-id 0\n",
         description="Add a sensor_data (0x23) block to a config, over a live BLE device or offline hex.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py add-sensor --addr AA:BB:CC:DD:EE:FF --sensor-type 0x0003 --bus-id 0
+    od-device-cli.py add-sensor --addr AA:BB:CC:DD:EE:FF --sensor-type 0x0003 --bus-id 0
         Read the device's config over BLE, add an AXP2101 sensor entry, and write it back
         in one step.
 
-    device_cli.py add-sensor --config-hex "1D 00 01 ... EC 58" --sensor-type 0x0005 --bus-id 0
+    od-device-cli.py add-sensor --config-hex "1D 00 01 ... EC 58" --sensor-type 0x0005 --bus-id 0
         Offline: add a sensor entry to a hex packet and print the updated hex, without
         touching a live device.
 """,
@@ -1035,16 +1035,16 @@ Examples:
     p_msd = sub.add_parser(
         "read-msd",
         help="Read live MSD data (battery voltage, chip temperature) via command 0x0044\n"
-        "  e.g. device_cli.py read-msd --addr AA:BB:CC:DD:EE:FF\n",
+        "  e.g. od-device-cli.py read-msd --addr AA:BB:CC:DD:EE:FF\n",
         description="Read the device's live 16-byte MSD buffer (command 0x0044) and decode battery "
         "voltage, chip temperature, and status bits.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py read-msd --addr AA:BB:CC:DD:EE:FF
+    od-device-cli.py read-msd --addr AA:BB:CC:DD:EE:FF
         Print decoded battery voltage/temperature/status for an unencrypted device.
 
-    device_cli.py read-msd --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71 --raw
+    od-device-cli.py read-msd --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71 --raw
         Same, for a device with BLE encryption enabled, printing the raw 16-byte payload
         as hex instead of decoding it.
 """,
