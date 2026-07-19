@@ -1103,7 +1103,7 @@ Examples:
 """,
     )
     p_write.add_argument("--addr", required=True, help="BLE device address")
-    p_write.add_argument("--input", required=True, type=Path, help="YAML config file")
+    p_write.add_argument("-i", "--input", required=True, type=Path, help="YAML config file")
     p_write.add_argument("--key", metavar="HEX", help="16-byte master key (32 hex chars) for encrypted BLE")
     p_write.set_defaults(func=cmd_write_config)
 
@@ -1138,7 +1138,7 @@ Examples:
         Print the encoded packet as hex bytes to stdout, e.g. for OPENDISPLAY_FACTORY_CONFIG_HEX.
 """,
     )
-    p_encode.add_argument("--input", required=True, type=Path, help="YAML config file")
+    p_encode.add_argument("-i", "--input", required=True, type=Path, help="YAML config file")
     p_encode.set_defaults(func=cmd_encode_config)
 
     p_add = sub.add_parser(
