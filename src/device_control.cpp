@@ -206,22 +206,25 @@ static void led_schedule_delay_ms(uint16_t ms) {
 }
 
 static void led_load_config(struct LedConfig* led) {
-    uint8_t* ledcfg = led->reserved;
+    // The 12-byte flash pattern persisted in LedConfig.reserved[] is struct
+    // LedFlashPattern (all single bytes, no endianness). Overlay-read to name the
+    // fields; the nibble packing (mode/brightness, delay/count) stays hand-decoded.
+    const struct LedFlashPattern* p = (const struct LedFlashPattern*)led->reserved;
     s_led.led = led;
-    s_led.brightness = (uint8_t)(((ledcfg[0] >> 4) & 0x0F) + 1);
-    s_led.c1 = ledcfg[1];
-    s_led.c2 = ledcfg[4];
-    s_led.c3 = ledcfg[7];
-    s_led.loop1delay = (uint8_t)((ledcfg[2] >> 4) & 0x0F);
-    s_led.loop2delay = (uint8_t)((ledcfg[5] >> 4) & 0x0F);
-    s_led.loop3delay = (uint8_t)((ledcfg[8] >> 4) & 0x0F);
-    s_led.loopcnt1 = (uint8_t)(ledcfg[2] & 0x0F);
-    s_led.loopcnt2 = (uint8_t)(ledcfg[5] & 0x0F);
-    s_led.loopcnt3 = (uint8_t)(ledcfg[8] & 0x0F);
-    s_led.ildelay1 = ledcfg[3];
-    s_led.ildelay2 = ledcfg[6];
-    s_led.ildelay3 = ledcfg[9];
-    s_led.grouprepeats = (uint8_t)(ledcfg[10] + 1);
+    s_led.brightness = (uint8_t)(((p->mode_brightness >> 4) & 0x0F) + 1);
+    s_led.c1 = p->color1;
+    s_led.c2 = p->color2;
+    s_led.c3 = p->color3;
+    s_led.loop1delay = (uint8_t)((p->loop1_delay_count >> 4) & 0x0F);
+    s_led.loop2delay = (uint8_t)((p->loop2_delay_count >> 4) & 0x0F);
+    s_led.loop3delay = (uint8_t)((p->loop3_delay_count >> 4) & 0x0F);
+    s_led.loopcnt1 = (uint8_t)(p->loop1_delay_count & 0x0F);
+    s_led.loopcnt2 = (uint8_t)(p->loop2_delay_count & 0x0F);
+    s_led.loopcnt3 = (uint8_t)(p->loop3_delay_count & 0x0F);
+    s_led.ildelay1 = p->inter_loop_delay1;
+    s_led.ildelay2 = p->inter_loop_delay2;
+    s_led.ildelay3 = p->inter_loop_delay3;
+    s_led.grouprepeats = (uint8_t)(p->group_repeats + 1);
     s_led.group_pos = 0;
     s_led.i1 = 0;
     s_led.i2 = 0;
@@ -387,8 +390,9 @@ void handleLedActivate(uint8_t* data, uint16_t len) {
         return;
     }
     struct LedConfig* led = &globalConfig.leds[ledInstance];
-    if (len >= 13) {
-        memcpy(led->reserved, data + 1, 12);
+    // Payload is [led_instance:1][LedFlashPattern:12]; stash the pattern in reserved[].
+    if (len >= 1 + sizeof(struct LedFlashPattern)) {
+        memcpy(led->reserved, data + 1, sizeof(struct LedFlashPattern));
     }
     uint8_t mode = (uint8_t)(led->reserved[0] & 0x0F);
     if (mode != 1) {

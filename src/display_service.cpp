@@ -1723,17 +1723,20 @@ void updatemsdata(){
     else if (tempEncoded > 255) tempEncoded = 255;
     uint8_t temperatureByte = (uint8_t)tempEncoded;
     uint8_t batteryVoltageLowByte = (uint8_t)(batteryVoltage10mv & 0xFF);
-    uint8_t statusByte = ((batteryVoltage10mv >> 8) & 0x01) |
-                         ((rebootFlag & 0x01) << 1) |
-                         ((connectionRequested & 0x01) << 2) |
-                         ((mloopcounter & 0x0F) << 4);
-    uint16_t msd_cid = 0x2446;
-    memset(msd_payload, 0, 16);
-    memcpy(msd_payload, (uint8_t*)&msd_cid, sizeof(msd_cid));
-    memcpy(&msd_payload[2], dynamicreturndata, 11);
-    msd_payload[13] = temperatureByte;
-    msd_payload[14] = batteryVoltageLowByte;
-    msd_payload[15] = statusByte;
+    uint8_t statusByte = (((batteryVoltage10mv >> 8) & 0x01) ? OD_MSD_STATUS_BATTERY_VOLTAGE_BIT8 : 0) |
+                         (rebootFlag ? OD_MSD_STATUS_REBOOT_FLAG : 0) |
+                         (connectionRequested ? OD_MSD_STATUS_CONNECTION_REQUESTED : 0) |
+                         (((uint8_t)(mloopcounter << OD_MSD_STATUS_MAIN_LOOP_COUNTER_SHIFT)) & OD_MSD_STATUS_MAIN_LOOP_COUNTER_MASK);
+    // Build the 16-byte advertisement via the canonical wire struct (all little-endian),
+    // then copy into the global msd_payload[16] that the BLE adv APIs below consume.
+    struct MsdAdvertisement m;
+    memset(&m, 0, sizeof m);
+    m.company_id = 0x2446;
+    memcpy(m.dynamic, dynamicreturndata, sizeof m.dynamic);
+    m.chip_temperature = temperatureByte;
+    m.battery_voltage_low = batteryVoltageLowByte;
+    m.status = statusByte;
+    memcpy(msd_payload, &m, sizeof m);
 #ifdef TARGET_NRF
     static uint8_t prev_msd_payload_nrf[16] = {0xFF};
     if (memcmp(prev_msd_payload_nrf, msd_payload, 16) == 0) {
@@ -2091,11 +2094,14 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     resetPipeWriteState();
     imageWriteLogReset();
 
-    if (len < 17) {
+    if (len < sizeof(struct PartialWriteStartHeader)) {
         send_direct_write_nack(0x76, OD_ERR_PARTIAL_STREAM, false);
         return;
     }
 
+    // Layout is struct PartialWriteStartHeader (17 B). It is ALL big-endian, unlike
+    // the little-endian PipePartialExt twin, so we parse by hand (the shifts ARE the
+    // byte-swap) rather than overlaying the struct on this LE MCU.
     uint8_t flags     = data[0];
     uint32_t oldEtag  = parse_be_u32(data + 1);
     uint32_t newEtag  = parse_be_u32(data + 5);
@@ -2540,14 +2546,15 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     // Fixed 10-byte payload (opcode already stripped by the dispatcher):
     // ver(1)+flags(1)+req_w(1)+req_n(1)+client_max_frame(2)+total_size(4).
     // Tolerate trailing bytes (future fields).
-    if (len < 10) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
-    uint8_t  ver              = data[0];
-    uint8_t  flags            = data[1];
-    uint8_t  req_w            = data[2];
-    uint8_t  req_n            = data[3];
-    uint16_t client_max_frame = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
-    uint32_t total_size       = (uint32_t)data[6] | ((uint32_t)data[7] << 8)
-                              | ((uint32_t)data[8] << 16) | ((uint32_t)data[9] << 24);
+    if (len < sizeof(struct PipeStartRequest)) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
+    struct PipeStartRequest req;
+    memcpy(&req, data, sizeof req);   // canonical 10-byte LE header (byte-identical to the old shifts)
+    uint8_t  ver              = req.version;
+    uint8_t  flags            = req.flags;
+    uint8_t  req_w            = req.req_window;
+    uint8_t  req_n            = req.req_ack_every;
+    uint16_t client_max_frame = req.client_max_frame;
+    uint32_t total_size       = req.total_size;
 
     if (ver != PIPE_VERSION) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
     // Defined flags: bit0 zlib compression, bit1 partial-region refresh. Any other bit unsupported.
@@ -2558,17 +2565,20 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
 
     // Partial START appends a 12-byte LE extension after total_size (payload len 22 vs 10):
     // [old_etag:4][x:2][y:2][w:2][h:2]. LE, unlike 0x76's big-endian layout.
-    if (partial && len < 22) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
+    if (partial && len < sizeof(struct PipeStartRequest) + sizeof(struct PipePartialExt)) {
+        sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return;
+    }
     uint32_t old_etag = 0;
     uint16_t rectX = 0, rectY = 0, rectW = 0, rectH = 0;
     uint32_t planeBytes = 0;
     if (partial) {
-        old_etag = (uint32_t)data[10] | ((uint32_t)data[11] << 8)
-                 | ((uint32_t)data[12] << 16) | ((uint32_t)data[13] << 24);
-        rectX = (uint16_t)data[14] | ((uint16_t)data[15] << 8);
-        rectY = (uint16_t)data[16] | ((uint16_t)data[17] << 8);
-        rectW = (uint16_t)data[18] | ((uint16_t)data[19] << 8);
-        rectH = (uint16_t)data[20] | ((uint16_t)data[21] << 8);
+        struct PipePartialExt ext;
+        memcpy(&ext, data + sizeof(struct PipeStartRequest), sizeof ext);  // 12-byte LE extension
+        old_etag = ext.old_etag;
+        rectX = ext.x;
+        rectY = ext.y;
+        rectW = ext.w;
+        rectH = ext.h;
 
         // Partial validations (plan 1.2, order 5-7). All precede any hardware touch; any
         // failure clears displayed_etag for parity with send_direct_write_nack. These are
