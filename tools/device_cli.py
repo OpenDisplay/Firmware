@@ -7,15 +7,15 @@ YAML with named fields for every block type in src/structs.h, and re-encodes edi
 back to the same wire format:
     [2B LE length] [1B version] { [1B separator] [1B tag] [NB struct] }* [2B LE CRC-16]
 
-Commands: read, write, decode, encode, add-sensor, read-msd
+Commands: read-config, write-config, decode-config, encode-config, add-sensor, read-msd
 Run `device_cli.py <command> --help` for command-specific examples.
 
 Dependencies:
-    - bleak         BLE communication (read/write/read-msd/add-sensor over --addr)
-    - pyyaml        YAML config I/O (read/write/decode/encode)
+    - bleak         BLE communication (read-config/write-config/read-msd/add-sensor over --addr)
+    - pyyaml        YAML config I/O (read-config/write-config/decode-config/encode-config)
     - cryptography  encrypted BLE sessions (--key)
 
-Offline hex-only usage (decode/encode via --config-hex) needs none of the above.
+Offline hex-only usage (decode-config/encode-config via --config-hex) needs none of the above.
 
 Setup:
     python3 -m venv .venv
@@ -841,7 +841,7 @@ def _write_output(text: str, output: Path | None) -> None:
         print(text, end="" if text.endswith("\n") else "\n")
 
 
-def cmd_read(args: argparse.Namespace) -> int:
+def cmd_read_config(args: argparse.Namespace) -> int:
     key = _parse_key_arg(args.key)
     packet = asyncio.run(ble_read_config(args.addr, key=key))
     doc = decode_packet(packet)
@@ -849,7 +849,7 @@ def cmd_read(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_write(args: argparse.Namespace) -> int:
+def cmd_write_config(args: argparse.Namespace) -> int:
     key = _parse_key_arg(args.key)
     doc = load_yaml_doc(args.input.read_text())
     packet = encode_packet(doc)
@@ -858,14 +858,14 @@ def cmd_write(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_decode(args: argparse.Namespace) -> int:
+def cmd_decode_config(args: argparse.Namespace) -> int:
     packet = read_hex_arg(args.config_hex, str(args.config_file) if args.config_file else None)
     doc = decode_packet(packet)
     _write_output(dump_yaml(doc), args.output)
     return 0
 
 
-def cmd_encode(args: argparse.Namespace) -> int:
+def cmd_encode_config(args: argparse.Namespace) -> int:
     doc = load_yaml_doc(args.input.read_text())
     packet = encode_packet(doc)
     print(format_hex(packet))
@@ -931,17 +931,17 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_read = sub.add_parser(
-        "read",
+        "read-config",
         help="Read a device's config over BLE and print it as YAML\n"
-        "  e.g. device_cli.py read --addr AA:BB:CC:DD:EE:FF -o config.yaml\n",
+        "  e.g. device_cli.py read-config --addr AA:BB:CC:DD:EE:FF -o config.yaml\n",
         description="Read a device's config over BLE (command 0x0040) and decode it to YAML.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py read --addr AA:BB:CC:DD:EE:FF -o config.yaml
+    device_cli.py read-config --addr AA:BB:CC:DD:EE:FF -o config.yaml
         Read the config and save it as YAML instead of printing to stdout.
 
-    device_cli.py read --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71
+    device_cli.py read-config --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71
         Same, for a device with BLE encryption enabled (security_config.encryption_enabled) -
         authenticates via the 0x0050 handshake first, then prints YAML to stdout.
 """,
@@ -949,61 +949,61 @@ Examples:
     p_read.add_argument("--addr", required=True, help="BLE device address")
     p_read.add_argument("-o", "--output", type=Path, help="Write YAML to a file instead of stdout")
     p_read.add_argument("--key", metavar="HEX", help="16-byte master key (32 hex chars) for encrypted BLE")
-    p_read.set_defaults(func=cmd_read)
+    p_read.set_defaults(func=cmd_read_config)
 
     p_write = sub.add_parser(
-        "write",
+        "write-config",
         help="Write a YAML config to a device over BLE\n"
-        "  e.g. device_cli.py write --addr AA:BB:CC:DD:EE:FF --input config.yaml\n",
+        "  e.g. device_cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml\n",
         description="Encode a YAML config and push it to a device over BLE (commands 0x0041/0x0042).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py write --addr AA:BB:CC:DD:EE:FF --input config.yaml
+    device_cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml
         Push config.yaml to the device, chunked automatically if it exceeds 200 bytes.
 
-    device_cli.py write --addr AA:BB:CC:DD:EE:FF --input config.yaml --key 1e6d01ca00803339d31ee98ca052da71
+    device_cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml --key 1e6d01ca00803339d31ee98ca052da71
         Same, authenticating first for a device with BLE encryption enabled.
 """,
     )
     p_write.add_argument("--addr", required=True, help="BLE device address")
     p_write.add_argument("--input", required=True, type=Path, help="YAML config file")
     p_write.add_argument("--key", metavar="HEX", help="16-byte master key (32 hex chars) for encrypted BLE")
-    p_write.set_defaults(func=cmd_write)
+    p_write.set_defaults(func=cmd_write_config)
 
     p_decode = sub.add_parser(
-        "decode",
+        "decode-config",
         help="Decode a hex config packet to YAML (offline)\n"
-        '  e.g. device_cli.py decode --config-hex "1D 00 01 ... EC 58"\n',
+        '  e.g. device_cli.py decode-config --config-hex "1D 00 01 ... EC 58"\n',
         description="Decode a config packet's hex bytes to YAML, offline - no device or BLE required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py decode --config-hex "1D 00 01 ... EC 58"
+    device_cli.py decode-config --config-hex "1D 00 01 ... EC 58"
         Decode a hex string pasted directly on the command line.
 
-    device_cli.py decode --config-file dump.bin -o config.yaml
+    device_cli.py decode-config --config-file dump.bin -o config.yaml
         Decode a binary config dump file and save the result as YAML.
 """,
     )
     add_hex_input_args(p_decode)
     p_decode.add_argument("-o", "--output", type=Path, help="Write YAML to a file instead of stdout")
-    p_decode.set_defaults(func=cmd_decode)
+    p_decode.set_defaults(func=cmd_decode_config)
 
     p_encode = sub.add_parser(
-        "encode",
+        "encode-config",
         help="Encode a YAML config to a hex packet (offline)\n"
-        "  e.g. device_cli.py encode --input config.yaml\n",
+        "  e.g. device_cli.py encode-config --input config.yaml\n",
         description="Encode a YAML config to hex packet bytes, offline - no device or BLE required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-    device_cli.py encode --input config.yaml
+    device_cli.py encode-config --input config.yaml
         Print the encoded packet as hex bytes to stdout, e.g. for OPENDISPLAY_FACTORY_CONFIG_HEX.
 """,
     )
     p_encode.add_argument("--input", required=True, type=Path, help="YAML config file")
-    p_encode.set_defaults(func=cmd_encode)
+    p_encode.set_defaults(func=cmd_encode_config)
 
     p_add = sub.add_parser(
         "add-sensor",
