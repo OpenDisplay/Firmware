@@ -274,6 +274,42 @@ void e1004_end_plane(void) {}
 void e1004_write_stream_bytes(const uint8_t* data, uint16_t len) { (void)data; (void)len; }
 #endif
 
+// bb_epaper 71f6e70 replaced EP397/EP426 full-init RAM windows with SET_ORIENTATION
+// (flip180=0 → 0x11=0x02 on 800-wide) while part inits and our partial helpers still
+// use the pre-change windows. Re-apply those so full and partial share one map.
+static void epdAlignCustomPartialRamMode(void) {
+    uint8_t uc[4];
+    if (bbep.type == EP397_800x480 || bbep.type == EP397_800x480_4GRAY) {
+        bbepCMD2(&bbep, SSD1608_DATA_MODE, 0x01);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMXPOS);
+        uc[0] = 0x00; uc[1] = 0x00; uc[2] = 0x1f; uc[3] = 0x03;
+        bbepWriteData(&bbep, uc, 4);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMYPOS);
+        uc[0] = 0xdf; uc[1] = 0x01; uc[2] = 0x00; uc[3] = 0x00;
+        bbepWriteData(&bbep, uc, 4);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMXCOUNT);
+        uc[0] = 0x00; uc[1] = 0x00;
+        bbepWriteData(&bbep, uc, 2);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMYCOUNT);
+        uc[0] = 0x00; uc[1] = 0x00;
+        bbepWriteData(&bbep, uc, 2);
+    } else if (bbep.type == EP426_800x480 || bbep.type == EP426_800x480_4GRAY) {
+        bbepCMD2(&bbep, SSD1608_DATA_MODE, 0x02);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMXPOS);
+        uc[0] = 0x1f; uc[1] = 0x03; uc[2] = 0x00; uc[3] = 0x00;
+        bbepWriteData(&bbep, uc, 4);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMYPOS);
+        uc[0] = 0x00; uc[1] = 0x00; uc[2] = 0xdf; uc[3] = 0x01;
+        bbepWriteData(&bbep, uc, 4);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMXCOUNT);
+        uc[0] = 0x1f; uc[1] = 0x03;
+        bbepWriteData(&bbep, uc, 2);
+        bbepWriteCmd(&bbep, SSD1608_SET_RAMYCOUNT);
+        uc[0] = 0x00; uc[1] = 0x00;
+        bbepWriteData(&bbep, uc, 2);
+    }
+}
+
 static void initBbepPanelSession() {
     const DisplayConfig& d = globalConfig.displays[0];
 #ifdef BBEP_T133A01
@@ -286,6 +322,7 @@ static void initBbepPanelSession() {
     bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
     bbepWakeUp(&bbep);
     bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    epdAlignCustomPartialRamMode();
     delay(200);
 }
 
@@ -390,6 +427,7 @@ static bool epdSessionAcquire(bool partialInit) {
                 const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
                                                      : bbep.pInitFull;
                 bbepSendCMDSequence(&bbep, initSeq);
+                epdAlignCustomPartialRamMode();
                 epdSessionInitWasPartial = partialInit;
             }
         }
@@ -413,6 +451,7 @@ static bool epdSessionAcquire(bool partialInit) {
                 const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
                                                      : bbep.pInitFull;
                 bbepSendCMDSequence(&bbep, initSeq);
+                epdAlignCustomPartialRamMode();
                 epdSessionInitWasPartial = partialInit;
             }
         }
