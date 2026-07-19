@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["bleak", "pyyaml", "cryptography"]
+# ///
 """
 Read/edit/write an OpenDisplay device's config, live over BLE or offline as hex.
 
@@ -9,18 +13,6 @@ back to the same wire format:
 
 Commands: read-config, write-config, decode-config, encode-config, add-sensor, read-msd
 Run `od-device-cli.py <command> --help` for command-specific examples.
-
-Dependencies:
-    - bleak         BLE communication (read-config/write-config/read-msd/add-sensor over --addr)
-    - pyyaml        YAML config I/O (read-config/write-config/decode-config/encode-config)
-    - cryptography  encrypted BLE sessions (--key)
-
-Offline hex-only usage (decode-config/encode-config via --config-hex) needs none of the above.
-
-Setup:
-    python3 -m venv .venv
-    source .venv/bin/activate
-    pip install bleak pyyaml cryptography
 """
 
 from __future__ import annotations
@@ -28,25 +20,191 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, NamedTuple
 
-TOOL_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(TOOL_DIR))
-
-from ble_crypto import (  # noqa: E402
-    BleSession,
-    compute_challenge_response,
-    compute_server_response,
-    derive_session_id,
-    derive_session_key,
-)
-from config_packet import outer_packet_crc, read_hex_arg, validate_packet  # noqa: E402
+import bleak
+import yaml
+from cryptography.hazmat.primitives import cmac
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESCCM
 
 CHAR_UUID = "00002446-0000-1000-8000-00805f9b34fb"
 WRITE_CHUNK_SIZE = 200
+
+# --- inlined from config_packet.py (still used standalone by provision_firmware.py) ---
+
+MAX_PACKET = 4096
+
+
+def crc16ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= (byte << 8) & 0xFFFF
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def outer_packet_crc(body: bytes) -> int:
+    """CRC16-CCITT over outer packet body (length field zeroed)."""
+    if len(body) < 2:
+        return crc16ccitt(body)
+    tmp = bytearray(body)
+    tmp[0] = 0
+    tmp[1] = 0
+    return crc16ccitt(bytes(tmp))
+
+
+def parse_hex_bytes(text: str) -> bytes:
+    text = text.strip()
+    if not text:
+        raise ValueError("empty config hex string")
+    if re.search(r"[\s,]", text):
+        parts = re.split(r"[\s,]+", text)
+        return bytes(int(p, 16) for p in parts if p)
+    if len(text) % 2:
+        raise ValueError("hex string has odd length")
+    return bytes.fromhex(text)
+
+
+def read_hex_arg(value: str | None, file_path: str | None) -> bytes:
+    if bool(value) == bool(file_path):
+        raise ValueError("specify exactly one of --config-hex or --config-file")
+    packet = parse_hex_bytes(value) if value else open(file_path, "rb").read()
+    validate_packet(packet)
+    return packet
+
+
+def validate_packet(packet: bytes) -> None:
+    if len(packet) < 4:
+        raise ValueError("config packet too short")
+    if len(packet) > MAX_PACKET:
+        raise ValueError(f"config packet too large ({len(packet)} bytes, max {MAX_PACKET})")
+    declared = packet[0] | (packet[1] << 8)
+    if declared != len(packet):
+        raise ValueError(f"length field {declared} does not match packet size {len(packet)}")
+    given = packet[-2] | (packet[-1] << 8)
+    calc = outer_packet_crc(packet[:-2])
+    if given != calc:
+        raise ValueError(f"CRC mismatch (given 0x{given:04X}, expected 0x{calc:04X})")
+
+
+# --- inlined from ble_crypto.py ---
+# Mirrors src/encryption.cpp: AES-128-CMAC challenge/response, session key/id
+# derivation, and AES-CCM (13-byte nonce, 12-byte tag) command/response framing.
+
+SESSION_LABEL = b"OpenDisplay session"
+
+
+def aes_cmac(key: bytes, message: bytes) -> bytes:
+    c = cmac.CMAC(algorithms.AES(key))
+    c.update(message)
+    return c.finalize()
+
+
+def aes_ecb_encrypt_block(key: bytes, block: bytes) -> bytes:
+    if len(block) != 16:
+        raise ValueError("aes_ecb_encrypt_block: block must be exactly 16 bytes")
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return encryptor.update(block) + encryptor.finalize()
+
+
+def aes_ccm_encrypt(key: bytes, nonce: bytes, plaintext: bytes, ad: bytes, tag_length: int = 12) -> tuple[bytes, bytes]:
+    ct_and_tag = AESCCM(key, tag_length=tag_length).encrypt(nonce, plaintext, ad)
+    return ct_and_tag[:-tag_length], ct_and_tag[-tag_length:]
+
+
+def aes_ccm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, ad: bytes) -> bytes:
+    return AESCCM(key, tag_length=len(tag)).decrypt(nonce, ciphertext + tag, ad)
+
+
+def derive_session_key(master_key: bytes, client_nonce: bytes, server_nonce: bytes, device_id: bytes) -> bytes:
+    cmac_input = SESSION_LABEL + b"\x00" + device_id + client_nonce + server_nonce + b"\x00\x80"
+    intermediate = aes_cmac(master_key, cmac_input)
+    ecb_input = (1).to_bytes(8, "big") + intermediate[:8]
+    return aes_ecb_encrypt_block(master_key, ecb_input)
+
+
+def derive_session_id(session_key: bytes, client_nonce: bytes, server_nonce: bytes) -> bytes:
+    return aes_cmac(session_key, client_nonce + server_nonce)[:8]
+
+
+def compute_challenge_response(master_key: bytes, server_nonce: bytes, client_nonce: bytes, device_id: bytes) -> bytes:
+    return aes_cmac(master_key, server_nonce + client_nonce + device_id)
+
+
+def compute_server_response(session_key: bytes, server_nonce: bytes, client_nonce: bytes, device_id: bytes) -> bytes:
+    return aes_cmac(session_key, server_nonce + client_nonce + device_id)
+
+
+def encrypt_command(session_key: bytes, session_id: bytes, counter: int, cmd_hi: int, cmd_lo: int, payload: bytes) -> tuple[bytes, int]:
+    if len(payload) > 255:
+        raise ValueError("encrypt_command: payload exceeds 255 bytes")
+    nonce_full = session_id + counter.to_bytes(8, "big")
+    ccm_nonce = nonce_full[3:]
+    ad = bytes([cmd_hi, cmd_lo])
+    plaintext = bytes([len(payload)]) + payload
+    ciphertext, tag = aes_ccm_encrypt(session_key, ccm_nonce, plaintext, ad)
+    wire = bytes([cmd_hi, cmd_lo]) + nonce_full + ciphertext + tag
+    return wire, counter + 1
+
+
+def decrypt_response(session_key: bytes, data: bytes) -> bytes:
+    if len(data) < 2 + 16 + 1 + 12:
+        raise ValueError("decrypt_response: frame too short to be an encrypted response")
+    cmd = data[:2]
+    nonce_full = data[2:18]
+    tag = data[-12:]
+    ciphertext = data[18:-12]
+    ccm_nonce = nonce_full[3:]
+    plaintext = aes_ccm_decrypt(session_key, ccm_nonce, ciphertext, tag, cmd)
+    payload_len = plaintext[0]
+    return cmd + plaintext[1 : 1 + payload_len]
+
+
+def response_needs_decryption(data: bytes) -> bool:
+    if len(data) < 2:
+        return False
+    if data[0] == 0xFF:
+        return False
+    command = (data[0] << 8) | data[1]
+    if command in (0x0050, 0x0043):
+        return False
+    if len(data) < 2 + 16 + 1 + 12:
+        # Shorter than any valid CCM frame (2B cmd + 16B nonce + >=1B ciphertext +
+        # 12B tag) - can only be a plaintext status/ack, e.g. the final config-write
+        # ack sent after reloadConfigAfterSave() clears the session server-side.
+        return False
+    return True
+
+
+@dataclass
+class BleSession:
+    master_key: bytes
+    session_key: bytes | None = field(default=None)
+    session_id: bytes | None = field(default=None)
+    counter: int = 0
+    authenticated: bool = False
+
+    def encrypt(self, cmd_hi: int, cmd_lo: int, payload: bytes) -> bytes:
+        assert self.session_key is not None and self.session_id is not None
+        wire, self.counter = encrypt_command(self.session_key, self.session_id, self.counter, cmd_hi, cmd_lo, payload)
+        return wire
+
+    def decrypt(self, data: bytes) -> bytes:
+        assert self.session_key is not None
+        return decrypt_response(self.session_key, data)
+
+    def needs_decryption(self, data: bytes) -> bool:
+        return self.authenticated and response_needs_decryption(data)
 
 
 class Field(NamedTuple):
@@ -525,18 +683,7 @@ def auto_int(value: str) -> int:
     return int(value, 0)
 
 
-def _require_yaml() -> Any:
-    try:
-        import yaml  # ty: ignore[unresolved-import]
-    except ImportError:
-        print("ERROR: this command requires PyYAML - run: pip install pyyaml", file=sys.stderr)
-        sys.exit(1)
-    return yaml
-
-
 def dump_yaml(doc: dict[str, Any]) -> str:
-    yaml = _require_yaml()
-
     class IndentedDumper(yaml.SafeDumper):
         def increase_indent(self, flow: bool = False, indentless: bool = False) -> None:
             return super().increase_indent(flow, False)
@@ -545,20 +692,10 @@ def dump_yaml(doc: dict[str, Any]) -> str:
 
 
 def load_yaml_doc(text: str) -> dict[str, Any]:
-    yaml = _require_yaml()
     data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("YAML document must be a mapping at the top level")
     return data
-
-
-def _require_bleak() -> Any:
-    try:
-        import bleak  # ty: ignore[unresolved-import]
-    except ImportError:
-        print("ERROR: this command requires bleak - run: pip install bleak", file=sys.stderr)
-        sys.exit(1)
-    return bleak
 
 
 def _status(message: str) -> None:
@@ -641,7 +778,6 @@ async def _ble_authenticate(ctx: _BleCtx, session: BleSession, timeout: float) -
 
 @asynccontextmanager
 async def _ble_connection(addr: str, key: bytes | None = None, auth_timeout: float = 10.0) -> AsyncIterator[_BleCtx]:
-    bleak = _require_bleak()
     session = BleSession(master_key=key) if key else None
     _status(f"Connecting to {addr}...")
     async with bleak.BleakClient(addr) as client:
