@@ -45,6 +45,10 @@ What the header contains and what it does **not**:
 - Prefer named constants over magic numbers: use `CMD_PIPE_WRITE_START`, `CMD_CONFIG_WRITE`, etc. instead of raw `0x0080` / `0x0041` in switch/case dispatch (see `src/communication.cpp`).
 - Opcode/response values must always match the canonical spec — if a value looks wrong, fix it in `../opendisplay-protocol` and re-`--push`, never locally.
 
+### Keep `tools/od-device-cli.py` in sync
+
+`tools/od-device-cli.py`'s `BLOCKS` dict duplicates the config-packet field layout (names, sizes, enum values) from `include/opendisplay_structs.h` so it can decode/encode config packets offline. It is **not** auto-generated. Whenever a config struct's fields are renamed, resized, or added/removed in `opendisplay_structs.h`, update `BLOCKS` (and `VALID_ENUMS` for new enum values) in the same change. A stale field name that happens to start with `reserved` silently vanishes from decoded YAML when its value is 0 — treat drift here as a correctness bug, not a cosmetic one.
+
 ## Source layout (`src/`)
 
 - `main.cpp` / `main.h` — entry point, boot, main loop.

@@ -7,8 +7,8 @@
 Read/edit/write an OpenDisplay device's config, live over BLE or offline as hex.
 
 Decodes the binary config packet (see loadGlobalConfig(), src/config_parser.cpp) into
-YAML with named fields for every block type in src/structs.h, and re-encodes edited YAML
-back to the same wire format:
+YAML with named fields for every block type in include/opendisplay_structs.h, and
+re-encodes edited YAML back to the same wire format:
     [2B LE length] [1B version] { [1B separator] [1B tag] [NB struct] }* [2B LE CRC-16]
 
 Commands: read-config, write-config, decode-config, encode-config, add-sensor, read-msd
@@ -209,7 +209,7 @@ class BleSession:
 
 class Field(NamedTuple):
     name: str
-    kind: str  # "u8" | "u16" | "u24" | "u32" | "hex" | "str"
+    kind: str  # "u8" | "u16" | "u16be" | "u24" | "u32" | "u48" | "hex" | "str"
     size: int  # exact byte width of this field
     needs_nul: bool = True  # "str" fields only: must leave room for a NUL terminator
 
@@ -222,9 +222,10 @@ class Block(NamedTuple):
     max_instances: int
 
 
-# Field layouts mirror the packed structs in src/structs.h exactly (byte-for-byte,
-# verified against sizeof() for each struct). "reserved*" fields are omitted from
-# decoded YAML when all-zero, and default to all-zero when absent on encode.
+# Field layouts mirror the packed structs in include/opendisplay_structs.h exactly
+# (byte-for-byte, verified against sizeof() for each struct). "reserved*" fields
+# are omitted from decoded YAML when all-zero, and default to all-zero when
+# absent on encode.
 BLOCKS: dict[int, Block] = {
     0x01: Block(
         "system_config",
@@ -248,7 +249,11 @@ BLOCKS: dict[int, Block] = {
             Field("manufacturer_id", "u16", 2),
             Field("board_type", "u8", 1),
             Field("board_revision", "u8", 1),
-            Field("reserved", "hex", 18),
+            Field("simple_config_driver_index", "u16", 2),
+            Field("simple_config_display_index", "u16", 2),
+            Field("simple_config_power_index", "u16", 2),
+            Field("simple_config_configured_at", "u48", 6),  # 48-bit LE Unix time (s)
+            Field("reserved", "hex", 6),
         ],
         22,
         1,
@@ -258,9 +263,7 @@ BLOCKS: dict[int, Block] = {
         True,
         [
             Field("power_mode", "u8", 1),
-            # assumed little-endian; firmware declares this as a raw uint8_t[3] and never
-            # composes it as an integer, so this can't be fully verified against src/
-            Field("battery_capacity_mah", "u24", 3),
+            Field("battery_capacity_mah", "u24", 3),  # 24-bit LE per opendisplay_structs.h
             Field("sleep_timeout_ms", "u16", 2),
             Field("tx_power", "u8", 1),
             Field("sleep_flags", "u8", 1),
@@ -292,7 +295,7 @@ BLOCKS: dict[int, Block] = {
             Field("pixel_height", "u16", 2),
             Field("active_width_mm", "u16", 2),
             Field("active_height_mm", "u16", 2),
-            Field("tag_type", "u16", 2),
+            Field("legacy_tag_type", "u16", 2),
             Field("rotation", "u8", 1),
             Field("reset_pin", "u8", 1),
             Field("busy_pin", "u8", 1),
@@ -303,7 +306,7 @@ BLOCKS: dict[int, Block] = {
             Field("color_scheme", "u8", 1),
             Field("transmission_modes", "u8", 1),
             Field("clk_pin", "u8", 1),
-            Field("reserved_pin_2", "u8", 1),
+            Field("cs_pin_2", "u8", 1),
             Field("reserved_pin_3", "u8", 1),
             Field("reserved_pin_4", "u8", 1),
             Field("reserved_pin_5", "u8", 1),
@@ -375,15 +378,15 @@ BLOCKS: dict[int, Block] = {
             Field("instance_number", "u8", 1),
             Field("input_type", "u8", 1),
             Field("display_as", "u8", 1),
-            Field("reserved_pin_1", "u8", 1),
-            Field("reserved_pin_2", "u8", 1),
-            Field("reserved_pin_3", "u8", 1),
-            Field("reserved_pin_4", "u8", 1),
-            Field("reserved_pin_5", "u8", 1),
-            Field("reserved_pin_6", "u8", 1),
-            Field("reserved_pin_7", "u8", 1),
-            Field("reserved_pin_8", "u8", 1),
-            Field("input_flags", "u8", 1),
+            Field("input_pin_1", "u8", 1),
+            Field("input_pin_2", "u8", 1),
+            Field("input_pin_3", "u8", 1),
+            Field("input_pin_4", "u8", 1),
+            Field("input_pin_5", "u8", 1),
+            Field("input_pin_6", "u8", 1),
+            Field("input_pin_7", "u8", 1),
+            Field("input_pin_8", "u8", 1),
+            Field("pins_used", "u8", 1),
             Field("invert", "u8", 1),
             Field("pullups", "u8", 1),
             Field("pulldowns", "u8", 1),
@@ -404,7 +407,11 @@ BLOCKS: dict[int, Block] = {
             Field("ssid", "str", 32, needs_nul=False),
             Field("password", "str", 32, needs_nul=False),
             Field("encryption_type", "u8", 1),
-            Field("reserved", "hex", 95),
+            # unlike ssid/password, needs an on-wire NUL: config_parser.cpp's isStringFormat
+            # scans server_host for an embedded 0x00 to tell a hostname from a raw IP
+            Field("server_host", "str", 64),
+            Field("server_port", "u16be", 2),
+            Field("reserved", "hex", 29),
         ],
         160,
         1,
@@ -457,6 +464,31 @@ BLOCKS: dict[int, Block] = {
         32,
         4,
     ),
+    0x2A: Block(
+        "nfc_configs",
+        False,
+        [
+            Field("instance_number", "u8", 1),
+            Field("nfc_ic_type", "u8", 1),
+            Field("bus_instance", "u8", 1),
+            Field("flags", "u8", 1),
+            Field("field_detect_pin", "u8", 1),
+            Field("field_detect_mode", "u8", 1),
+            Field("field_detect_active", "u8", 1),
+            Field("field_detect_debounce_ms", "u8", 1),
+            Field("power_pin", "u8", 1),
+            Field("power_active", "u8", 1),
+            Field("power_on_delay_ms", "u8", 1),
+            Field("power_off_delay_ms", "u8", 1),
+            Field("adv_button_byte_index", "u8", 1),
+            Field("adv_button_button_id", "u8", 1),
+            Field("reserved_pin_1", "u8", 1),
+            Field("reserved_pin_2", "u8", 1),
+            Field("reserved", "hex", 16),
+        ],
+        32,
+        2,
+    ),
     0x2B: Block(
         "flash_configs",
         False,
@@ -507,8 +539,9 @@ for _tag, _block in BLOCKS.items():
 # this tool doesn't know about yet.
 VALID_ENUMS: dict[tuple[str, str], set[int]] = {
     ("sensors", "sensor_type"): {1, 2, 3, 4, 5},  # SENSOR_TYPE_TEMPERATURE..BQ27220
-    ("displays", "color_scheme"): {0, 1, 2, 3, 4, 5, 6, 7, 8},  # COLOR_SCHEME_MONO..BWGBRY_SPLIT
+    ("displays", "color_scheme"): {0, 1, 2, 3, 4, 5, 6, 7, 8, 100, 101, 102},  # COLOR_SCHEME_MONO..BWGBRY_SPLIT, RGB565/RGB888/RGB16BPC
     ("touch_controllers", "touch_ic_type"): {0, 1},  # TOUCH_IC_NONE, TOUCH_IC_GT911
+    ("power_option", "capacity_estimator"): {1, 2, 3, 4, 5},  # CAPACITY_EST_LI_ION..SEEED_LI_ION
 }
 
 
@@ -525,7 +558,7 @@ def decode_fields(fields: list[Field], payload: bytes) -> dict[str, Any]:
             value = raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
             nonzero = bool(value)
         else:
-            value = int.from_bytes(raw, "little")
+            value = int.from_bytes(raw, "big" if f.kind.endswith("be") else "little")
             nonzero = value != 0
         if f.name.startswith("reserved") and not nonzero:
             continue
@@ -555,7 +588,7 @@ def encode_fields(block_key: str, fields: list[Field], data: dict[str, Any], exp
             if int_value < 0:
                 raise ValueError(f"{block_key}.{f.name}: value {int_value} is negative, field is unsigned")
             try:
-                raw = int_value.to_bytes(f.size, "little")
+                raw = int_value.to_bytes(f.size, "big" if f.kind.endswith("be") else "little")
             except OverflowError:
                 max_value = (1 << (f.size * 8)) - 1
                 raise ValueError(
