@@ -184,9 +184,9 @@ void sendResponse(uint8_t* response, uint16_t len) {
         uint8_t status = (len >= 3 && !pipeDataAck) ? response[2] : 0x00;
         // Encrypt all authenticated responses except auth/version handshakes and FE/FF status.
         // Direct-write / partial-write / LED acks must be encrypted too; LAN/BLE clients decrypt every response.
-        if (command != CMD_AUTHENTICATE && command != CMD_FIRMWARE_VERSION && status != 0xFE && status != 0xFF) {
-            uint8_t nonce[16];
-            uint8_t auth_tag[12];
+        if (command != CMD_AUTHENTICATE && command != CMD_FIRMWARE_VERSION && status != RESP_AUTH_REQUIRED && status != RESP_NACK) {
+            uint8_t nonce[ENCRYPTION_NONCE_SIZE];
+            uint8_t auth_tag[ENCRYPTION_TAG_SIZE];
             uint16_t encrypted_len = 0;
             if (encryptResponse(response, len, encrypted_response, &encrypted_len, nonce, auth_tag)) {
                 if (!quietAck) {
@@ -198,7 +198,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
                 len = encrypted_len;
             } else {
                 writeSerial("WARNING: Failed to encrypt response, sending unencrypted error response", true);
-                errorResponse[0] = 0xFF;
+                errorResponse[0] = RESP_NACK;
                 errorResponse[1] = (uint8_t)(command & 0xFF);
                 errorResponse[2] = 0x00;
                 response = errorResponse;
@@ -259,8 +259,8 @@ void handleReadMSD() {
     writeSerial("=== READ MSD COMMAND (0x0044) ===", true);
     uint8_t response[2 + 16];
     uint16_t responseLen = 0;
-    response[responseLen++] = 0x00;
-    response[responseLen++] = 0x44;
+    response[responseLen++] = RESP_ACK;
+    response[responseLen++] = RESP_MSD_READ;
     memcpy(&response[responseLen], msd_payload, sizeof(msd_payload));
     responseLen += sizeof(msd_payload);
     sendResponse(response, responseLen);
@@ -336,8 +336,8 @@ void handleFirmwareVersion() {
     if (shaLen > 40) shaLen = 40;
     uint8_t response[2 + 1 + 1 + 1 + 40];
     uint16_t offset = 0;
-    response[offset++] = 0x00;
-    response[offset++] = 0x43;
+    response[offset++] = RESP_ACK;
+    response[offset++] = RESP_FIRMWARE_VERSION;
     response[offset++] = major;
     response[offset++] = minor;
     response[offset++] = shaLen;
@@ -362,20 +362,20 @@ void handleReadConfig() {
         const uint16_t maxChunks = (MAX_CONFIG_SIZE + 93) / 94;
         while (remaining > 0 && chunkNumber < maxChunks) {
             uint16_t responseLen = 0;
-            configReadResponseBuffer[responseLen++] = 0x00;
-            configReadResponseBuffer[responseLen++] = 0x40;
+            configReadResponseBuffer[responseLen++] = RESP_ACK;
+            configReadResponseBuffer[responseLen++] = RESP_CONFIG_READ;
             configReadResponseBuffer[responseLen++] = chunkNumber & 0xFF;
             configReadResponseBuffer[responseLen++] = (chunkNumber >> 8) & 0xFF;
             if (chunkNumber == 0) {
                 configReadResponseBuffer[responseLen++] = configLen & 0xFF;
                 configReadResponseBuffer[responseLen++] = (configLen >> 8) & 0xFF;
             }
-            uint16_t maxDataSize = 100 - responseLen;
+            uint16_t maxDataSize = MAX_RESPONSE_DATA_SIZE - responseLen;
             uint16_t chunkSize = (remaining < maxDataSize) ? remaining : maxDataSize;
             if (chunkSize == 0) break;
             memcpy(configReadResponseBuffer + responseLen, configData + offset, chunkSize);
             responseLen += chunkSize;
-            if (responseLen > 100 || responseLen == 0) break;
+            if (responseLen > MAX_RESPONSE_DATA_SIZE || responseLen == 0) break;
             sendResponse(configReadResponseBuffer, responseLen);
             offset += chunkSize;
             remaining -= chunkSize;
@@ -387,7 +387,7 @@ void handleReadConfig() {
 #endif
         }
     } else {
-        uint8_t errorResponse[] = {0xFF, 0x40, 0x00, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_READ, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
     }
 }
@@ -397,38 +397,38 @@ void handleWriteConfig(uint8_t* data, uint16_t len) {
     if (isEncryptionEnabled() && !isAuthenticated()) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
-            uint8_t response[] = {0x00, (uint8_t)(CMD_CONFIG_WRITE & 0xFF), 0xFE};
+            uint8_t response[] = {RESP_ACK, (uint8_t)(CMD_CONFIG_WRITE & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
         secureEraseConfig();
     }
-    if (len > 200) {
+    if (len > CONFIG_CHUNK_SIZE) {
         chunkedWriteState.active = true;
         chunkedWriteState.receivedSize = 0;
         chunkedWriteState.expectedChunks = 0;
         chunkedWriteState.receivedChunks = 0;
-        if (len >= 202) {
+        if (len >= CONFIG_CHUNK_SIZE_WITH_PREFIX) {
             chunkedWriteState.totalSize = data[0] | (data[1] << 8);
-            chunkedWriteState.expectedChunks = (chunkedWriteState.totalSize + 200 - 1) / 200;
-            uint16_t chunkDataSize = ((len - 2) < 200) ? (len - 2) : 200;
+            chunkedWriteState.expectedChunks = (chunkedWriteState.totalSize + CONFIG_CHUNK_SIZE - 1) / CONFIG_CHUNK_SIZE;
+            uint16_t chunkDataSize = ((len - 2) < CONFIG_CHUNK_SIZE) ? (len - 2) : CONFIG_CHUNK_SIZE;
             memcpy(chunkedWriteState.buffer, data + 2, chunkDataSize);
             chunkedWriteState.receivedSize = chunkDataSize;
             chunkedWriteState.receivedChunks = 1;
         } else {
-            uint16_t chunkSize = (len < 200) ? len : 200;
+            uint16_t chunkSize = (len < CONFIG_CHUNK_SIZE) ? len : CONFIG_CHUNK_SIZE;
             chunkedWriteState.totalSize = len;
             chunkedWriteState.expectedChunks = 1;
             memcpy(chunkedWriteState.buffer, data, chunkSize);
             chunkedWriteState.receivedSize = chunkSize;
             chunkedWriteState.receivedChunks = 1;
         }
-        uint8_t ackResponse[] = {0x00, 0x41, 0x00, 0x00};
+        uint8_t ackResponse[] = {RESP_ACK, RESP_CONFIG_WRITE, 0x00, 0x00};
         sendResponse(ackResponse, sizeof(ackResponse));
         return;
     }
-    uint8_t responseOk[] = {0x00, 0x41, 0x00, 0x00};
-    uint8_t responseErr[] = {0xFF, 0x41, 0x00, 0x00};
+    uint8_t responseOk[] = {RESP_ACK, RESP_CONFIG_WRITE, 0x00, 0x00};
+    uint8_t responseErr[] = {RESP_NACK, RESP_CONFIG_WRITE, 0x00, 0x00};
     bool ok = saveConfig(data, len);
     if (ok) {
         reloadConfigAfterSave();
@@ -438,8 +438,8 @@ void handleWriteConfig(uint8_t* data, uint16_t len) {
 
 void handleClearConfig(void) {
     writeSerial("=== CLEAR CONFIG COMMAND (0x0045) ===");
-    uint8_t responseOk[] = {0x00, 0x45, 0x00, 0x00};
-    uint8_t responseErr[] = {0xFF, 0x45, 0x00, 0x00};
+    uint8_t responseOk[] = {RESP_ACK, RESP_CONFIG_CLEAR, 0x00, 0x00};
+    uint8_t responseErr[] = {RESP_NACK, RESP_CONFIG_CLEAR, 0x00, 0x00};
 
     if (!clearStoredConfig()) {
         sendResponse(responseErr, sizeof(responseErr));
@@ -452,7 +452,7 @@ void handleClearConfig(void) {
 
 void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
     if (!chunkedWriteState.active) {
-        uint8_t errorResponse[] = {0xFF, 0x42, 0x00, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
@@ -460,15 +460,15 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
             chunkedWriteState.active = false;
-            uint8_t response[] = {0x00, (uint8_t)(CMD_CONFIG_CHUNK & 0xFF), 0xFE};
+            uint8_t response[] = {RESP_ACK, (uint8_t)(CMD_CONFIG_CHUNK & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
         secureEraseConfig();
     }
-    if (len == 0 || len > 200 || chunkedWriteState.receivedSize + len > 4096 || chunkedWriteState.receivedChunks >= 20) {
+    if (len == 0 || len > CONFIG_CHUNK_SIZE || chunkedWriteState.receivedSize + len > 4096 || chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
         chunkedWriteState.active = false;
-        uint8_t errorResponse[] = {0xFF, 0x42, 0x00, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
@@ -476,8 +476,8 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
     chunkedWriteState.receivedSize += len;
     chunkedWriteState.receivedChunks++;
     if (chunkedWriteState.receivedChunks >= chunkedWriteState.expectedChunks) {
-        uint8_t ok[] = {0x00, 0x42, 0x00, 0x00};
-        uint8_t err[] = {0xFF, 0x42, 0x00, 0x00};
+        uint8_t ok[] = {RESP_ACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
+        uint8_t err[] = {RESP_NACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         bool saved = saveConfig(chunkedWriteState.buffer, chunkedWriteState.receivedSize);
         if (saved) {
             reloadConfigAfterSave();
@@ -487,7 +487,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         chunkedWriteState.receivedSize = 0;
         chunkedWriteState.receivedChunks = 0;
     } else {
-        uint8_t ackResponse[] = {0x00, 0x42, 0x00, 0x00};
+        uint8_t ackResponse[] = {RESP_ACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(ackResponse, sizeof(ackResponse));
     }
 }
@@ -529,27 +529,27 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     if (isEncryptionEnabled()) {
         if (!isAuthenticated()) {
             writeSerial("ERROR: Command requires authentication (encryption enabled)");
-            uint8_t response[] = {0x00, (uint8_t)(command & 0xFF), 0xFE};
+            uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
 
-        if (len < 2 + 16 + 12) {
+        if (len < BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE) {
             writeSerial("ERROR: Unencrypted command received when encryption is enabled");
-            uint8_t response[] = {0x00, (uint8_t)(command & 0xFF), 0xFE};
+            uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
 
-        uint8_t nonce_full[16];
-        uint8_t auth_tag[12];
+        uint8_t nonce_full[ENCRYPTION_NONCE_SIZE];
+        uint8_t auth_tag[ENCRYPTION_TAG_SIZE];
         static uint8_t plaintext[512];
         uint16_t plaintext_len = 0;
 
-        memcpy(nonce_full, data + 2, 16);
-        memcpy(auth_tag, data + len - 12, 12);
+        memcpy(nonce_full, data + BLE_CMD_HEADER_SIZE, ENCRYPTION_NONCE_SIZE);
+        memcpy(auth_tag, data + len - ENCRYPTION_TAG_SIZE, ENCRYPTION_TAG_SIZE);
 
-        uint16_t encrypted_data_len = len - 2 - 16 - 12;
+        uint16_t encrypted_data_len = len - BLE_CMD_HEADER_SIZE - ENCRYPTION_NONCE_SIZE - ENCRYPTION_TAG_SIZE;
 
         if (!quietCmd) {
             static char data_buf[256];
@@ -565,9 +565,9 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             writeSerial(nonce_buf);
         }
 
-        if (!decryptCommand(data + 2 + 16, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
+        if (!decryptCommand(data + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
             writeSerial("ERROR: Decryption failed");
-            uint8_t response[] = {0x00, (uint8_t)(command & 0xFF), 0xFF};
+            uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_NACK};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }

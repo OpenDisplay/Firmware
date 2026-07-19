@@ -512,7 +512,7 @@ void secure_random(uint8_t* output, size_t len) {
 
 bool handleAuthenticate(uint8_t* data, uint16_t len) {
     if (!isEncryptionEnabled()) {
-        uint8_t response[] = {0x00, 0x50, 0x03};
+        uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_NOT_CONFIG};
         sendResponse(response, sizeof(response));
         return false;
     }
@@ -521,7 +521,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         uint32_t timeSinceLastAuth = (currentTime - encryptionSession.last_auth_time) / 1000;
         if (timeSinceLastAuth < 60) {
             if (encryptionSession.auth_attempts >= 10) {
-                uint8_t response[] = {0x00, 0x50, 0x04};
+                uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_RATE_LIMIT};
                 sendResponse(response, sizeof(response));
                 return false;
             }
@@ -541,7 +541,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         uint8_t device_id[4];
         getAuthDeviceIdBytes(device_id);
         uint8_t response[2 + 1 + 16 + 4];
-        response[0] = 0x00; response[1] = 0x50; response[2] = 0x00;
+        response[0] = RESP_ACK; response[1] = RESP_AUTHENTICATE; response[2] = AUTH_STATUS_CHALLENGE;
         memcpy(response + 3, encryptionSession.pending_server_nonce, 16);
         memcpy(response + 19, device_id, 4);
         sendResponse(response, sizeof(response));
@@ -555,7 +555,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         memcpy(challenge_response, data + 16, 16);
         if (currentTime - encryptionSession.server_nonce_time > 30000) {
             writeSerial("ERROR: Server nonce expired");
-            uint8_t response[] = {0x00, 0x50, 0xFF};
+            uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
         }
@@ -568,13 +568,13 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         uint8_t expected_response[16];
         if (!aes_cmac(securityConfig.encryption_key, challenge_input, 36, expected_response)) {
             writeSerial("ERROR: Failed to compute expected CMAC");
-            uint8_t response[] = {0x00, 0x50, 0xFF};
+            uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
         }
         if (!constantTimeCompare(challenge_response, expected_response, 16)) {
             writeSerial("ERROR: Authentication failed (wrong key)");
-            uint8_t response[] = {0x00, 0x50, 0x01};
+            uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_FAILED};
             sendResponse(response, sizeof(response));
             memset(encryptionSession.pending_server_nonce, 0, 16);
             return false;
@@ -584,7 +584,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         if (!deriveSessionKey(securityConfig.encryption_key, client_nonce,
                               encryptionSession.pending_server_nonce, encryptionSession.session_key)) {
             writeSerial("ERROR: Failed to derive session key");
-            uint8_t response[] = {0x00, 0x50, 0xFF};
+            uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
         }
@@ -596,7 +596,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         }
         if (!session_id_valid) {
             writeSerial("ERROR: Session ID is invalid (all zeros)!");
-            uint8_t response[] = {0x00, 0x50, 0xFF};
+            uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
         }
@@ -617,19 +617,19 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         if (!aes_cmac(encryptionSession.session_key, server_input, 36, server_response)) {
             writeSerial("ERROR: Failed to compute server response");
             clearEncryptionSession();
-            uint8_t response[] = {0x00, 0x50, 0xFF};
+            uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
         }
         uint8_t response[2 + 1 + 16];
-        response[0] = 0x00; response[1] = 0x50; response[2] = 0x00;
+        response[0] = RESP_ACK; response[1] = RESP_AUTHENTICATE; response[2] = AUTH_STATUS_SUCCESS;
         memcpy(response + 3, server_response, 16);
         sendResponse(response, sizeof(response));
         writeSerial("Authentication successful, session established");
         return true;
     }
     writeSerial("ERROR: Invalid authentication request format (len=" + String(len) + ")");
-    uint8_t response[] = {0x00, 0x50, 0xFF};
+    uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
     sendResponse(response, sizeof(response));
     return false;
 }
@@ -662,7 +662,7 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
     static uint8_t decrypted_with_length[512];
     bool success = aes_ccm_decrypt(encryptionSession.session_key, nonce, 13,
                                    ad, 2, ciphertext, encrypted_len,
-                                   decrypted_with_length, auth_tag, 12);
+                                   decrypted_with_length, auth_tag, ENCRYPTION_TAG_SIZE);
     if (success) {
         uint8_t payload_length = decrypted_with_length[0];
         if (payload_length > encrypted_len - 1) {
@@ -707,13 +707,13 @@ bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* cipher
     uint16_t total_payload_len = 1 + payload_len;
     bool success = aes_ccm_encrypt(encryptionSession.session_key, nonce_ccm, 13,
                                    ad, 2, payload_with_length, total_payload_len,
-                                   ciphertext + 2 + 16, auth_tag, 12);
+                                   ciphertext + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, auth_tag, ENCRYPTION_TAG_SIZE);
     if (!success) return false;
     ciphertext[0] = plaintext[0];
     ciphertext[1] = plaintext[1];
-    memcpy(ciphertext + 2, nonce, 16);
-    memcpy(ciphertext + 2 + 16 + total_payload_len, auth_tag, 12);
-    *ciphertext_len = 2 + 16 + total_payload_len + 12;
+    memcpy(ciphertext + BLE_CMD_HEADER_SIZE, nonce, ENCRYPTION_NONCE_SIZE);
+    memcpy(ciphertext + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + total_payload_len, auth_tag, ENCRYPTION_TAG_SIZE);
+    *ciphertext_len = BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + total_payload_len + ENCRYPTION_TAG_SIZE;
     updateEncryptionSessionActivity();
     return true;
 }

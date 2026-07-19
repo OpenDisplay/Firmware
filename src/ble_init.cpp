@@ -208,6 +208,8 @@ void ble_init() {
 #ifdef TARGET_ESP32
 volatile bool bleRestartAdvertisingPending = false;
 volatile bool esp32BleNotifySubscribed = false;
+volatile bool bleDisconnectCleanupPending = false;
+volatile bool msdUpdatePending = false;
 
 void esp32_ble_clear_handles(void) {
     pServer = nullptr;

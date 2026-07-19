@@ -63,13 +63,20 @@ volatile bool epdRefreshInProgress = false;
 
 extern uint32_t displayed_etag;
 
-static const uint8_t ERR_ETAG_MISMATCH = 0x01u;
-static const uint8_t ERR_RECT_OOB = 0x03u;
-static const uint8_t ERR_RECT_ALIGN = 0x04u;
-static const uint8_t ERR_PARTIAL_FLAGS = 0x05u;
-static const uint8_t ERR_PARTIAL_STREAM = 0x06u;
-static const uint8_t ERR_PARTIAL_UNSUPPORTED = 0x07u;
+// 0x76 partial-write error codes come from the canonical opendisplay_protocol.h;
+// use OD_ERR_PARTIAL_* directly at the call sites rather than shadowing them here
+// (the OD_ERR_PIPE_START_* family reuses the same byte values with DIFFERENT
+// meanings, so a local copy is a drift/mix-up hazard). For reference:
+//   OD_ERR_PARTIAL_ETAG_MISMATCH  0x01   old_etag != displayed etag
+//   OD_ERR_PARTIAL_RECT_OOB       0x03   rectangle out of panel bounds
+//   OD_ERR_PARTIAL_RECT_ALIGN     0x04   x / width not a multiple of 8
+//   OD_ERR_PARTIAL_FLAGS          0x05   bad / unsupported flags
+//   OD_ERR_PARTIAL_STREAM         0x06   stream / length error
+//   OD_ERR_PARTIAL_UNSUPPORTED    0x07   partial write unsupported (e.g. not 1bpp)
 
+// TODO(protocol): the canonical header defines no partial-write flag constant;
+// the 0x76 path reuses the bit0=compressed convention. Add an OD_PARTIAL_FLAG_*
+// (or reuse a shared flag) upstream in opendisplay-protocol, then drop this local.
 static const uint8_t PARTIAL_FLAG_COMPRESSED = 0x01u;
 static const uint8_t PARTIAL_ALLOWED_FLAGS = PARTIAL_FLAG_COMPRESSED;
 
@@ -1755,28 +1762,24 @@ void updatemsdata(){
         memcpy(prev_msd_payload, msd_payload, 16);
         advertisementData->setManufacturerData(msd_payload, 16);
         BLEAdvertising *pAdvertising = (pServer != nullptr) ? pServer->getAdvertising() : BLEDevice::getAdvertising();
-        if (pAdvertising != nullptr) {
-            if (pServer != nullptr && pServer->getConnectedCount() > 0) {
-                *advertisementData = BLEAdvertisementData();
-                advertisementData->setName(("OD" + getChipIdHex()).c_str());
-                advertisementData->setFlags(0x06);
-                advertisementData->setManufacturerData(msd_payload, 16);
-            } else {
-                pAdvertising->stop();
-                BLEAdvertisementData freshAdvertisementData;
-                static String savedDeviceName = "";
-                if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
-                freshAdvertisementData.setName(savedDeviceName.c_str());
-                freshAdvertisementData.setFlags(0x06);
-                freshAdvertisementData.setManufacturerData(msd_payload, 16);
-                *advertisementData = freshAdvertisementData;
-                // setAdvertisementData() must be the last data call before start():
-                // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
-                // flag and would make start() drop this manufacturer-data payload.
-                pAdvertising->setAdvertisementData(freshAdvertisementData);
-                delay(50);
-                pAdvertising->start();
-            }
+        // Only rebuild+restart advertising while disconnected. The former connected
+        // branch rebuilt *advertisementData but never pushed it via
+        // setAdvertisementData(), so it was dead work — dropped.
+        if (pAdvertising != nullptr && !(pServer != nullptr && pServer->getConnectedCount() > 0)) {
+            pAdvertising->stop();
+            BLEAdvertisementData freshAdvertisementData;
+            static String savedDeviceName = "";
+            if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
+            freshAdvertisementData.setName(savedDeviceName.c_str());
+            freshAdvertisementData.setFlags(0x06);
+            freshAdvertisementData.setManufacturerData(msd_payload, 16);
+            *advertisementData = freshAdvertisementData;
+            // setAdvertisementData() must be the last data call before start():
+            // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
+            // flag and would make start() drop this manufacturer-data payload.
+            pAdvertising->setAdvertisementData(freshAdvertisementData);
+            delay(50);
+            pAdvertising->start();
         }
     }
     opendisplay_mdns_update_msd_txt();
@@ -2062,7 +2065,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         memcpy(&directWriteDecompressedTotal, data, 4);
         if (directWriteDecompressedTotal != directWriteTotalBytes) {
             cleanupDirectWriteState(false);
-            uint8_t errorResponse[] = {0xFF, 0x70};
+            uint8_t errorResponse[] = {RESP_NACK, RESP_DIRECT_WRITE_START_ACK};
             sendResponse(errorResponse, sizeof(errorResponse));
             return;
         }
@@ -2072,13 +2075,13 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
         uint32_t compressedDataLen = len - 4;
         if (!zlib_stream_to_direct_write(data + 4, compressedDataLen, false)) {
             cleanupDirectWriteState(false);
-            uint8_t errorResponse[] = {0xFF, 0x70};
+            uint8_t errorResponse[] = {RESP_NACK, RESP_DIRECT_WRITE_START_ACK};
             sendResponse(errorResponse, sizeof(errorResponse));
             return;
         }
         directWriteCompressedReceived = compressedDataLen;
     }
-    uint8_t ackResponse[] = {0x00, 0x70};
+    uint8_t ackResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_START_ACK};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
 
@@ -2089,7 +2092,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     imageWriteLogReset();
 
     if (len < 17) {
-        send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, false);
+        send_direct_write_nack(0x76, OD_ERR_PARTIAL_STREAM, false);
         return;
     }
 
@@ -2102,12 +2105,12 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     uint16_t rectH    = ((uint16_t)data[15] << 8) | data[16];
 
     if ((flags & ~PARTIAL_ALLOWED_FLAGS) != 0) {
-        send_direct_write_nack(0x76, ERR_PARTIAL_FLAGS, false);
+        send_direct_write_nack(0x76, OD_ERR_PARTIAL_FLAGS, false);
         return;
     }
 
     if (oldEtag == 0 || oldEtag != displayed_etag || newEtag == 0) {
-        send_direct_write_nack(0x76, ERR_ETAG_MISMATCH, false);
+        send_direct_write_nack(0x76, OD_ERR_PARTIAL_ETAG_MISMATCH, false);
         return;
     }
 
@@ -2117,27 +2120,31 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
         // bb_epaper partial refresh support is effectively non-existent for
         // 2bpp+ panels, and physical panels may not support that mode either.
         // This protocol uses two 1bpp controller planes as old/new image memory.
-        send_direct_write_nack(0x76, ERR_PARTIAL_UNSUPPORTED, false);
+        send_direct_write_nack(0x76, OD_ERR_PARTIAL_UNSUPPORTED, false);
         return;
     }
 
     if (rectW == 0 || rectH == 0 ||
         (uint32_t)rectX + rectW > dispW ||
         (uint32_t)rectY + rectH > dispH) {
-        send_direct_write_nack(0x76, ERR_RECT_OOB, false);
+        send_direct_write_nack(0x76, OD_ERR_PARTIAL_RECT_OOB, false);
         return;
     }
 
     if ((rectX & 7u) != 0 || (rectW & 7u) != 0) {
-        send_direct_write_nack(0x76, ERR_RECT_ALIGN, false);
+        send_direct_write_nack(0x76, OD_ERR_PARTIAL_RECT_ALIGN, false);
         return;
     }
 
     uint32_t planeBytes = calc_controller_plane_bytes(rectW, rectH);
     uint32_t expectedLogicalSize = planeBytes * 2u;
 
+    // TODO(protocol): 0x76 (partial-write) has no RESP_* mirror in the canonical
+    // header, so the opcode-echo byte in these frames — and in the send_direct_write_nack(0x76, ...)
+    // calls below — stays a raw literal. Add RESP_PARTIAL_WRITE_START upstream in
+    // opendisplay-protocol, then replace the raw 0x76 here.
     if (expectedLogicalSize == 0) {
-        uint8_t errResponse[] = {0xFF, 0x76};
+        uint8_t errResponse[] = {RESP_NACK, 0x76};
         sendResponse(errResponse, sizeof(errResponse));
         return;
     }
@@ -2164,12 +2171,12 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     if (len > 17) {
         uint16_t initLen = len - 17;
         if (!partial_consume_bytes(data + 17, (uint32_t)initLen)) {
-            send_direct_write_nack(0x76, ERR_PARTIAL_STREAM, true);
+            send_direct_write_nack(0x76, OD_ERR_PARTIAL_STREAM, true);
             return;
         }
     }
 
-    uint8_t ackResponse[] = {0x00, 0x76};
+    uint8_t ackResponse[] = {RESP_ACK, 0x76};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
 
@@ -2183,11 +2190,11 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
         if (len == 0) return;
         imageWriteLogChunk(data, len);
         if (!partial_consume_bytes(data, (uint32_t)len)) {
-            send_direct_write_nack(0x71, ERR_PARTIAL_STREAM, true);
+            send_direct_write_nack(RESP_DIRECT_WRITE_DATA_ACK, OD_ERR_PARTIAL_STREAM, true);
             return;
         }
         imageWriteLogProgress(partialCtx.bytes_received, partialCtx.expected_stream_size);
-        uint8_t ackResponse[] = {0x00, 0x71};
+        uint8_t ackResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_DATA_ACK};
         sendResponse(ackResponse, sizeof(ackResponse));
         return;
     }
@@ -2196,12 +2203,12 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (directWriteCompressed) {
         if (!handleDirectWriteCompressedData(data, len)) {
             cleanupDirectWriteState(true);
-            uint8_t errorResponse[] = {0xFF, 0x71};
+            uint8_t errorResponse[] = {RESP_NACK, RESP_DIRECT_WRITE_DATA_ACK};
             sendResponse(errorResponse, sizeof(errorResponse));
         } else {
             directWriteCompressedReceived += len;
             imageWriteLogProgress(directWriteBytesWritten, directWriteTotalBytes);
-            uint8_t ackResponse[] = {0x00, 0x71};
+            uint8_t ackResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_DATA_ACK};
             sendResponse(ackResponse, sizeof(ackResponse));
         }
         return;
@@ -2225,7 +2232,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (directWriteBytesWritten >= directWriteTotalBytes) {
         handleDirectWriteEnd(nullptr, 0);
     } else {
-        uint8_t ackResponse[] = {0x00, 0x71};
+        uint8_t ackResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_DATA_ACK};
         sendResponse(ackResponse, sizeof(ackResponse));
     }
 }
@@ -2237,20 +2244,20 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     if (pipeState.active) return;
     if (partialCtx.active) {
         if (data != nullptr && len > 1) {
-            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
+            send_direct_write_nack(RESP_DIRECT_WRITE_END_ACK, OD_ERR_PARTIAL_STREAM, true);
             return;
         }
         if (partialCtx.compressed) {
             if (partialCtx.bytes_received == 0 || !zlib_stream_to_partial_write(nullptr, 0, true)) {
-                send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
+                send_direct_write_nack(RESP_DIRECT_WRITE_END_ACK, OD_ERR_PARTIAL_STREAM, true);
                 return;
             }
         } else if (partialCtx.bytes_written != partialCtx.expected_stream_size) {
-            send_direct_write_nack(0x72, ERR_PARTIAL_STREAM, true);
+            send_direct_write_nack(RESP_DIRECT_WRITE_END_ACK, OD_ERR_PARTIAL_STREAM, true);
             return;
         }
         imageWriteLogFinish(partialCtx.bytes_received, partialCtx.expected_stream_size);
-        uint8_t ackResponse[] = {0x00, 0x72};
+        uint8_t ackResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_END_ACK};
         sendResponse(ackResponse, sizeof(ackResponse));
         int refreshMode = REFRESH_PARTIAL;
         if (data != nullptr && len >= 1 && data[0] == REFRESH_FULL) refreshMode = REFRESH_FULL;
@@ -2258,11 +2265,11 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
         bool refreshSuccess = partial_write_to_panel(refreshMode);
         if (refreshSuccess) {
             displayed_etag = partialCtx.new_etag;
-            uint8_t validatedResponse[] = {0x00, 0x73};
+            uint8_t validatedResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_REFRESH_SUCCESS};
             sendResponse(validatedResponse, sizeof(validatedResponse));
         } else {
             displayed_etag = 0;
-            uint8_t timeoutResponse[] = {0x00, 0x74};
+            uint8_t timeoutResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_REFRESH_TIMEOUT};
             sendResponse(timeoutResponse, sizeof(timeoutResponse));
         }
         cleanup_partial_write_state();
@@ -2349,11 +2356,11 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
         // of diffing against the wrong, now-outdated base image.
         if (hasNewEtag && newEtag != 0) displayed_etag = newEtag;
         else displayed_etag = 0;
-        uint8_t refreshResponse[] = {0x00, 0x73};
+        uint8_t refreshResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_REFRESH_SUCCESS};
         sendResponse(refreshResponse, sizeof(refreshResponse));
     } else {
         if (hasNewEtag) displayed_etag = 0;
-        uint8_t timeoutResponse[] = {0x00, 0x74};
+        uint8_t timeoutResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_REFRESH_TIMEOUT};
         sendResponse(timeoutResponse, sizeof(timeoutResponse));
     }
 }
@@ -2424,10 +2431,18 @@ static void pipeBuildAckPayload(uint8_t* out) {
     out[4] = (uint8_t)((mask >> 24) & 0xFF);
 }
 
+// TODO(protocol): the canonical opendisplay_protocol.h defines no RESP_* mirror
+// for the pipe-write opcodes, so the response opcode-echo byte in the helpers
+// below (0x80 / 0x81 / 0x82) stays a raw literal. It also defines no data-phase
+// pipe error namespace (only OD_ERR_PIPE_START_* for the 0x80 START), so the
+// sendPipeNack() error codes (0x03 over-size/overflow, 0x04 out-of-window) are
+// raw too. Add RESP_PIPE_WRITE_{START,DATA,END} + an OD_ERR_PIPE_DATA_* set
+// upstream in opendisplay-protocol, then replace those literals here.
+
 // {0x00,0x81, highest_seen, ack_mask LE(4)} via sendResponse (auto-encrypts when
 // authenticated). Resets both cadence counters.
 static void sendPipeAck(void) {
-    uint8_t r[7] = {0x00, 0x81, 0, 0, 0, 0, 0};
+    uint8_t r[7] = {RESP_ACK, 0x81, 0, 0, 0, 0, 0};
     pipeBuildAckPayload(r + 2);
     sendResponse(r, sizeof(r));
     pipeState.frames_since_ack = 0;
@@ -2443,7 +2458,7 @@ static void sendPipeAck(void) {
 // with refreshDisplay=true: sleep a powered controller cleanly, cut power, resume
 // touch) instead of leaving the panel powered until the next transfer.
 static void sendPipeNack(uint8_t err) {
-    uint8_t r[8] = {0xFF, 0x81, err, 0, 0, 0, 0, 0};
+    uint8_t r[8] = {RESP_NACK, 0x81, err, 0, 0, 0, 0, 0};
     pipeBuildAckPayload(r + 3);
     sendResponse(r, sizeof(r));
     pipeState.error = true;
@@ -2460,7 +2475,7 @@ static void sendPipeNack(uint8_t err) {
 
 // {0xFF,0x80, err, 0x00}. Caller owns any session teardown.
 static void sendPipeStartNack(uint8_t err) {
-    uint8_t r[4] = {0xFF, 0x80, err, 0x00};
+    uint8_t r[4] = {RESP_NACK, 0x80, err, 0x00};
     sendResponse(r, sizeof(r));
 }
 
@@ -2525,7 +2540,7 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     // Fixed 10-byte payload (opcode already stripped by the dispatcher):
     // ver(1)+flags(1)+req_w(1)+req_n(1)+client_max_frame(2)+total_size(4).
     // Tolerate trailing bytes (future fields).
-    if (len < 10) { sendPipeStartNack(0x01); return; }
+    if (len < 10) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
     uint8_t  ver              = data[0];
     uint8_t  flags            = data[1];
     uint8_t  req_w            = data[2];
@@ -2534,16 +2549,16 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     uint32_t total_size       = (uint32_t)data[6] | ((uint32_t)data[7] << 8)
                               | ((uint32_t)data[8] << 16) | ((uint32_t)data[9] << 24);
 
-    if (ver != PIPE_VERSION) { sendPipeStartNack(0x01); return; }
+    if (ver != PIPE_VERSION) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
     // Defined flags: bit0 zlib compression, bit1 partial-region refresh. Any other bit unsupported.
-    if ((flags & ~(PIPE_FLAG_COMPRESSED | PIPE_FLAG_PARTIAL)) != 0) { sendPipeStartNack(0x02); return; }
+    if ((flags & ~(PIPE_FLAG_COMPRESSED | PIPE_FLAG_PARTIAL)) != 0) { sendPipeStartNack(OD_ERR_PIPE_START_UNKNOWN_FLAG); return; }
 
     bool compressed = (flags & PIPE_FLAG_COMPRESSED) != 0;
     bool partial    = (flags & PIPE_FLAG_PARTIAL) != 0;
 
     // Partial START appends a 12-byte LE extension after total_size (payload len 22 vs 10):
     // [old_etag:4][x:2][y:2][w:2][h:2]. LE, unlike 0x76's big-endian layout.
-    if (partial && len < 22) { sendPipeStartNack(0x01); return; }
+    if (partial && len < 22) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
     uint32_t old_etag = 0;
     uint16_t rectX = 0, rectY = 0, rectW = 0, rectH = 0;
     uint32_t planeBytes = 0;
@@ -2562,17 +2577,17 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
         uint16_t dispH = globalConfig.displays[0].pixel_height;
         // 5: two 1bpp controller planes are the partial mechanism; seeed/IT8951 has no equivalent.
         if (getBitsPerPixel() != 1 || seeed_driver_used() || e1004_panel_used()) {
-            displayed_etag = 0; sendPipeStartNack(0x06); return;
+            displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_PARTIAL_UNSUPPORTED); return;
         }
         // 6: etag gate — nonzero and must match what is currently on the panel.
         if (old_etag == 0 || old_etag != displayed_etag) {
-            displayed_etag = 0; sendPipeStartNack(0x05); return;
+            displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_ETAG_MISMATCH); return;
         }
         // 7: rectangle must be non-empty, in-bounds, and x/width byte-aligned (1bpp packing).
         if (rectW == 0 || rectH == 0 ||
             (uint32_t)rectX + rectW > dispW || (uint32_t)rectY + rectH > dispH ||
             (rectX & 7u) != 0 || (rectW & 7u) != 0) {
-            displayed_etag = 0; sendPipeStartNack(0x07); return;
+            displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_RECT_INVALID); return;
         }
     }
 
@@ -2584,11 +2599,11 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
         if (planeBytes == 0 || total_size != planeBytes * 2u) {
             // Plan 1.2: every partial-request NACK at steps 5-8 clears the etag
             // (parity with send_direct_write_nack).
-            displayed_etag = 0; sendPipeStartNack(0x03); return;
+            displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_SIZE_MISMATCH); return;
         }
     } else {
         directWriteComputeGeometry(compressed);
-        if (total_size != directWriteTotalBytes) { sendPipeStartNack(0x03); return; }
+        if (total_size != directWriteTotalBytes) { sendPipeStartNack(OD_ERR_PIPE_START_SIZE_MISMATCH); return; }
     }
 
     // Effective values (min-rule, plan 1.1). Floors at 1; N <= W; frame <= 244.
@@ -2648,7 +2663,11 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     // commands sequentially from its callback task, so activation below completes
     // before any queued 0x0081 write is handed to the dispatcher.
     // Device maxima; flags bit0 SET (selective repeat), bit1 = partial accepted (plan 1.2).
-    uint8_t resp[8] = {0x00, 0x80, PIPE_VERSION, PIPE_MAX_W, PIPE_MAX_N,
+    // TODO(protocol): 0x80 has no RESP_* mirror (see sendPipeAck), and the START
+    // response-flags bit0 "selective repeat" has no canonical constant (distinct from
+    // the request-side PIPE_FLAG_*). Add RESP_PIPE_WRITE_START + a response-flag
+    // constant upstream, then replace the raw 0x80 / 0x01 here.
+    uint8_t resp[8] = {RESP_ACK, 0x80, PIPE_VERSION, PIPE_MAX_W, PIPE_MAX_N,
                        (uint8_t)(PIPE_MAX_FRAME & 0xFF), (uint8_t)((PIPE_MAX_FRAME >> 8) & 0xFF),
                        (uint8_t)(0x01 | (partial ? PIPE_FLAG_PARTIAL : 0))};
     sendResponse(resp, sizeof(resp));
@@ -2771,12 +2790,12 @@ void handlePipeWriteData(uint8_t* data, uint16_t len) {
 
 void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
     if (!pipeState.active) {
-        uint8_t n[2] = {0xFF, 0x82};   // no active pipe transfer
+        uint8_t n[2] = {RESP_NACK, 0x82};   // no active pipe transfer
         sendResponse(n, sizeof(n));
         return;
     }
     if (pipeState.error) {
-        uint8_t n[2] = {0xFF, 0x82};   // a fatal error already NACKed this transfer
+        uint8_t n[2] = {RESP_NACK, 0x82};   // a fatal error already NACKed this transfer
         sendResponse(n, sizeof(n));
         // sendPipeNack already released the panel hardware at NACK time; this
         // re-run is a defensive no-op (partialCtx / directWriteActive already down).
@@ -2798,7 +2817,7 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
             incomplete = true;
         }
         if (incomplete) {
-            uint8_t n[2] = {0xFF, 0x82};
+            uint8_t n[2] = {RESP_NACK, 0x82};
             sendResponse(n, sizeof(n));
             displayed_etag = 0;
             cleanup_partial_write_state();
@@ -2806,7 +2825,7 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
             return;
         }
         imageWriteLogFinish(partialCtx.bytes_received, partialCtx.expected_stream_size);
-        uint8_t ackResponse[] = {0x00, 0x82};
+        uint8_t ackResponse[] = {RESP_ACK, 0x82};
         sendResponse(ackResponse, sizeof(ackResponse));
         // Refresh selector rides the END tail (plan 1.4): 0->FULL, 1->FAST, 2/absent->PARTIAL.
         int refreshMode = REFRESH_PARTIAL;
@@ -2817,11 +2836,11 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
         bool refreshSuccess = partial_write_to_panel(refreshMode);
         if (refreshSuccess) {
             displayed_etag = newEtag;
-            uint8_t validatedResponse[] = {0x00, 0x73};
+            uint8_t validatedResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_REFRESH_SUCCESS};
             sendResponse(validatedResponse, sizeof(validatedResponse));
         } else {
             displayed_etag = 0;
-            uint8_t timeoutResponse[] = {0x00, 0x74};
+            uint8_t timeoutResponse[] = {RESP_ACK, RESP_DIRECT_WRITE_REFRESH_TIMEOUT};
             sendResponse(timeoutResponse, sizeof(timeoutResponse));
         }
         cleanup_partial_write_state();
@@ -2834,7 +2853,7 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
     bool incomplete = (pipeState.queued_count > 0);
     if (!pipeState.compressed && directWriteBytesWritten < directWriteTotalBytes) incomplete = true;
     if (incomplete) {
-        uint8_t n[2] = {0xFF, 0x82};
+        uint8_t n[2] = {RESP_NACK, 0x82};
         sendResponse(n, sizeof(n));
         // Mid-stream abort with the panel powered: use the legacy mid-stream
         // variant (refreshDisplay=true → sleep the controller cleanly, cut power,
@@ -3163,6 +3182,6 @@ static void send_direct_write_nack(uint8_t opcode, uint8_t error, bool cleanupSt
         if (partialCtx.active) cleanup_partial_write_state();
         else cleanupDirectWriteState(false);
     }
-    uint8_t errResponse[] = {0xFF, opcode, error, 0x00};
+    uint8_t errResponse[] = {RESP_NACK, opcode, error, 0x00};
     sendResponse(errResponse, sizeof(errResponse));
 }

@@ -376,13 +376,13 @@ void processLedFlash() {
 
 void handleLedActivate(uint8_t* data, uint16_t len) {
     if (len < 1) {
-        uint8_t errorResponse[] = {0xFF, 0x73, 0x01, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_LED_ACTIVATE_ACK, 0x01, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     uint8_t ledInstance = data[0];
     if (ledInstance >= globalConfig.led_count) {
-        uint8_t errorResponse[] = {0xFF, 0x73, 0x02, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_LED_ACTIVATE_ACK, 0x02, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
@@ -393,7 +393,7 @@ void handleLedActivate(uint8_t* data, uint16_t len) {
     uint8_t mode = (uint8_t)(led->reserved[0] & 0x0F);
     if (mode != 1) {
         led_stop_internal(true);
-        uint8_t successResponse[] = {0x00, 0x73, 0x00, 0x00};
+        uint8_t successResponse[] = {RESP_ACK, RESP_LED_ACTIVATE_ACK, 0x00, 0x00};
         sendResponse(successResponse, sizeof(successResponse));
         return;
     }
@@ -407,18 +407,18 @@ void handleLedActivate(uint8_t* data, uint16_t len) {
     led_load_config(led);
     led_run_step();
 
-    uint8_t successResponse[] = {0x00, 0x73, 0x00, 0x00};
+    uint8_t successResponse[] = {RESP_ACK, RESP_LED_ACTIVATE_ACK, 0x00, 0x00};
     sendResponse(successResponse, sizeof(successResponse));
 }
 
 void handleLedStop(uint8_t* data, uint16_t len) {
     if (s_led.active && len >= 1 && data[0] != s_led.instance) {
-        uint8_t errorResponse[] = {0xFF, 0x75, 0x02, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_LED_STOP_ACK, 0x02, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     led_stop_internal(true);
-    uint8_t successResponse[] = {0x00, 0x75, 0x00, 0x00};
+    uint8_t successResponse[] = {RESP_ACK, RESP_LED_STOP_ACK, 0x00, 0x00};
     sendResponse(successResponse, sizeof(successResponse));
 }
 
@@ -718,7 +718,7 @@ void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
         if (overrideSeconds != 0) {
             writeSerial("0x0052 duration payload ignored (D-FF hard power off has no timer)", true);
         }
-        uint8_t ok[] = {0x00, 0x52, 0x00, 0x00};
+        uint8_t ok[] = {RESP_ACK, RESP_DEEP_SLEEP, 0x00, 0x00};
         sendResponse(ok, sizeof(ok));
         delay(100);
         powerLatchPowerOff();
@@ -726,13 +726,13 @@ void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
     }
     if (globalConfig.power_option.power_mode != 1) {
         writeSerial("Device not battery powered - 0x0052 rejected", true);
-        uint8_t errorResponse[] = {0xFF, 0x52, 0x02, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_DEEP_SLEEP, 0x02, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
         writeSerial("Deep sleep disabled in config - 0x0052 rejected", true);
-        uint8_t errorResponse[] = {0xFF, 0x52, 0x01, 0x00};
+        uint8_t errorResponse[] = {RESP_NACK, RESP_DEEP_SLEEP, 0x01, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
