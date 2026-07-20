@@ -240,7 +240,6 @@ static void flushResponseQueueToBle() {
         uint8_t bleDrain = 0;
         while (responseQueueTail != responseQueueHead && bleDrain < 16) {
             const bool quietAck = imageWriteLogQuietFrame(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
-            if (!quietAck) writeSerial("ESP32: Sending queued response (" + String(responseQueue[responseQueueTail].len) + " bytes)");
             // notify(data,len) copies the payload into an mbuf immediately, so a
             // concurrent client WRITE_NR on this shared RX/TX characteristic cannot
             // corrupt the outgoing ACK (as setValue()+notify() could, since no-arg
@@ -253,7 +252,12 @@ static void flushResponseQueueToBle() {
             }
             responseQueue[responseQueueTail].pending = false;
             responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
-            if (!quietAck) writeSerial("Response sent successfully");
+            // One line per drained response, reporting the remaining queue depth
+            // (replaces the old "Sending queued response" + "Response sent successfully").
+            if (!quietAck) {
+                uint8_t depth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
+                writeSerial("BLE Response Sent (queue size: " + String(depth) + ")");
+            }
             bleDrain++;
         }
     } else if (pServer && pServer->getConnectedCount() > 0) {
