@@ -82,7 +82,6 @@ static void pollConfiguredPowerOffButtons() {
 
 // BinaryInputs.input_type wire values (see structs.h for the full contract).
 // 2 is reserved for switches (host-side feature); the ADC ladder uses 3.
-#define BINARY_INPUT_TYPE_DIGITAL    1
 #define BINARY_INPUT_TYPE_ADC_LADDER 3
 
 // --- ADC resistor-ladder buttons (e.g. XTEINK X4) -------------------------
@@ -716,7 +715,7 @@ void initButtons() {
             continue;
         }
 #endif
-        if (input->input_type != BINARY_INPUT_TYPE_DIGITAL) continue;
+        if (input->input_type != OD_INPUT_TYPE_BUTTON) continue;
         if (input->button_data_byte_index > 10) continue;
         uint16_t instanceHoldMs = (input->power_off_hold_sec == 0) ? 3000u : (uint16_t)input->power_off_hold_sec * 1000u;
         uint8_t* instancePins[8] = {
