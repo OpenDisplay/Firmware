@@ -109,7 +109,7 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
 }
 
 void reboot(){
-    writeSerial("=== REBOOT COMMAND (0x000F) ===", true);
+    // Banner logged by the dispatcher (commandName() in communication.cpp).
     delay(100);
 #ifdef TARGET_NRF
     NVIC_SystemReset();
@@ -667,7 +667,7 @@ void initButtons() {
 }
 
 void enterDFUMode() {
-    writeSerial("=== ENTER DFU MODE COMMAND (0x0051) ===", true);
+    // Banner logged by the dispatcher (commandName() in communication.cpp).
 
 #ifdef TARGET_NRF
     writeSerial("Preparing to enter DFU bootloader mode...", true);
@@ -707,7 +707,7 @@ void enterDFUMode() {
 }
 
 void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
-    writeSerial("=== DEEP SLEEP COMMAND (0x" + String(CMD_DEEP_SLEEP, HEX) + ") ===", true);
+    // Banner logged by the dispatcher (commandName() in communication.cpp).
 #ifdef TARGET_ESP32
     // Optional 2-byte big-endian seconds payload overrides the configured
     // deep-sleep duration for exactly one cycle. 0x0000 = explicit no-override.
@@ -753,7 +753,7 @@ void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
 }
 
 void handlePowerOffCommand(const uint8_t* payload, uint16_t payloadLen) {
-    writeSerial("=== POWER OFF COMMAND (0x" + String(CMD_POWER_OFF, HEX) + ") ===", true);
+    // Banner logged by the dispatcher (commandName() in communication.cpp).
     // CMD_POWER_OFF request is bare [0x00][0x52]; any trailing payload is RESERVED
     // and ignored (unlike CMD_DEEP_SLEEP 0x0053, this has no duration payload).
     (void)payload;

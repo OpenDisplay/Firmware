@@ -256,7 +256,6 @@ void sendResponse(uint8_t* response, uint16_t len) {
 }
 
 void handleReadMSD() {
-    writeSerial("=== READ MSD COMMAND (0x0044) ===", true);
     uint8_t response[2 + 16];
     uint16_t responseLen = 0;
     response[responseLen++] = RESP_ACK;
@@ -437,7 +436,6 @@ void handleWriteConfig(uint8_t* data, uint16_t len) {
 }
 
 void handleClearConfig(void) {
-    writeSerial("=== CLEAR CONFIG COMMAND (0x0045) ===");
     uint8_t responseOk[] = {RESP_ACK, RESP_CONFIG_CLEAR, 0x00, 0x00};
     uint8_t responseErr[] = {RESP_NACK, RESP_CONFIG_CLEAR, 0x00, 0x00};
 
@@ -500,6 +498,40 @@ typedef void* BLEConnHandle;
 typedef void* BLECharPtr;
 #endif
 
+// Human-readable name for a command opcode, used for the single dispatch banner
+// emitted by imageDataWritten() (the shared command handler for nRF, ESP32 BLE,
+// and the ESP32 LAN transport). Returns nullptr for opcodes not dispatched here
+// (incl. CMD_NFC_ENDPOINT 0x0083, which this Firmware does not implement on any
+// target) — the switch default logs those as unknown. Single source of truth for
+// the banner text: keep in sync with the dispatch switch below; individual
+// cases/handlers must NOT log their own "=== ... COMMAND ... ===" banner.
+static const char* commandName(uint16_t cmd) {
+    switch (cmd) {
+        case CMD_REBOOT:              return "REBOOT";              // 0x000F
+        case CMD_CONFIG_READ:         return "READ CONFIG";         // 0x0040
+        case CMD_CONFIG_WRITE:        return "WRITE CONFIG";        // 0x0041
+        case CMD_CONFIG_CHUNK:        return "WRITE CONFIG CHUNK";  // 0x0042
+        case CMD_FIRMWARE_VERSION:    return "FIRMWARE VERSION";    // 0x0043
+        case CMD_READ_MSD:            return "READ MSD";            // 0x0044
+        case CMD_CONFIG_CLEAR:        return "CLEAR CONFIG";        // 0x0045
+        case CMD_AUTHENTICATE:        return "AUTHENTICATE";        // 0x0050
+        case CMD_ENTER_DFU:           return "ENTER DFU MODE";      // 0x0051
+        case CMD_POWER_OFF:           return "POWER OFF";           // 0x0052
+        case CMD_DEEP_SLEEP:          return "DEEP SLEEP";          // 0x0053
+        case CMD_DIRECT_WRITE_START:  return "DIRECT WRITE START";  // 0x0070
+        case CMD_DIRECT_WRITE_DATA:   return "DIRECT WRITE DATA";   // 0x0071
+        case CMD_DIRECT_WRITE_END:    return "DIRECT WRITE END";    // 0x0072
+        case CMD_LED_ACTIVATE:        return "LED ACTIVATE";        // 0x0073
+        case CMD_LED_STOP:            return "LED STOP";            // 0x0075
+        case CMD_PARTIAL_WRITE_START: return "PARTIAL WRITE START"; // 0x0076
+        case CMD_BUZZER:              return "BUZZER ACTIVATE";     // 0x0077
+        case CMD_PIPE_WRITE_START:    return "PIPE WRITE START";    // 0x0080
+        case CMD_PIPE_WRITE_DATA:     return "PIPE WRITE DATA";     // 0x0081
+        case CMD_PIPE_WRITE_END:      return "PIPE WRITE END";      // 0x0082
+        default:                      return nullptr;
+    }
+}
+
 void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len) {
     (void)conn_hdl;
     (void)chr;
@@ -512,16 +544,26 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     // Silence the per-frame command spam for image-write data (0x0071) once the
     // stream is past its first chunk; the display handler's 5% meter reports it.
     const bool quietCmd = (command == CMD_DIRECT_WRITE_DATA || command == CMD_PIPE_WRITE_DATA) && imageWriteLogQuietCmd();
-    if (!quietCmd) writeSerial("Processing command: 0x" + String(command, HEX));
+    // Single per-command banner for the whole dispatch. Named via commandName();
+    // unknown opcodes (nullptr) get no banner here and fall to the switch default's
+    // "Unknown command" error. Cases and handlers must not log their own banner.
+    if (!quietCmd) {
+        const char* name = commandName(command);
+        if (name != nullptr) {
+            char banner[64];
+            snprintf(banner, sizeof(banner), "=== %s COMMAND (0x%04X) ===", name, command);
+            writeSerial(banner);
+        }
+    }
 
+    // AUTHENTICATE and FIRMWARE_VERSION are handled before the encryption gate
+    // (they are the handshake). The banner is already emitted above via commandName().
     if (command == CMD_AUTHENTICATE) {
-        writeSerial("=== AUTHENTICATE COMMAND (0x0050) ===");
         handleAuthenticate(data + 2, len - 2);
         return;
     }
 
     if (command == CMD_FIRMWARE_VERSION) {
-        writeSerial("=== FIRMWARE VERSION COMMAND (0x0043) ===");
         handleFirmwareVersion();
         return;
     }
@@ -580,92 +622,78 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         data = decrypted_data;
     }
 
+    // The per-command banner is logged once above (commandName()); cases below do
+    // NOT log their own "=== ... COMMAND ... ===". CMD_AUTHENTICATE and
+    // CMD_FIRMWARE_VERSION are handled by the early returns above and so are absent
+    // here. CMD_NFC_ENDPOINT (0x0083) is intentionally not handled by this Firmware
+    // (any target) — it falls to default as an unknown command.
     switch (command) {
-        case CMD_CONFIG_READ:
-            writeSerial("=== READ CONFIG COMMAND (0x0040) ===");
+        case CMD_REBOOT:              // 0x000F
+            delay(100);
+            reboot();
+            break;
+        case CMD_CONFIG_READ:         // 0x0040
             writeSerial("Command received at time: " + String(millis()));
             handleReadConfig();
             writeSerial("Returned from handleReadConfig");
             break;
-        case CMD_CONFIG_WRITE:
-            writeSerial("=== WRITE CONFIG COMMAND (0x0041) ===");
+        case CMD_CONFIG_WRITE:        // 0x0041
             handleWriteConfig(data + 2, len - 2);
             break;
-        case CMD_CONFIG_CHUNK:
-            writeSerial("=== WRITE CONFIG CHUNK COMMAND (0x0042) ===");
+        case CMD_CONFIG_CHUNK:        // 0x0042
             handleWriteConfigChunk(data + 2, len - 2);
             break;
-        case CMD_CONFIG_CLEAR:
-            writeSerial("=== CLEAR CONFIG COMMAND (0x0045) ===");
-            handleClearConfig();
-            break;
-        case CMD_REBOOT:
-            writeSerial("=== Reboot COMMAND (0x000F) ===");
-            delay(100);
-            reboot();
-            break;
-        case CMD_FIRMWARE_VERSION:
-            writeSerial("=== FIRMWARE VERSION COMMAND (0x0043) ===");
-            handleFirmwareVersion();
-            break;
-        case CMD_READ_MSD:
-            writeSerial("=== READ MSD COMMAND (0x0044) ===");
+        case CMD_READ_MSD:            // 0x0044
             handleReadMSD();
             break;
-        case CMD_DIRECT_WRITE_START:
-            writeSerial("=== DIRECT WRITE START COMMAND (0x0070) ===");
+        case CMD_CONFIG_CLEAR:        // 0x0045
+            handleClearConfig();
+            break;
+        case CMD_ENTER_DFU:           // 0x0051
+            enterDFUMode();
+            break;
+        case CMD_POWER_OFF:           // 0x0052
+            handlePowerOffCommand(data + 2, len - 2);
+            break;
+        case CMD_DEEP_SLEEP:          // 0x0053
+            handleDeepSleepCommand(data + 2, len - 2);
+            break;
+        case CMD_DIRECT_WRITE_START:  // 0x0070
             handleDirectWriteStart(data + 2, len - 2);
             break;
-        case CMD_DIRECT_WRITE_DATA:
+        case CMD_DIRECT_WRITE_DATA:   // 0x0071
             handleDirectWriteData(data + 2, len - 2);
             break;
-        case CMD_DIRECT_WRITE_END:
-            writeSerial("=== DIRECT WRITE END COMMAND (0x0072) ===");
+        case CMD_DIRECT_WRITE_END:    // 0x0072
             handleDirectWriteEnd(data + 2, len - 2);
             break;
-        case CMD_PIPE_WRITE_START:
-            writeSerial("=== PIPE WRITE START COMMAND (0x0080) ===");
+        case CMD_LED_ACTIVATE:        // 0x0073
+            handleLedActivate(data + 2, len - 2);
+            break;
+        case CMD_LED_STOP:            // 0x0075
+            handleLedStop(data + 2, len - 2);
+            break;
+        case CMD_PARTIAL_WRITE_START: // 0x0076
+            handlePartialWriteStart(data + 2, len - 2);
+            break;
+        case CMD_BUZZER:              // 0x0077
+            handleBuzzerActivate(data + 2, len - 2);
+            break;
+        case CMD_PIPE_WRITE_START:    // 0x0080
             handlePipeWriteStart(data + 2, len - 2);
             break;
-        case CMD_PIPE_WRITE_DATA:
+        case CMD_PIPE_WRITE_DATA:     // 0x0081
             // The replay counter (verifyNonceReplay) already advanced at decrypt time,
             // above this switch, for every 0x0081 frame — including ones the handler
             // then queues or discards — so drops/dupes never desync it and the counter
             // delta stays within in-flight <= W <= 32 <= the +-32 replay window.
             handlePipeWriteData(data + 2, len - 2);
             break;
-        case CMD_PIPE_WRITE_END:
-            writeSerial("=== PIPE WRITE END COMMAND (0x0082) ===");
+        case CMD_PIPE_WRITE_END:      // 0x0082
             handlePipeWriteEnd(data + 2, len - 2);
-            break;
-        case CMD_PARTIAL_WRITE_START:
-            handlePartialWriteStart(data + 2, len - 2);
-            break;
-        case CMD_LED_ACTIVATE:
-            writeSerial("=== LED ACTIVATE COMMAND (0x0073) ===");
-            handleLedActivate(data + 2, len - 2);
-            break;
-        case CMD_LED_STOP:
-            writeSerial("=== LED STOP COMMAND (0x0075) ===");
-            handleLedStop(data + 2, len - 2);
-            break;
-        case CMD_BUZZER:
-            writeSerial("=== BUZZER ACTIVATE COMMAND (0x0077) ===");
-            handleBuzzerActivate(data + 2, len - 2);
-            break;
-        case CMD_ENTER_DFU:
-            writeSerial("=== ENTER DFU MODE COMMAND (0x0051) ===");
-            enterDFUMode();
-            break;
-        case CMD_POWER_OFF:
-            handlePowerOffCommand(data + 2, len - 2);
-            break;
-        case CMD_DEEP_SLEEP:
-            handleDeepSleepCommand(data + 2, len - 2);
             break;
         default:
             writeSerial("ERROR: Unknown command: 0x" + String(command, HEX));
-            writeSerial("Expected: 0x0011 (read config), 0x0064 (image info), 0x0065 (block data), or 0x0003 (finalize)");
             break;
     }
     if (!quietCmd) writeSerial("Command processing completed successfully");
