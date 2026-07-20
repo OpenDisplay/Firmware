@@ -79,6 +79,137 @@ static void pollConfiguredPowerOffButtons() {
         }
     }
 }
+
+// BinaryInputs.input_type wire values (see structs.h for the full contract).
+// 2 is reserved for switches (host-side feature); the ADC ladder uses 3.
+#define BINARY_INPUT_TYPE_ADC_LADDER 3
+
+// --- ADC resistor-ladder buttons (e.g. XTEINK X4) -------------------------
+// Several buttons share one ADC pin via a resistor ladder, distinguished by
+// voltage. They have no edge interrupt, so they are polled. Reported through
+// the same MSD button byte as digital buttons for a uniform host contract.
+#define MAX_ADC_LADDERS     4
+#define MAX_LADDER_BUTTONS  4    // reserved[] holds at most N+1 = 5 LE uint16 thresholds
+#define ADC_LADDER_POLL_MS  5
+#define ADC_LADDER_DEBOUNCE 3    // consecutive equal samples required to accept a change
+
+// Thresholds for N+1 buttons must fit in BinaryInputs.reserved[]; fail the build if not.
+static_assert(2 + 2 * (MAX_LADDER_BUTTONS + 1) <= sizeof(BinaryInputs::reserved),
+              "ADC ladder thresholds would overflow BinaryInputs.reserved[]");
+
+struct AdcLadder {
+    uint8_t  pin;
+    uint8_t  num_buttons;
+    uint8_t  id_base;
+    uint8_t  byte_index;
+    uint16_t thresholds[MAX_LADDER_BUTTONS + 1];  // descending; [0] = idle ceiling
+    int8_t   current_button;     // -1 = none pressed
+    int8_t   candidate_button;   // debounce: last raw classification
+    uint8_t  candidate_count;    // consecutive samples equal to candidate
+    uint8_t  press_count;        // 0-15, increments per press (5 s reset window)
+    uint8_t  last_button_id;     // id of most recent press (for clean release reporting)
+    uint32_t last_press_time;
+};
+static AdcLadder adcLadders[MAX_ADC_LADDERS];
+static uint8_t   adcLadderCount = 0;
+
+// Returns button index 0..num_buttons-1, or -1 when nothing is pressed.
+static int classifyAdcLadder(int adc, const AdcLadder* l) {
+    if (adc > (int)l->thresholds[0]) return -1;            // above idle ceiling
+    for (uint8_t i = 0; i < l->num_buttons; i++) {
+        if (adc > (int)l->thresholds[i + 1]) return (int)i; // thr[i+1] < adc <= thr[i]
+    }
+    return (int)l->num_buttons - 1;                        // catch-all bottom bucket
+}
+
+static void registerAdcLadder(const struct BinaryInputs* input) {
+    if (adcLadderCount >= MAX_ADC_LADDERS) return;
+    uint8_t n = input->reserved[0];                        // num_buttons
+    if (n == 0 || n > MAX_LADDER_BUTTONS) {
+        writeSerial("ADC ladder: count " + String(n) + " out of range 1.." +
+                    String(MAX_LADDER_BUTTONS) + " on pin " + String(input->input_pin_1) + ", skipping", true);
+        return;
+    }
+    if (input->button_data_byte_index > 10) {              // index into the 11-byte MSD block
+        writeSerial("ADC ladder: byte_index " + String(input->button_data_byte_index) +
+                    " out of range 0..10 on pin " + String(input->input_pin_1) + ", skipping", true);
+        return;
+    }
+    if ((int)input->reserved[1] + n > 8) {                 // 3-bit id field: id_base..id_base+n-1 must be <= 7
+        writeSerial("ADC ladder: id_base " + String(input->reserved[1]) + " + count " + String(n) +
+                    " exceeds 3-bit id space on pin " + String(input->input_pin_1) + ", skipping", true);
+        return;
+    }
+    AdcLadder* l = &adcLadders[adcLadderCount];
+    l->pin = input->input_pin_1;                            // ADC GPIO
+    l->num_buttons = n;
+    l->id_base = input->reserved[1];
+    l->byte_index = input->button_data_byte_index;
+    for (uint8_t k = 0; k <= n; k++) {
+        l->thresholds[k] = (uint16_t)input->reserved[2 + 2 * k] |
+                           ((uint16_t)input->reserved[3 + 2 * k] << 8);
+    }
+    for (uint8_t k = 0; k < n; k++) {                      // contract: thresholds strictly descending
+        if (l->thresholds[k] <= l->thresholds[k + 1]) {    // reject malformed config from any host
+            writeSerial("ADC ladder: thresholds not strictly descending on pin " +
+                        String(input->input_pin_1) + ", skipping", true);
+            return;
+        }
+    }
+    l->current_button = -1;
+    l->candidate_button = -1;
+    l->candidate_count = 0;
+    l->press_count = 0;
+    l->last_button_id = (uint8_t)(l->id_base & 0x07);
+    l->last_press_time = 0;
+    pinMode(l->pin, INPUT);
+    analogSetPinAttenuation(l->pin, ADC_11db);
+    adcLadderCount++;
+    writeSerial("ADC ladder: pin " + String(l->pin) + " n " + String(n) +
+                " idBase " + String(l->id_base) + " byteIdx " + String(l->byte_index), true);
+}
+
+static void pollAdcButtons() {
+    if (adcLadderCount == 0) return;
+    static uint32_t lastPoll = 0;
+    uint32_t now = millis();
+    if (now - lastPoll < ADC_LADDER_POLL_MS) return;
+    lastPoll = now;
+    for (uint8_t i = 0; i < adcLadderCount; i++) {
+        AdcLadder* l = &adcLadders[i];
+        int adc = analogRead(l->pin);
+        int btn = classifyAdcLadder(adc, l);
+        if (btn == l->candidate_button) {
+            if (l->candidate_count < 255) l->candidate_count++;
+        } else {
+            l->candidate_button = (int8_t)btn;
+            l->candidate_count = 1;
+        }
+        if (l->candidate_count < ADC_LADDER_DEBOUNCE) continue;  // not yet stable
+        if (btn == l->current_button) continue;                 // no change
+        uint8_t state;
+        if (btn >= 0) {
+            if (l->last_press_time == 0 || now - l->last_press_time > 5000) l->press_count = 0;
+            l->press_count = (uint8_t)((l->press_count + 1) & 0x0F);
+            l->last_press_time = now;
+            l->last_button_id = (uint8_t)((l->id_base + btn) & 0x07);
+            state = 1;
+        } else {
+            state = 0;  // released; last_button_id identifies which button
+        }
+        l->current_button = (int8_t)btn;
+        uint8_t data = (uint8_t)((l->last_button_id & 0x07) |
+                                 ((l->press_count & 0x0F) << 3) |
+                                 ((state & 0x01) << 7));
+        if (l->byte_index < 11) dynamicreturndata[l->byte_index] = data;
+        updatemsdata();
+        writeSerial("ADC btn pin " + String(l->pin) + " adc=" + String(adc) + " idx=" + String(btn) +
+                    " id=" + String(l->last_button_id) + " cnt=" + String(l->press_count) +
+                    " state=" + String(state), true);
+    }
+}
+#else
+static void pollAdcButtons() {}
 #endif
 
 void connect_callback(uint16_t conn_handle) {
@@ -431,6 +562,7 @@ void processButtonEvents() {
 #ifdef TARGET_ESP32
     pollConfiguredPowerOffButtons();
 #endif
+    pollAdcButtons();
     if (buttonEventPending) {
         noInterrupts();
         buttonEventPending = false;
@@ -571,10 +703,19 @@ void initButtons() {
         buttonStates[i].power_off = false;
         buttonStates[i].power_off_hold_ms = 0;
     }
+#ifdef TARGET_ESP32
+    adcLadderCount = 0;
+#endif
     if (globalConfig.binary_input_count == 0) return;
     for (uint8_t instanceIdx = 0; instanceIdx < globalConfig.binary_input_count; instanceIdx++) {
         struct BinaryInputs* input = &globalConfig.binary_inputs[instanceIdx];
-        if (input->input_type != 1) continue;
+#ifdef TARGET_ESP32
+        if (input->input_type == BINARY_INPUT_TYPE_ADC_LADDER) {
+            registerAdcLadder(input);
+            continue;
+        }
+#endif
+        if (input->input_type != OD_INPUT_TYPE_BUTTON) continue;
         if (input->button_data_byte_index > 10) continue;
         uint16_t instanceHoldMs = (input->power_off_hold_sec == 0) ? 3000u : (uint16_t)input->power_off_hold_sec * 1000u;
         uint8_t* instancePins[8] = {
