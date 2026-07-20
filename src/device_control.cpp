@@ -21,6 +21,8 @@ extern "C" void bootloader_util_app_start(uint32_t start_addr);
 #include <esp_system.h>
 #include "driver/gpio.h"
 #include "esp32-hal-gpio.h"
+#include "ble_init.h"          // BLEDevice/BLEServer/BLEAdvertising aliases + esp32_ble_clear_handles()
+extern BLEServer* pServer;     // defined in main.cpp
 #endif
 
 extern uint8_t rebootFlag;
@@ -108,6 +110,25 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
     resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect
 }
 
+#ifdef TARGET_ESP32
+// Tear NimBLE down before esp_restart(): esp_restart() resets the CPU but NOT the
+// BT controller hardware, so on the next (software-reset) boot BLEDevice::init()
+// tries to enable an already-enabled controller and aborts -> PANIC boot loop that
+// only a physical power cycle clears. Mirrors the deep-sleep teardown in
+// enterDeepSleep() (main.cpp), which is why sleep->wake re-inits cleanly.
+static void esp32_ble_deinit_before_restart() {
+    if (pServer != nullptr) {
+        BLEAdvertising* pAdvertising = pServer->getAdvertising();
+        if (pAdvertising != nullptr) pAdvertising->stop();
+    }
+    delay(200);
+    BLEDevice::deinit(true);      // clearAll: disables + releases the BT controller
+    esp32_ble_clear_handles();
+    delay(100);
+    writeSerial("BLE deinitialized before restart", true);
+}
+#endif
+
 void reboot(){
     writeSerial("=== REBOOT COMMAND (0x000F) ===", true);
     delay(100);
@@ -115,6 +136,7 @@ void reboot(){
     NVIC_SystemReset();
 #endif
 #ifdef TARGET_ESP32
+    esp32_ble_deinit_before_restart();
     esp_restart();
 #endif
 }
@@ -702,6 +724,7 @@ void enterDFUMode() {
 #ifdef TARGET_ESP32
     writeSerial("ESP32: Rebooting (OTA typically handled via WiFi)", true);
     delay(100);
+    esp32_ble_deinit_before_restart();
     esp_restart();
 #endif
 }
