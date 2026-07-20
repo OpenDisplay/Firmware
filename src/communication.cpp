@@ -256,7 +256,6 @@ void sendResponse(uint8_t* response, uint16_t len) {
 }
 
 void handleReadMSD() {
-    writeSerial("=== READ MSD COMMAND (0x0044) ===", true);
     uint8_t response[2 + 16];
     uint16_t responseLen = 0;
     response[responseLen++] = RESP_ACK;
