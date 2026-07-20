@@ -128,17 +128,17 @@ static void registerAdcLadder(const struct BinaryInputs* input) {
     uint8_t n = input->reserved[0];                        // num_buttons
     if (n == 0 || n > MAX_LADDER_BUTTONS) {
         writeSerial("ADC ladder: count " + String(n) + " out of range 1.." +
-                    String(MAX_LADDER_BUTTONS) + " on pin " + String(input->reserved_pin_1) + ", skipping", true);
+                    String(MAX_LADDER_BUTTONS) + " on pin " + String(input->input_pin_1) + ", skipping", true);
         return;
     }
     if (input->button_data_byte_index > 10) {              // index into the 11-byte MSD block
         writeSerial("ADC ladder: byte_index " + String(input->button_data_byte_index) +
-                    " out of range 0..10 on pin " + String(input->reserved_pin_1) + ", skipping", true);
+                    " out of range 0..10 on pin " + String(input->input_pin_1) + ", skipping", true);
         return;
     }
     if ((int)input->reserved[1] + n > 8) {                 // 3-bit id field: id_base..id_base+n-1 must be <= 7
         writeSerial("ADC ladder: id_base " + String(input->reserved[1]) + " + count " + String(n) +
-                    " exceeds 3-bit id space on pin " + String(input->reserved_pin_1) + ", skipping", true);
+                    " exceeds 3-bit id space on pin " + String(input->input_pin_1) + ", skipping", true);
         return;
     }
     AdcLadder* l = &adcLadders[adcLadderCount];
