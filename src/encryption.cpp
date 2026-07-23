@@ -41,6 +41,10 @@ bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
 bool constantTimeCompare(const uint8_t* a, const uint8_t* b, size_t len);
 void secure_random(uint8_t* output, size_t len);
 void writeSerial(String message, bool newLine = true);
+#ifdef TARGET_ESP32
+static void ccm_session_init(EncryptionSession& session);
+static void ccm_session_free(EncryptionSession& session);
+#endif
 
 void getAuthDeviceIdBytes(uint8_t* device_id) {
     if (device_id == nullptr) return;
