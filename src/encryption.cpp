@@ -186,6 +186,9 @@ bool isAuthenticated() {
 }
 
 void clearEncryptionSession() {
+#ifdef TARGET_ESP32
+    ccm_session_free(encryptionSession);
+#endif
     memset(encryptionSession.session_key, 0, 16);
     memset(encryptionSession.client_nonce, 0, 16);
     memset(encryptionSession.server_nonce, 0, 16);
@@ -231,6 +234,28 @@ bool constantTimeCompare(const uint8_t* a, const uint8_t* b, size_t len) {
 }
 
 #ifdef TARGET_ESP32
+
+static void ccm_session_init(EncryptionSession& session) {
+    if (session.is_ccm_ready) {
+        mbedtls_ccm_free(&session.ccm_ctx);
+    }
+    mbedtls_ccm_init(&session.ccm_ctx);
+    if (mbedtls_ccm_setkey(&session.ccm_ctx, MBEDTLS_CIPHER_ID_AES, session.session_key, 128) == 0) {
+        session.is_ccm_ready = true;
+    } else {
+        mbedtls_ccm_free(&session.ccm_ctx);
+        session.is_ccm_ready = false;
+        writeSerial("ERROR: Failed to initialize CCM session context");
+    }
+}
+
+static void ccm_session_free(EncryptionSession& session) {
+    if (session.is_ccm_ready) {
+        mbedtls_ccm_free(&session.ccm_ctx);
+        session.is_ccm_ready = false;
+    }
+}
+
 bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, uint8_t* mac) {
     mbedtls_cipher_context_t ctx;
     const mbedtls_cipher_info_t* cipher_info = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_128_ECB);
@@ -284,16 +309,24 @@ bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
                      const uint8_t* ad, size_t ad_len,
                      const uint8_t* plaintext, size_t plaintext_len,
                      uint8_t* ciphertext, uint8_t* tag, size_t tag_len) {
-    mbedtls_ccm_context ccm;
-    mbedtls_ccm_init(&ccm);
-    if (mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
-        writeSerial("ERROR: Failed to set CCM key");
-        mbedtls_ccm_free(&ccm);
-        return false;
+    mbedtls_ccm_context *ctx = NULL;
+    mbedtls_ccm_context local_ctx = {0};
+    if (encryptionSession.is_ccm_ready) {
+        ctx = &encryptionSession.ccm_ctx;
+    } else {
+        mbedtls_ccm_init(&local_ctx);
+        if (mbedtls_ccm_setkey(&local_ctx, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+            writeSerial("ERROR: Failed to set CCM key");
+            mbedtls_ccm_free(&local_ctx);
+            return false;
+        }
+        ctx = &local_ctx;
     }
-    int ret = mbedtls_ccm_encrypt_and_tag(&ccm, plaintext_len, nonce, nonce_len,
+    int ret = mbedtls_ccm_encrypt_and_tag(ctx, plaintext_len, nonce, nonce_len,
                                           ad, ad_len, plaintext, ciphertext, tag, tag_len);
-    mbedtls_ccm_free(&ccm);
+    if (ctx == &local_ctx) {
+        mbedtls_ccm_free(&local_ctx);
+    }
     if (ret != 0) {
         writeSerial("ERROR: CCM encrypt failed: " + String((int)ret));
         return false;
@@ -305,31 +338,36 @@ bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
                      const uint8_t* ad, size_t ad_len,
                      const uint8_t* ciphertext, size_t ciphertext_len,
                      uint8_t* plaintext, const uint8_t* tag, size_t tag_len) {
-    mbedtls_ccm_context ccm;
-    mbedtls_ccm_init(&ccm);
-    if (mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
-        writeSerial("ERROR: Failed to set CCM key");
-        mbedtls_ccm_free(&ccm);
-        return false;
-    }
     if (nonce_len < 7 || nonce_len > 13) {
         writeSerial("ERROR: Invalid CCM nonce length (must be 7-13 bytes)");
-        mbedtls_ccm_free(&ccm);
         return false;
     }
     if (tag_len != 4 && tag_len != 6 && tag_len != 8 && tag_len != 10 && tag_len != 12 && tag_len != 14 && tag_len != 16) {
         writeSerial("ERROR: Invalid CCM tag length (must be 4, 6, 8, 10, 12, 14, or 16 bytes)");
-        mbedtls_ccm_free(&ccm);
         return false;
     }
     if (ciphertext_len == 0) {
         writeSerial("ERROR: CCM ciphertext length is 0 (must be at least 1 byte)");
-        mbedtls_ccm_free(&ccm);
         return false;
     }
-    int ret = mbedtls_ccm_auth_decrypt(&ccm, ciphertext_len, nonce, nonce_len,
+    mbedtls_ccm_context *ctx = NULL;
+    mbedtls_ccm_context local_ctx = {0};
+    if (encryptionSession.is_ccm_ready) {
+        ctx = &encryptionSession.ccm_ctx;
+    } else {
+        mbedtls_ccm_init(&local_ctx);
+        if (mbedtls_ccm_setkey(&local_ctx, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+            writeSerial("ERROR: Failed to set CCM key");
+            mbedtls_ccm_free(&local_ctx);
+            return false;
+        }
+        ctx = &local_ctx;
+    }
+    int ret = mbedtls_ccm_auth_decrypt(ctx, ciphertext_len, nonce, nonce_len,
                                        ad, ad_len, ciphertext, plaintext, tag, tag_len);
-    mbedtls_ccm_free(&ccm);
+    if (ctx == &local_ctx) {
+        mbedtls_ccm_free(&local_ctx);
+    }
     if (ret != 0) {
         char err_buf[128];
         snprintf(err_buf, sizeof(err_buf), "ERROR: CCM decrypt failed: %d (ciphertext_len=%zu, nonce_len=%zu, tag_len=%zu)",
@@ -588,6 +626,9 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
             sendResponse(response, sizeof(response));
             return false;
         }
+#ifdef TARGET_ESP32
+        ccm_session_init(encryptionSession);
+#endif
         deriveSessionId(encryptionSession.session_key, client_nonce,
                         encryptionSession.server_nonce, encryptionSession.session_id);
         bool session_id_valid = false;
