@@ -60,47 +60,50 @@ void setup() {
     #elif !defined(DISABLE_USB_SERIAL)
     od_log_init(&Serial);
     #endif
-    writeSerial("=== FIRMWARE INFO ===");
-    writeSerial("Firmware Version: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()));
+    od_log_info("=== FIRMWARE INFO ===");
+    uint8_t fwMajor = getFirmwareMajor();
+    uint8_t fwMinor = getFirmwareMinor();
+    od_log_info("Firmware Version: %u.%u", fwMajor, fwMinor);
     const char* shaCStr = SHA_STRING;
     String shaStr = String(shaCStr);
     if (shaStr.length() >= 2 && shaStr.charAt(0) == '"' && shaStr.charAt(shaStr.length() - 1) == '"') {
         shaStr = shaStr.substring(1, shaStr.length() - 1);
     }
     if (shaStr.length() > 0 && shaStr != "\"\"" && shaStr != "") {
-        writeSerial("Git SHA: " + shaStr);
+        od_log_info("Git SHA: %s", shaStr.c_str());
     } else {
-        writeSerial("Git SHA: (not set)");
+        od_log_info("Git SHA: (not set)");
     }
     // Set only by the ESP32 wake-cause check below; NRF has no deep-sleep wake path.
     bool is_deep_sleep_wake = false;
     bool woke_by_button = false;
     #ifdef TARGET_ESP32
     esp_reset_reason_t reset_reason = esp_reset_reason();
-    writeSerial("Reset reason: " + String(resetReasonName(reset_reason)) + " (" + String((int)reset_reason) + ")");
+    const char* resetReasonStr = resetReasonName(reset_reason);
+    od_log_info("Reset reason: %s (%d)", resetReasonStr, (int)reset_reason);
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
     if (is_deep_sleep_wake) {
         woke_from_deep_sleep = true;
         deep_sleep_count++;
-        writeSerial("=== WOKE FROM DEEP SLEEP ===");
+        od_log_info("=== WOKE FROM DEEP SLEEP ===");
         woke_by_button = detectButtonWake(wakeup_reason);  // logs the named cause + pin(s)
-        writeSerial("Deep sleep count: " + String(deep_sleep_count));
+        od_log_info("Deep sleep count: %u", deep_sleep_count);
     } else {
         woke_from_deep_sleep = false;
-        writeSerial("=== NORMAL BOOT ===");
+        od_log_info("=== NORMAL BOOT ===");
         // The bootloader reloads RTC memory segments from the app image on every
         // reset except a deep-sleep wake, so RTC_DATA_ATTR does NOT survive
         // panic/WDT/SW/brownout resets: a hidden mid-cycle reset lands here with
         // count 0, indistinguishable from a true first boot (captured on hardware
         // in docs/FINDINGS_DEEP_SLEEP_WAKE_BOOT_SCREEN_2026-07-07.md).
-        writeSerial("Deep sleep count (RTC): " + String(deep_sleep_count));
+        od_log_info("Deep sleep count (RTC): %u", deep_sleep_count);
     }
     #endif
-    writeSerial("Starting setup...");
-    if (is_deep_sleep_wake) { writeSerial("[wake] >> full_config_init"); flushLog(); }
+    od_log_info("Starting setup...");
+    if (is_deep_sleep_wake) { od_log_info("[wake] >> full_config_init"); od_log_flush(); }
     full_config_init();
-    if (is_deep_sleep_wake) { writeSerial("[wake] << full_config_init >> initio"); flushLog(); }
+    if (is_deep_sleep_wake) { od_log_info("[wake] << full_config_init >> initio"); od_log_flush(); }
     initio();
 #ifdef TARGET_NRF
     // SoftDevice must start before display/SPI; advertising starts after boot screen.
@@ -115,13 +118,13 @@ void setup() {
         // Wake keeps the panel image; skipping initDisplay() (EPD rail power +
         // full refresh) is the wake path's main energy saving.
         initDisplay();
-        writeSerial("Display initialized");
+        od_log_info("Display initialized");
     }
 #ifdef TARGET_ESP32
     // Full BLE after display: ESP32 queues commands for loop() until setup returns.
-    if (is_deep_sleep_wake) { writeSerial("[wake] >> ble_init"); flushLog(); }
+    if (is_deep_sleep_wake) { od_log_info("[wake] >> ble_init"); od_log_flush(); }
     ble_init();
-    if (is_deep_sleep_wake) { writeSerial("[wake] << ble_init"); flushLog(); }
+    if (is_deep_sleep_wake) { od_log_info("[wake] << ble_init"); od_log_flush(); }
 #elif defined(TARGET_NRF)
     ble_nrf_advertising_start();
 #endif
@@ -131,16 +134,16 @@ void setup() {
     }
     #endif
     updatemsdata();
-    if (is_deep_sleep_wake) { writeSerial("[wake] >> initButtons"); flushLog(); }
+    if (is_deep_sleep_wake) { od_log_info("[wake] >> initButtons"); od_log_flush(); }
     initButtons();
-    if (is_deep_sleep_wake) { writeSerial("[wake] >> initTouchInput"); flushLog(); }
+    if (is_deep_sleep_wake) { od_log_info("[wake] >> initTouchInput"); od_log_flush(); }
     initTouchInput();
     #ifdef TARGET_ESP32
     if (is_deep_sleep_wake) {
         // Arm the awake window LAST so buttons/GT911 bring-up doesn't shrink the
         // host's connection window. Without this, loop() falls into the idle
         // branch and re-enters deep sleep almost immediately.
-        writeSerial("Advertising for " + String(globalConfig.power_option.sleep_timeout_ms) + " ms (sleep_timeout_ms), waiting for connection...");
+        od_log_info("Advertising for %u ms (sleep_timeout_ms), waiting for connection...", globalConfig.power_option.sleep_timeout_ms);
         advertising_timeout_active = true;
         advertising_start_time = millis();
         if (woke_by_button) {
@@ -148,7 +151,8 @@ void setup() {
             // the minimum window so they (or a host) get time to interact.
             minWakeWindowActive = true;
             minWakeWindowStartMs = millis();
-            writeSerial("Button wake: holding awake >= " + String(minWakeTimeMs()) + " ms");
+            uint32_t minWakeMs = minWakeTimeMs();
+            od_log_info("Button wake: holding awake >= %u ms", (unsigned)minWakeMs);
         }
     } else if (deep_sleep_count == 0) {
         // First boot — or a hidden mid-cycle reset, which reloads the RTC count
@@ -160,7 +164,10 @@ void setup() {
     // Both sleep paths measure quiet time from here, not from power-on.
     lastActivityMs = millis();
     #endif
-    writeSerial("=== Setup completed successfully ===");
+    od_log_info("=== Setup completed successfully ===");
+#ifdef TARGET_ESP32
+    od_log_info("Heap: free=%u min=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+#endif
 }
 
 uint32_t getDeepSleepCount() {
@@ -186,7 +193,7 @@ static bool minWakeHoldActive() {
     if (!minWakeWindowActive) return false;
     if (millis() - minWakeWindowStartMs >= minWakeTimeMs()) {
         minWakeWindowActive = false;
-        writeSerial("Minimum wake window elapsed, deep sleep permitted");
+        od_log_info("Minimum wake window elapsed, deep sleep permitted");
         return false;
     }
     return true;
@@ -273,7 +280,7 @@ void flushResponseQueueToBle() {
             // (replaces the old "Sending queued response" + "Response sent successfully").
             if (!quietAck) {
                 uint8_t depth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
-                writeSerial("BLE Response Sent (queue size: " + String(depth) + ")");
+                od_log_debug("BLE Response Sent (queue size: %u)", depth);
             }
             bleDrain++;
         }
@@ -319,7 +326,7 @@ void loop() {
     // THIS IS THE MAIN (FIRST) LOOP FOR A DEEP SLEEP ENABLED ESP32
     if (woke_from_deep_sleep && advertising_timeout_active) {
         if (pServer && pServer->getConnectedCount() > 0) {
-            writeSerial("BLE connection established - switching to full mode");
+            od_log_info("BLE connection established - switching to full mode");
             advertising_timeout_active = false;
             fullSetupAfterConnection();
             woke_from_deep_sleep = false;
@@ -341,8 +348,9 @@ void loop() {
         // On a button wake the min-wake hold keeps this window open past the
         // quiet timeout; idleDelay(50) below services buttons/touch throughout.
         if (idle_duration >= advertising_timeout_ms && !minWakeHoldActive()) {
-            writeSerial("BLE advertising timeout (idle " + String(idle_duration) + " ms of " +
-                        String(millis() - advertising_start_time) + " ms window) - no connection, returning to deep sleep");
+            uint32_t advertisingElapsedMs = millis() - advertising_start_time;
+            od_log_info("BLE advertising timeout (idle %u ms of %u ms window) - no connection, returning to deep sleep",
+                        (unsigned)idle_duration, (unsigned)advertisingElapsedMs);
             advertising_timeout_active = false;
             enterDeepSleep();
             return;
@@ -395,7 +403,7 @@ void loop() {
     if (directWriteActive && directWriteStartTime > 0) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
         if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
-            writeSerial("ERROR: Direct write timeout (" + String(directWriteDuration) + " ms) - cleaning up stuck state");
+            od_log_error("ERROR: Direct write timeout (%u ms) - cleaning up stuck state", (unsigned)directWriteDuration);
             cleanupDirectWriteState(true);
         }
     }
@@ -406,14 +414,16 @@ void loop() {
     static uint32_t lastWiFiCheck = 0;
     if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
         lastWiFiCheck = millis();
-        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
+        wl_status_t wifiStatus = WiFi.status();
+        if (wifiStatus != WL_CONNECTED && wifiConnected) {
+            od_log_warn("WiFi connection lost (status: %d)", wifiStatus);
             wifiConnected = false;
             if (wifiServerConnected) {
                 disconnectWiFiServer();
             }
-        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
+        } else if (wifiStatus == WL_CONNECTED && !wifiConnected) {
+            String wifiIp = WiFi.localIP().toString();
+            od_log_info("WiFi reconnected (IP: %s)", wifiIp.c_str());
             wifiConnected = true;
             restartWiFiLanAfterReconnect();
         }
@@ -449,7 +459,7 @@ void loop() {
             if (idleMs < idleHoldMs || minWakeHoldActive()) {
                 idleDelay(5);
             } else {
-                writeSerial("Idle " + String(idleMs) + " ms (hold " + String(idleHoldMs) + " ms) - entering deep sleep");
+                od_log_info("Idle %u ms (hold %u ms) - entering deep sleep", (unsigned)idleMs, (unsigned)idleHoldMs);
                 enterDeepSleep();
             }
         }
@@ -508,38 +518,38 @@ void idleDelay(uint32_t delayMs) {
 
 #ifdef TARGET_ESP32
 void fullSetupAfterConnection() {
-    writeSerial("=== Full Setup After Connection ===");
+    od_log_info("=== Full Setup After Connection ===");
     initWiFi(false);
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (globalConfig.display_count > 0 && fastepd_driver_used()) {
-        writeSerial("Panel: FastEPD ED103/IT8951 (bb_epaper not used)", true);
-        writeSerial("=== Full setup completed ===");
+        od_log_info("Panel: FastEPD ED103/IT8951 (bb_epaper not used)");
+        od_log_info("=== Full setup completed ===");
         return;
     }
 #endif
     if (globalConfig.display_count > 0) {
         memset(&bbep, 0, sizeof(BBEPDISP));
         int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
-        writeSerial("Panel type: " + String(panelType));
+        od_log_info("Panel type: %d", panelType);
         bbepSetPanelType(&bbep, panelType);
         bbepSetRotation(&bbep, globalConfig.displays[0].rotation * 90);
     }
-    writeSerial("=== Full setup completed ===");
+    od_log_info("=== Full setup completed ===");
 }
 
 void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     if (globalConfig.power_option.power_mode != 1) {
-        writeSerial("Skipping deep sleep - not battery powered (power_mode: " + String(globalConfig.power_option.power_mode) + ")");
+        od_log_debug("Skipping deep sleep - not battery powered (power_mode: %u)", globalConfig.power_option.power_mode);
         return;
     }
     if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
-        writeSerial("Skipping deep sleep - deep_sleep_time_seconds is 0");
+        od_log_debug("Skipping deep sleep - deep_sleep_time_seconds is 0");
         return;
     }
     // Callers sample their idle state before getting here; a central can connect in
     // that gap. Re-check so we never tear down the stack on a live link.
     if (!force && pServer != nullptr && pServer->getConnectedCount() > 0) {
-        writeSerial("Skipping deep sleep - BLE client connected");
+        od_log_debug("Skipping deep sleep - BLE client connected");
         lastActivityMs = millis();
         return;
     }
@@ -548,7 +558,7 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     // commits to esp_deep_sleep_start(), so a late abort would leave the device
     // awake with the radio dark. force (host 0x0053) bypasses the hold.
     if (!force && minWakeHoldActive()) {
-        writeSerial("Skipping deep sleep - minimum wake window active");
+        od_log_debug("Skipping deep sleep - minimum wake window active");
         return;
     }
     // Panel power-down MUST sit below every early-return above (including the
@@ -565,14 +575,14 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
         BLEAdvertising *pAdvertising = pServer->getAdvertising();
         if (pAdvertising != nullptr) {
             pAdvertising->stop();
-            writeSerial("BLE advertising stopped");
+            od_log_info("BLE advertising stopped");
         }
     }
     delay(200);
     BLEDevice::deinit(true);
     esp32_ble_clear_handles();
     delay(100);
-    writeSerial("BLE deinitialized");
+    od_log_info("BLE deinitialized");
     // Host override (0x0053 payload) applies to this one cycle only: it is a
     // parameter, never stored, so an aborted or later sleep reverts to config.
     uint16_t sleepSeconds = overrideSleepSeconds ? overrideSleepSeconds
@@ -583,9 +593,10 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     // manipulation then cannot disturb freshly configured RTC pulls, and its
     // gpio_hold_en() touches only the latch pin, never the wake pads.
     armButtonWakeSources();
-    writeSerial("Entering deep sleep for " + String(sleepSeconds) + " seconds" +
-                (overrideSleepSeconds ? " (host override, one cycle)" : " (config)"));
-    flushLog(); // Arduino drain UART/Serial prior to deep sleep
+    od_log_info("Entering deep sleep for %u seconds%s", sleepSeconds,
+                overrideSleepSeconds ? " (host override, one cycle)" : " (config)");
+    od_log_info("Heap: free=%u min=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+    od_log_flush(); // drain UART/Serial prior to deep sleep
     delay(100); // Brief delay to ensure serial output is sent
     powerLatchHoldForSleep();
     esp_deep_sleep_start();
@@ -623,7 +634,7 @@ static void configureDisplayPinsLowPower() {
 
 void pwrmgm(bool onoff){
     if(globalConfig.display_count == 0){
-        writeSerial("No display configured");
+        od_log_warn("No display configured");
         return;
     }
     // Idempotency guard keyed on the panel power state machine (the single source
@@ -647,11 +658,11 @@ void pwrmgm(bool onoff){
     }
     if(axp2101_found){
         if(onoff){
-        writeSerial("Powering up AXP2101 PMIC...");
+        od_log_info("Powering up AXP2101 PMIC...");
             initAXP2101(axp2101_bus_id);
         }
         else{
-            writeSerial("Powering down AXP2101 PMIC...");
+            od_log_info("Powering down AXP2101 PMIC...");
             powerDownAXP2101();
             Wire.end();
             invalidateOpenDisplayWire();
@@ -672,7 +683,7 @@ void pwrmgm(bool onoff){
             digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
             delay(800);
         } else {
-            writeSerial("Power pin not set");
+            od_log_warn("Power pin not set");
         }
         if (!fastepd_driver_spi) {
             if (disp.reset_pin != 0xFF) {
@@ -758,7 +769,7 @@ void xiaoinit(){
 }
 
 void ws_pp_init(){
-    writeSerial("===  Photo Printer Initialization ===");
+    od_log_info("===  Photo Printer Initialization ===");
     pinMode(21, OUTPUT);
     digitalWrite(21, HIGH);
     pinMode(1, INPUT);
@@ -787,7 +798,7 @@ void ws_pp_init(){
     digitalWrite(42, HIGH);
     pinMode(45, OUTPUT);
     digitalWrite(45, HIGH);
-    writeSerial("Photo Printer initialized");
+    od_log_info("Photo Printer initialized");
 }
 
 #ifdef TARGET_NRF
@@ -809,10 +820,10 @@ void powerDownExternalFlashFromConfig(void) {
     const uint8_t sckPin = flashCfg->sck_pin;
     const uint8_t csPin = flashCfg->cs_pin;
     if (mosiPin == 0xFF || sckPin == 0xFF || csPin == 0xFF) {
-        writeSerial("Flash config: invalid MOSI/SCK/CS pins", true);
+        od_log_warn("Flash config: invalid MOSI/SCK/CS pins");
         return;
     }
-    writeSerial("Flash config: deep sleep MOSI=" + String(mosiPin) + " SCK=" + String(sckPin) + " CS=" + String(csPin), true);
+    od_log_debug("Flash config: deep sleep MOSI=%u SCK=%u CS=%u", mosiPin, sckPin, csPin);
 
     pinMode(mosiPin, OUTPUT);
     pinMode(sckPin, OUTPUT);
@@ -858,29 +869,30 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
         }
         return result;
     };
-    writeSerial("=== External Flash Power-Down ===");
-    writeSerial("Pin configuration: MOSI=" + String(mosiPin) + " MISO=" + String(misoPin) + " SCK=" + String(sckPin) + " CS=" + String(csPin) + " WP=" + String(wpPin) + " HOLD=" + String(holdPin));
-    writeSerial("Configuring SPI pins...");
+    od_log_info("=== External Flash Power-Down ===");
+    od_log_debug("Pin configuration: MOSI=%u MISO=%u SCK=%u CS=%u WP=%u HOLD=%u",
+                 mosiPin, misoPin, sckPin, csPin, wpPin, holdPin);
+    od_log_debug("Configuring SPI pins...");
     pinMode(mosiPin, OUTPUT);
     pinMode(misoPin, INPUT);
     pinMode(sckPin, OUTPUT);
     pinMode(csPin, OUTPUT);
     pinMode(wpPin, OUTPUT);
     pinMode(holdPin, OUTPUT);
-    writeSerial("SPI pins configured");
+    od_log_debug("SPI pins configured");
     digitalWrite(sckPin, HIGH);  // Clock idle high (SPI mode 0)
     digitalWrite(csPin, HIGH);   // CS inactive
     digitalWrite(wpPin, HIGH);   // WP disabled (active-low)
     digitalWrite(holdPin, HIGH); // HOLD disabled (active-low)
-    writeSerial("Control pins set: CS=HIGH, WP=HIGH (disabled), HOLD=HIGH (disabled), SCK=HIGH (idle)");
+    od_log_debug("Control pins set: CS=HIGH, WP=HIGH (disabled), HOLD=HIGH (disabled), SCK=HIGH (idle)");
     delay(1);
-    writeSerial("Attempting to wake flash from deep power-down (command 0xAB)...");
+    od_log_debug("Attempting to wake flash from deep power-down (command 0xAB)...");
     digitalWrite(csPin, LOW);
     spiTransfer(0xAB);
     digitalWrite(csPin, HIGH);
     delay(10); // Wait for flash to wake up (typically 3-35us, using 10ms for safety)
-    writeSerial("Wake-up command sent, waiting 10ms...");
-    writeSerial("Reading JEDEC ID before power-down...");
+    od_log_debug("Wake-up command sent, waiting 10ms...");
+    od_log_debug("Reading JEDEC ID before power-down...");
     digitalWrite(csPin, LOW);
     spiTransfer(0x9F); // JEDEC ID command
     uint8_t jedecId[3];
@@ -888,22 +900,17 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
         jedecId[i] = spiTransfer(0x00);
     }
     digitalWrite(csPin, HIGH);
-    String jedecIdStr = "0x";
-    for (int i = 0; i < 3; i++) {
-        if (jedecId[i] < 16) jedecIdStr += "0";
-        jedecIdStr += String(jedecId[i], HEX);
-    }
-    jedecIdStr.toUpperCase();
-    writeSerial("JEDEC ID before: " + jedecIdStr + " (Manufacturer=0x" + String(jedecId[0], HEX) + ", MemoryType=0x" + String(jedecId[1], HEX) + ", Capacity=0x" + String(jedecId[2], HEX) + ")");
+    od_log_debug("JEDEC ID before: 0x%02X%02X%02X (Manufacturer=0x%02X, MemoryType=0x%02X, Capacity=0x%02X)",
+                 jedecId[0], jedecId[1], jedecId[2], jedecId[0], jedecId[1], jedecId[2]);
     delay(1);
-    writeSerial("Sending deep power-down command (0xB9)...");
+    od_log_debug("Sending deep power-down command (0xB9)...");
     digitalWrite(csPin, LOW);
     spiTransfer(0xB9);
     digitalWrite(csPin, HIGH);
     if(false){
-    writeSerial("Deep power-down command sent, waiting 10ms...");
+    od_log_debug("Deep power-down command sent, waiting 10ms...");
     delay(10); // Wait for command to complete
-    writeSerial("Reading JEDEC ID after power-down command...");
+    od_log_debug("Reading JEDEC ID after power-down command...");
     digitalWrite(csPin, LOW);
     spiTransfer(0x9F);
     uint8_t jedecIdAfter[3];
@@ -911,13 +918,8 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
         jedecIdAfter[i] = spiTransfer(0x00);
     }
     digitalWrite(csPin, HIGH);
-    String jedecIdAfterStr = "0x";
-    for (int i = 0; i < 3; i++) {
-        if (jedecIdAfter[i] < 16) jedecIdAfterStr += "0";
-        jedecIdAfterStr += String(jedecIdAfter[i], HEX);
-    }
-    jedecIdAfterStr.toUpperCase();
-    writeSerial("JEDEC ID after: " + jedecIdAfterStr + " (byte[0]=0x" + String(jedecIdAfter[0], HEX) + ", byte[1]=0x" + String(jedecIdAfter[1], HEX) + ", byte[2]=0x" + String(jedecIdAfter[2], HEX) + ")");
+    od_log_debug("JEDEC ID after: 0x%02X%02X%02X (byte[0]=0x%02X, byte[1]=0x%02X, byte[2]=0x%02X)",
+                 jedecIdAfter[0], jedecIdAfter[1], jedecIdAfter[2], jedecIdAfter[0], jedecIdAfter[1], jedecIdAfter[2]);
     }
     // CS/WP/HOLD are active-low: keep HIGH so the chip stays deselected and in deep sleep.
     // CLK/MOSI/MISO LOW — defined idle levels, no floating buffers on the MCU side.
@@ -932,7 +934,7 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
         digitalWrite(pin, HIGH);
     }
     #else
-    writeSerial("External flash power-down not implemented for ESP32");
+    od_log_warn("External flash power-down not implemented for ESP32");
     return false;
     #endif
     return false;
