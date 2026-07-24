@@ -1,13 +1,13 @@
 #include "sensor_bq27220.h"
 #include "structs.h"
 #include "display_service.h"
+#include "od_log.h"
 
 #include <Arduino.h>
 #include <Wire.h>
 
 extern struct GlobalConfig globalConfig;
 extern uint8_t dynamicreturndata[11];
-void writeSerial(String message, bool newLine = true);
 
 static_assert(sizeof(SensorData) == 30, "SensorData must remain 30 bytes");
 
@@ -127,15 +127,16 @@ void initBq27220Sensors(void) {
         return;
     }
     if (!bq27220_ensure_bus(s)) {
-        writeSerial("BQ27220: bus init failed", true);
+        od_log_warn("BQ27220: bus init failed");
         return;
     }
+    const uint8_t addr = bq27220_addr_7bit(s);
     uint8_t raw[2];
     if (!bq27220_read_block(s, BQ27220_CMD_VOLTAGE, raw, 2)) {
-        writeSerial("BQ27220: not found @0x" + String(bq27220_addr_7bit(s), HEX), true);
+        od_log_warn("BQ27220: not found @0x%02X", addr);
         return;
     }
-    writeSerial("BQ27220: fuel gauge @0x" + String(bq27220_addr_7bit(s), HEX), true);
+    od_log_info("BQ27220: fuel gauge @0x%02X", addr);
 }
 
 static constexpr uint32_t kBq27220MsdPollTtlMs = 30000u;
