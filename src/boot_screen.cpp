@@ -7,6 +7,7 @@
 #include <bb_epaper.h>
 #include "qr/qrcode.h"
 #include "display_service.h"
+#include "od_log.h"
 #if __has_include("logo_bitmap.h")
 #include "logo_bitmap.h"
 #define BOOT_HAS_LOGO
@@ -25,7 +26,6 @@ uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
 int getBitsPerPixel();
 int getplane();
-void writeSerial(String message, bool newLine);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
@@ -924,11 +924,11 @@ bool writeBootScreenWithQr() {
         if (e1004Stream) {
             if (halfPass == 0) {
                 if (!e1004_begin_plane()) {
-                    writeSerial("Boot screen: E1004 dual-CS plane open failed", true);
+                    od_log_error("Boot screen: E1004 dual-CS plane open failed");
                     return false;
                 }
             } else if (!e1004_advance_to_cs2()) {
-                writeSerial("Boot screen: E1004 CS2 advance failed", true);
+                od_log_error("Boot screen: E1004 CS2 advance failed");
                 e1004_end_plane();
                 return false;
             }
@@ -1058,6 +1058,6 @@ bool writeBootScreenWithQr() {
             for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, pitch);
         }
     }
-    writeSerial("Boot screen with QR rendered", true);
+    od_log_info("Boot screen with QR rendered");
     return true;
 }
