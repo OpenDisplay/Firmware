@@ -53,6 +53,43 @@ struct ImageData {
 #endif
 #define PIPE_REORDER_SLOT_SIZE  248    // >= max plaintext data payload (241 @ frame 244; 212 encrypted)
 
+// LOCAL link policy: the ATT MTU this device asks NimBLE to negotiate on the BLE
+// transport (BLEDevice::setMTU -> ble_att_set_preferred_mtu). "Preferred" is literal --
+// the central drives the exchange and may settle lower, so nothing may assume this
+// value was granted. Deliberately distinct from OD_BLE_MAX_FRAME: that is the
+// cross-repo WIRE ceiling used to size buffers and the GATT value, whereas this is
+// one device's request on one physical link. They are equal today; the asserts below
+// state the coupling that actually matters instead of leaving it to a shared symbol.
+//
+// NOT used on nRF: Bluefruit fixes the MTU at BLE_GATT_ATT_MTU_MAX (247) via
+// configPrphBandwidth(BANDWIDTH_MAX) -> configPrphConn(247, ...) before the SoftDevice
+// starts, and 256 exceeds that cap. See ble_init.cpp.
+#define OD_BLE_PREFERRED_ATT_MTU  256u
+
+// A single-PDU write carries OD_BLE_PREFERRED_ATT_MTU - 3 value bytes (ATT opcode 1 +
+// handle 2). It must (a) still admit the largest legitimate inbound frame, and (b) never
+// exceed the slot the payload is copied into.
+static_assert(OD_BLE_PREFERRED_ATT_MTU - 3u >= PIPE_REORDER_SLOT_SIZE,
+              "negotiated MTU too small for the largest pipe frame");
+static_assert(OD_BLE_PREFERRED_ATT_MTU - 3u <= OD_BLE_MAX_FRAME,
+              "a single-PDU write could overrun an OD_BLE_MAX_FRAME-sized slot");
+
+#ifdef TARGET_ESP32
+// BLE TX ring. Defined here, NOT in main.h: communication.cpp used to carry its own
+// copy of this struct plus a MAX_RESPONSE_SIZE_LOCAL constant, so the bound checked
+// before the memcpy in esp32_queue_ble_notify_copy() lived in a different file from
+// the slot it guarded -- two definitions of one type (an ODR violation) that had to be
+// edited in lockstep or the guard would admit a response larger than the slot.
+#define RESPONSE_QUEUE_SIZE 10
+#define MAX_RESPONSE_SIZE   OD_BLE_MAX_FRAME
+
+struct ResponseQueueItem {
+    uint8_t data[MAX_RESPONSE_SIZE];
+    uint16_t len;
+    bool pending;
+};
+#endif
+
 // PIPE_WRITE protocol constants (PIPE_ACK_MASK_BITS, PIPE_MAX_FRAME, PIPE_VERSION,
 // PIPE_FLAG_COMPRESSED, PIPE_FLAG_PARTIAL) come from the canonical opendisplay_protocol.h.
 // PIPE_FLAG_PARTIAL bit1: partial-region refresh. START carries a 12-byte LE extension

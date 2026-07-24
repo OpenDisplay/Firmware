@@ -355,25 +355,21 @@ static constexpr uint32_t DEFAULT_IDLE_HOLD_MS = 10000;
 #ifdef TARGET_NRF
 BLEDfu bledfu;
 BLEService imageService("2446");
-BLECharacteristic imageCharacteristic("2446", BLEWrite | BLEWriteWithoutResponse | BLENotify, 512);
+// max_len is a GATT-declared attribute length the SoftDevice reserves for real (vloc =
+// BLE_GATTS_VLOC_STACK), so 512 cost 512 B of attribute table while the link caps at
+// ATT MTU 247 (payload 244) -- half of it was unreachable.
+BLECharacteristic imageCharacteristic("2446", BLEWrite | BLEWriteWithoutResponse | BLENotify, OD_BLE_MAX_FRAME);
 #endif
 
 #ifdef TARGET_ESP32
-// Define queue sizes and structures first
-#define RESPONSE_QUEUE_SIZE 10
-#define MAX_RESPONSE_SIZE 512
+// RESPONSE_QUEUE_SIZE / MAX_RESPONSE_SIZE / ResponseQueueItem come from structs.h so
+// this file and communication.cpp cannot drift apart on the slot size.
 // PIPE_WRITE ingest sizing: 33 slots hold a full W=32 in-flight window + END across a
-// 60 s Spectra SPI stall (loop blocked in bbepWriteData). 256 covers pipe <=244,
-// legacy <=232, HA <=244. A third-party client writing >256 B on a raw 512-MTU link
-// would regress (none known).
+// 60 s Spectra SPI stall (loop blocked in bbepWriteData). OD_BLE_MAX_FRAME (256) covers
+// pipe <=244, legacy <=232, HA <=244; the GATT layer now rejects anything larger with
+// ATT 0x0D rather than the app dropping it silently.
 #define COMMAND_QUEUE_SIZE 33
-#define MAX_COMMAND_SIZE 256
-
-struct ResponseQueueItem {
-    uint8_t data[MAX_RESPONSE_SIZE];
-    uint16_t len;
-    bool pending;
-};
+#define MAX_COMMAND_SIZE OD_BLE_MAX_FRAME
 
 ResponseQueueItem responseQueue[RESPONSE_QUEUE_SIZE];
 uint8_t responseQueueHead = 0;

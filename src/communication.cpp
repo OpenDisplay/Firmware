@@ -62,21 +62,18 @@ String getChipIdHex();
 float readBatteryVoltage();
 
 #ifdef TARGET_ESP32
-struct ResponseQueueItem {
-    uint8_t data[512];
-    uint16_t len;
-    bool pending;
-};
+// ResponseQueueItem / RESPONSE_QUEUE_SIZE / MAX_RESPONSE_SIZE come from structs.h.
+// This file previously redeclared the struct with a hardcoded 512 and kept private
+// *_LOCAL copies of both sizes, so the guard in esp32_queue_ble_notify_copy() and the
+// slot it protects were sized in two different files and had to be edited in lockstep.
 extern WiFiClient wifiClient;
 extern bool wifiServerConnected;
-extern ResponseQueueItem responseQueue[10];
+extern ResponseQueueItem responseQueue[RESPONSE_QUEUE_SIZE];
 extern uint8_t responseQueueHead;
 extern uint8_t responseQueueTail;
 // Drains the response ring to BLE (defined in main.cpp). handleReadConfig() calls
 // this between chunks so a multi-chunk config read never overflows the ring.
 extern void flushResponseQueueToBle();
-static constexpr uint8_t RESPONSE_QUEUE_SIZE_LOCAL = 10;
-static constexpr uint16_t MAX_RESPONSE_SIZE_LOCAL = 512;
 
 static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
     if (!wifiServerConnected || !wifiClient.connected() || len == 0) {
@@ -90,14 +87,14 @@ static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
 
 /** Mirror responses to BLE only when a central is connected; LAN already got send_wifi_lan_frame. */
 static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
-    if (len > MAX_RESPONSE_SIZE_LOCAL) {
-        writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE_LOCAL) + ")", true);
+    if (len > MAX_RESPONSE_SIZE) {
+        writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE) + ")", true);
         return;
     }
     if (pServer == nullptr || pServer->getConnectedCount() == 0) {
         return;
     }
-    uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE_LOCAL;
+    uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE;
     if (nextHead == responseQueueTail) {
         writeSerial("ERROR: Response queue full, dropping response", true);
         return;
@@ -106,7 +103,7 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
     responseQueue[responseQueueHead].len = len;
     responseQueue[responseQueueHead].pending = true;
     responseQueueHead = nextHead;
-    if (!quiet) writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE_LOCAL) % RESPONSE_QUEUE_SIZE_LOCAL) + ")", true);
+    if (!quiet) writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE) + ")", true);
 }
 #endif
 

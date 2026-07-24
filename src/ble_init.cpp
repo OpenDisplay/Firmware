@@ -253,8 +253,9 @@ void ble_init_esp32(bool update_manufacturer_data) {
     String deviceName = "OD" + getChipIdHex();
     writeSerial("Device name will be: " + deviceName);
     BLEDevice::init(deviceName.c_str());
-    writeSerial("Setting BLE MTU to 512...");
-    BLEDevice::setMTU(512);
+    // Preferred only: the central drives the exchange and may settle lower.
+    writeSerial("Setting preferred BLE ATT MTU to " + String(OD_BLE_PREFERRED_ATT_MTU) + "...");
+    BLEDevice::setMTU(OD_BLE_PREFERRED_ATT_MTU);
     pServer = BLEDevice::createServer();
     if (pServer == nullptr) {
         writeSerial("ERROR: Failed to create BLE server");
@@ -272,12 +273,16 @@ void ble_init_esp32(bool update_manufacturer_data) {
     }
     writeSerial("BLE service 0x2446 created successfully");
     BLEUUID charUUID("00002446-0000-1000-8000-00805F9B34FB");
+    // Declaring max_len (rather than inheriting NimBLE's 512 default) makes the GATT
+    // layer reject an oversize write with ATT 0x0D instead of letting it reach onWrite()
+    // and be dropped silently by the MAX_COMMAND_SIZE check.
     pTxCharacteristic = pService->createCharacteristic(
         charUUID,
         NIMBLE_PROPERTY::READ |
         NIMBLE_PROPERTY::NOTIFY |
         NIMBLE_PROPERTY::WRITE |
-        NIMBLE_PROPERTY::WRITE_NR
+        NIMBLE_PROPERTY::WRITE_NR,
+        OD_BLE_MAX_FRAME
     );
     if (pTxCharacteristic == nullptr) {
         writeSerial("ERROR: Failed to create BLE characteristic");
