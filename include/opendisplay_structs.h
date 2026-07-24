@@ -557,7 +557,7 @@ enum ColorScheme {
 /** @enum PanelIC  @width 2
  *  @external bb_epaper (0-76 names track bb_epaper EP* panel identifiers); the
  *  1000-1030 range comes from the M3 / EPD-nRF5 driver line; 3000+ from the
- *  Seeed_GFX / OpenDisplay runtime. Wire values are OpenDisplay-OWNED; each
+ *  FastEPD IT8951 / OpenDisplay runtime. Wire values are OpenDisplay-OWNED; each
  *  firmware maps value -> its bb_epaper EP* constant via a repo-local
  *  opendisplay_epd_map.c (NOT part of this header; bb_epaper never dictates the
  *  wire values). @doc "display controller / panel type (DisplayConfig.panel_ic_type).
@@ -670,8 +670,8 @@ enum PanelIC {
     OD_PANEL_IC_SSD1619_013_BWR          = 1028, /**< @doc "SSD1619 1.3\" 144x200 B/W/R" */
     OD_PANEL_IC_SSD1619_022_LITE_BW      = 1029, /**< @doc "SSD1619 M3 Lite 2.2\" 250x128 B/W" */
     OD_PANEL_IC_SSD1619_022_LITE_BWR     = 1030, /**< @doc "SSD1619 M3 Lite 2.2\" 250x128 B/W/R" */
-    OD_PANEL_IC_ED103TC2_1872X1404       = 3000, /**< @doc "E Ink ED103TC2 + IT8951 (Seeed 10.3\", 1872x1404, 1bpp; Seeed_GFX/OpenDisplay runtime, values 3000+)" */
-    OD_PANEL_IC_ED103TC2_1872X1404_4GRAY = 3001 /**< @doc "same panel as 3000; 4bpp (16-level)" */
+    OD_PANEL_IC_ED103TC2_1872X1404       = 3000, /**< @doc "E Ink ED103TC2 + IT8951 (10.3\", 1872x1404, 1bpp; FastEPD IT8951 path, values 3000+)" */
+    OD_PANEL_IC_ED103TC2_1872X1404_4GRAY = 3001 /**< @doc "same panel as 3000; 4bpp (16-level gray via FastEPD)" */
 };
 
 /* DisplayConfig.transmission_modes @bits TransmissionModes (bits 5-6 reserved --
@@ -700,7 +700,7 @@ struct DisplayConfig {
     uint8_t  rotation;               /**< @enum Rotation @doc "physical rotation." */
     uint8_t  reset_pin;              /**< @doc "panel reset GPIO; 0xFF = none." @default 0xFF */
     uint8_t  busy_pin;               /**< @doc "panel busy-status GPIO; 0xFF = none." @default 0xFF */
-    uint8_t  dc_pin;                 /**< @doc "data/command select; doubles as SPI MISO on OpenDisplay-runtime IT8951 / Seeed ED103 panels." */
+    uint8_t  dc_pin;                 /**< @doc "data/command select; doubles as SPI MISO on OpenDisplay-runtime IT8951 / ED103 panels." */
     uint8_t  cs_pin;                 /**< @doc "SPI chip-select; 0xFF = none." @default 0xFF */
     uint8_t  data_pin;               /**< @doc "data-out pin (SPI MOSI / data line)." */
     uint8_t  partial_update_support; /**< @enum PartialUpdateSupport @doc "partial-update capability." */
