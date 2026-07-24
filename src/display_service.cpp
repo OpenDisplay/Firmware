@@ -5,6 +5,7 @@
 #include <string.h>
 #include <Wire.h>
 #include "structs.h"
+#include "od_log.h"
 #include "buzzer_control.h"
 #include "sensor_sht40.h"
 #include "sensor_bq27220.h"
@@ -105,8 +106,6 @@ extern BLEService* pService;
 
 void pwrmgm(bool onoff);
 String getChipIdHex();
-void writeSerial(String message, bool newLine);
-void flushLog();
 void bbepInitIO(BBEPDISP *pBBEP, uint8_t u8DC, uint8_t u8RST, uint8_t u8BUSY, uint8_t u8CS, uint8_t u8MOSI, uint8_t u8SCK, uint32_t u32Speed);
 void bbepWakeUp(BBEPDISP *pBBEP);
 void bbepSendCMDSequence(BBEPDISP *pBBEP, const uint8_t *pSeq);
@@ -364,7 +363,7 @@ static uint32_t epdKeepAliveWindowMs(void) {
     for (uint8_t i = 0; i < globalConfig.sensor_count; i++) {
         if (globalConfig.sensors[i].sensor_type == OD_SENSOR_TYPE_AXP2101) {
             if (s != 0) {
-                writeSerial("[EPD session] AXP2101 present - keep-alive forced off (screen_timeout_seconds ignored)", true);
+                od_log_info("[EPD session] AXP2101 present - keep-alive forced off (screen_timeout_seconds ignored)");
             }
             return 0;
         }
@@ -396,7 +395,7 @@ static void pwrmgmLockGive(void) {
 // power off without re-taking the non-recursive lock.
 static void epdSessionForceOffLocked(void) {
     if (pwrmgmState == PWR_OFF) return;   // idempotent
-    writeSerial("[EPD session] force off", true);
+    od_log_info("[EPD session] force off");
     if (epdSessionUsesFastepd()) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
         fastepd_direct_sleep();
@@ -418,7 +417,7 @@ static bool epdSessionAcquire(bool partialInit) {
     pwrmgmLockTake();
     bool cold;
     if (pwrmgmState == PWR_OFF) {
-        writeSerial("[EPD session] acquire: COLD bring-up", true);
+        od_log_info("[EPD session] acquire: COLD bring-up");
         pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
         if (!epdSessionUsesFastepd()) {
             const DisplayConfig& d = globalConfig.displays[0];
@@ -441,8 +440,8 @@ static bool epdSessionAcquire(bool partialInit) {
         cold = true;
     } else {
         // WARM re-acquire (or, defensively, an already-ACTIVE re-entry).
-        writeSerial(pwrmgmState == PWR_ACTIVE ? "[EPD session] acquire: already ACTIVE (defensive)"
-                                              : "[EPD session] acquire: WARM re-acquire", true);
+        od_log_info(pwrmgmState == PWR_ACTIVE ? "[EPD session] acquire: already ACTIVE (defensive)"
+                                              : "[EPD session] acquire: WARM re-acquire");
         pwrmgmState = PWR_ACTIVE;
         pwrmgmOffDeadlineMs = 0;   // cancel keep-alive
         // Phase 1: full re-init on warm re-acquire (HW reset => registers identical
@@ -476,14 +475,14 @@ static void epdSessionRelease(bool refreshSuccess) {
     if (pwrmgmState == PWR_OFF) { pwrmgmLockGive(); return; }   // nothing to release
     uint32_t window = epdKeepAliveWindowMs();
     if (window == 0 || !refreshSuccess) {
-        writeSerial(refreshSuccess ? "[EPD session] release: keep-alive disabled, powering off"
-                                   : "[EPD session] release: refresh failed, powering off", true);
+        od_log_info(refreshSuccess ? "[EPD session] release: keep-alive disabled, powering off"
+                                   : "[EPD session] release: refresh failed, powering off");
         epdSessionForceOffLocked();
     } else {
         pwrmgmState = PWR_WARM;
         pwrmgmOffDeadlineMs = millis() + window;
         // Controller stays AWAKE (no bbepSleep; is_awake stays 1); rail/SPI stay up.
-        writeSerial("[EPD session] release: panel warm-idle, off in " + String(window) + " ms", true);
+        od_log_info("[EPD session] release: panel warm-idle, off in %u ms", (unsigned)window);
     }
     pwrmgmLockGive();
 }
@@ -499,7 +498,7 @@ void epdSessionTick(void) {
     if (!pwrmgmLockTryTake()) return;      // held by a transfer -> skip this pass
     // Re-check under the lock: a transfer may have moved us out of WARM meanwhile.
     if (pwrmgmState == PWR_WARM && (int32_t)(millis() - pwrmgmOffDeadlineMs) >= 0) {
-        writeSerial("[EPD session] keep-alive expired — powering panel off", true);
+        od_log_info("[EPD session] keep-alive expired — powering panel off");
         epdSessionForceOffLocked();
     }
     pwrmgmLockGive();
@@ -511,10 +510,10 @@ bool epdSessionIsWarm(void) {
 
 static bool refreshBootScreenFull() {
     if (!writeBootScreenWithQr()) {
-        writeSerial("Boot screen render failed", true);
+        od_log_warn("Boot screen render failed");
         return false;
     }
-    writeSerial("EPD refresh: FULL (boot)", true);
+    od_log_info("EPD refresh: FULL (boot)");
     touchSuspendForEpdRefresh();
     bbepRefresh(&bbep, REFRESH_FULL);
     return waitforrefresh(60);
@@ -550,7 +549,7 @@ static PipeReorderSlot pipeReorder[PIPE_REORDER_SLOTS];
 void checkPartialWriteTimeout(void) {
     if (partialCtx.active && partialCtx.start_time > 0 &&
         (millis() - partialCtx.start_time) > 900000UL) {
-        writeSerial("ERROR: Partial write timeout - cleaning up stuck state", true);
+        od_log_error("ERROR: Partial write timeout - cleaning up stuck state");
         cleanup_partial_write_state();
         // A pipe-partial transfer shares partialCtx: also clear pipeState so a zombie
         // pipeState.active can't misroute later 0x0081 frames into the dead partialCtx.
@@ -722,7 +721,7 @@ bool waitforrefresh(int timeout){
 #endif
     if (e1004_panel_used() && !bbepIsBusy(&bbep)) {
         // bbepRefresh already waited; idle here means refresh finished.
-        writeSerial("Refresh completed inside bb_epaper", true);
+        od_log_info("Refresh completed inside bb_epaper");
         return true;
     }
     // Poll at 10 ms (was 100 ms) so a ~0.5 s refresh returns up to ~90 ms sooner.
@@ -731,21 +730,19 @@ bool waitforrefresh(int timeout){
     // (timeout*100 iterations of 10 ms); dot cadence every 50 iters keeps ~0.5 s/dot.
     for (size_t i = 0; i < (size_t)(timeout * 100); i++){
         delay(10);
-        if(i % 50 == 0) writeSerial(".", false);
+        if(i % 50 == 0) od_log_raw(".");
         if(!bbepIsBusy(&bbep)){
             if(i == 0){
-                writeSerial("ERROR: Epaper not busy after refresh command - refresh may not have started", true);
+                od_log_error("ERROR: Epaper not busy after refresh command - refresh may not have started");
                 return false;
             }
-            writeSerial(".", true);
-            writeSerial("Refresh took ", false);
-            writeSerial((String)((float)i / 100), false);
-            writeSerial(" seconds", true);
+            od_log_raw(".\n");
+            od_log_info("Refresh took %.2f seconds", (float)i / 100);
 //            delay(200);   // EXTRA DELAY HERE IS UNNEEDED AND JUST SLOWS THINGS DOWN
             return true;
         }
     }
-    writeSerial("Refresh timed out", true);
+    od_log_warn("Refresh timed out");
     return false;
 }
 
@@ -766,7 +763,7 @@ static bool wireBeginForOpenDisplay(int sda, int scl, uint32_t hz) {
         return true;
     }
     if (hz > 100000u && Wire.begin(sda, scl, 100000u)) {
-        writeSerial("NOTE: I2C fallback to 100kHz (SDA=GPIO" + String(sda) + " SCL=GPIO" + String(scl) + ")", true);
+        od_log_info("NOTE: I2C fallback to 100kHz (SDA=GPIO%d SCL=GPIO%d)", sda, scl);
         Wire.setClock(100000u);
         s_wire_sda_pin = (int8_t)sda;
         s_wire_scl_pin = (int8_t)scl;
@@ -774,7 +771,7 @@ static bool wireBeginForOpenDisplay(int sda, int scl, uint32_t hz) {
         s_wire_open_display_ready = true;
         return true;
     }
-    writeSerial("ERROR: Wire.begin failed (SDA=GPIO" + String(sda) + " SCL=GPIO" + String(scl) + ")", true);
+    od_log_error("ERROR: Wire.begin failed (SDA=GPIO%d SCL=GPIO%d)", sda, scl);
     return false;
 }
 #endif
@@ -864,17 +861,17 @@ void initOrRestoreWireForOpenDisplay(void) {
 }
 
 void initDataBuses(){
-    writeSerial("=== Initializing Data Buses ===", true);
+    od_log_info("=== Initializing Data Buses ===");
     if(globalConfig.data_bus_count == 0){
-        writeSerial("No data buses configured", true);
+        od_log_info("No data buses configured");
         return;
     }
     for(uint8_t i = 0; i < globalConfig.data_bus_count; i++){
         struct DataBus* bus = &globalConfig.data_buses[i];
         if(bus->bus_type == 0x01){ // I2C bus
-            writeSerial("Initializing I2C bus " + String(i) + " (instance " + String(bus->instance_number) + ")", true);
+            od_log_info("Initializing I2C bus %u (instance %u)", i, bus->instance_number);
             if(bus->pin_1 == 0xFF || bus->pin_2 == 0xFF){
-                writeSerial("ERROR: Invalid I2C pins for bus " + String(i) + " (SCL=" + String(bus->pin_1) + ", SDA=" + String(bus->pin_2) + ")", true);
+                od_log_error("ERROR: Invalid I2C pins for bus %u (SCL=%u, SDA=%u)", i, bus->pin_1, bus->pin_2);
                 continue;
             }
             uint32_t busSpeed = (bus->bus_speed_hz > 0) ? bus->bus_speed_hz : 100000;
@@ -893,27 +890,27 @@ void initDataBuses(){
                 }
                 Wire.begin(); // Uses default I2C pins
                 Wire.setClock(busSpeed);
-                writeSerial("NOTE: nRF52840 using default I2C pins (config pins: SCL=" + String(bus->pin_1) + ", SDA=" + String(bus->pin_2) + ")", true);
+                od_log_info("NOTE: nRF52840 using default I2C pins (config pins: SCL=%u, SDA=%u)", bus->pin_1, bus->pin_2);
                 #endif
-                writeSerial("I2C bus " + String(i) + " initialized: SCL=pin" + String(bus->pin_1) + ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz", true);
+                od_log_info("I2C bus %u initialized: SCL=pin%u, SDA=pin%u, Speed=%uHz", i, bus->pin_1, bus->pin_2, (unsigned)busSpeed);
             } else {
-                writeSerial("I2C bus " + String(i) + " configured (init on demand): SCL=pin" + String(bus->pin_1) +
-                    ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz", true);
+                od_log_info("I2C bus %u configured (init on demand): SCL=pin%u, SDA=pin%u, Speed=%uHz",
+                    i, bus->pin_1, bus->pin_2, (unsigned)busSpeed);
             }
         }
         else if(bus->bus_type == 0x02){
-            writeSerial("SPI bus " + String(i) + " detected (not yet implemented)", true);
-            writeSerial("  Instance: " + String(bus->instance_number), true);
+            od_log_info("SPI bus %u detected (not yet implemented)", i);
+            od_log_info("  Instance: %u", bus->instance_number);
         }
         else{
-            writeSerial("WARNING: Unknown bus type 0x" + String(bus->bus_type, HEX) + " for bus " + String(i), true);
+            od_log_warn("WARNING: Unknown bus type 0x%02X for bus %u", bus->bus_type, i);
         }
     }
-    writeSerial("=== Data Bus Initialization Complete ===", true);
+    od_log_info("=== Data Bus Initialization Complete ===");
 }
 
 void initio(){
-    writeSerial("[initio] >> LEDs", true); flushLog();
+    od_log_info("[initio] >> LEDs"); od_log_flush();
     if(globalConfig.led_count > 0){
         for (uint8_t i = 0; i < globalConfig.led_count; i++) {
             struct LedConfig* led = &globalConfig.leds[i];
@@ -953,25 +950,25 @@ void initio(){
             }
         }
     }
-    writeSerial("[initio] >> initPassiveBuzzers", true); flushLog();
+    od_log_info("[initio] >> initPassiveBuzzers"); od_log_flush();
     initPassiveBuzzers();
-    writeSerial("[initio] >> pwr_pin", true); flushLog();
+    od_log_info("[initio] >> pwr_pin"); od_log_flush();
     if(globalConfig.system_config.pwr_pin != 0xFF){
     pinMode(globalConfig.system_config.pwr_pin, OUTPUT);
     digitalWrite(globalConfig.system_config.pwr_pin, LOW);
     }
     else{
-        writeSerial("Power pin not set", true);
+        od_log_warn("Power pin not set");
     }
-    writeSerial("[initio] >> initDataBuses", true); flushLog();
+    od_log_info("[initio] >> initDataBuses"); od_log_flush();
     initDataBuses();
-    writeSerial("[initio] >> initSensors", true); flushLog();
+    od_log_info("[initio] >> initSensors"); od_log_flush();
     initSensors();
-    writeSerial("[initio] << done", true); flushLog();
+    od_log_info("[initio] << done"); od_log_flush();
 }
 
 void scanI2CDevices(){
-    writeSerial("=== Scanning I2C Bus for Devices ===", true);
+    od_log_info("=== Scanning I2C Bus for Devices ===");
     initOrRestoreWireForOpenDisplay();
     uint8_t deviceCount = 0;
     uint8_t foundDevices[128];
@@ -981,60 +978,68 @@ void scanI2CDevices(){
         if(error == 0){
             foundDevices[deviceCount] = address;
             deviceCount++;
-            writeSerial("I2C device found at address 0x" + String(address, HEX) + " (" + String(address) + ")", true);
+            od_log_debug("I2C device found at address 0x%02X (%u)", address, address);
         }
         else if(error == 4){
-            writeSerial("ERROR: Unknown error at address 0x" + String(address, HEX), true);
+            od_log_error("ERROR: Unknown error at address 0x%02X", address);
         }
     }
     if(deviceCount == 0){
-        writeSerial("No I2C devices found on bus", true);
+        od_log_warn("No I2C devices found on bus");
     } else {
-        writeSerial("Found " + String(deviceCount) + " I2C device(s)", true);
-        writeSerial("Device addresses: ", true);
-        String addrList = "";
-        for(uint8_t i = 0; i < deviceCount; i++){
-            if(i > 0) addrList += ", ";
-            addrList += "0x" + String(foundDevices[i], HEX);
+        od_log_debug("Found %u I2C device(s)", deviceCount);
+        od_log_debug("Device addresses: ");
+        char addrList[700];
+        int pos = snprintf(addrList, sizeof(addrList), "%s", "");
+        if (pos < 0) {
+            pos = 0;
+            addrList[0] = '\0';
         }
-        writeSerial(addrList, true);
+        for(uint8_t i = 0; i < deviceCount && pos < (int)sizeof(addrList); i++){
+            int n = snprintf(addrList + pos, sizeof(addrList) - pos, i > 0 ? ", 0x%02X" : "0x%02X", foundDevices[i]);
+            if (n < 0) {
+                break;
+            }
+            pos += n;
+        }
+        od_log_debug("%s", addrList);
     }
-    writeSerial("=== I2C Scan Complete ===", true);
+    od_log_info("=== I2C Scan Complete ===");
 }
 
 void initSensors(){
-    writeSerial("=== Initializing Sensors ===", true);
+    od_log_info("=== Initializing Sensors ===");
     if(globalConfig.sensor_count == 0){
-        writeSerial("No sensors configured", true);
+        od_log_warn("No sensors configured");
         return;
     }
     for(uint8_t i = 0; i < globalConfig.sensor_count; i++){
         struct SensorData* sensor = &globalConfig.sensors[i];
-        writeSerial("Initializing sensor " + String(i) + " (instance " + String(sensor->instance_number) + ")", true);
-        writeSerial("  Type: 0x" + String(sensor->sensor_type, HEX), true);
-        writeSerial("  Bus ID: " + String(sensor->bus_id), true);
+        od_log_debug("Initializing sensor %u (instance %u)", i, sensor->instance_number);
+        od_log_debug("  Type: 0x%04X", sensor->sensor_type);
+        od_log_debug("  Bus ID: %u", sensor->bus_id);
         if(sensor->sensor_type == OD_SENSOR_TYPE_AXP2101){
-            writeSerial("  Detected AXP2101 PMIC sensor", true);
+            od_log_debug("  Detected AXP2101 PMIC sensor");
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_TEMPERATURE){
-            writeSerial("  Temperature sensor (initialization not implemented)", true);
+            od_log_debug("  Temperature sensor (initialization not implemented)");
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_HUMIDITY){
-            writeSerial("  Humidity sensor (initialization not implemented)", true);
+            od_log_debug("  Humidity sensor (initialization not implemented)");
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_SHT40){
-            writeSerial("  SHT40 (I2C + MSD slot)", true);
+            od_log_debug("  SHT40 (I2C + MSD slot)");
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_BQ27220){
-            writeSerial("  BQ27220 fuel gauge (MSD voltage + optional dynamic SOC/status bytes)", true);
+            od_log_debug("  BQ27220 fuel gauge (MSD voltage + optional dynamic SOC/status bytes)");
         }
         else{
-            writeSerial("  Unknown sensor type 0x" + String(sensor->sensor_type, HEX), true);
+            od_log_warn("  Unknown sensor type 0x%04X", sensor->sensor_type);
         }
     }
     initSht40Sensors();
     initBq27220Sensors();
-    writeSerial("=== Sensor Initialization Complete ===", true);
+    od_log_info("=== Sensor Initialization Complete ===");
 }
 
 void initAXP2101(uint8_t busId){
@@ -1042,27 +1047,27 @@ void initAXP2101(uint8_t busId){
     digitalWrite(21, LOW);
     delay(100);
     digitalWrite(21, HIGH);
-    writeSerial("=== Initializing AXP2101 PMIC ===", true);
+    od_log_info("=== Initializing AXP2101 PMIC ===");
     if(busId >= globalConfig.data_bus_count){
-        writeSerial("ERROR: Invalid bus ID " + String(busId) + " (only " + String(globalConfig.data_bus_count) + " buses configured)", true);
+        od_log_error("ERROR: Invalid bus ID %u (only %u buses configured)", busId, globalConfig.data_bus_count);
         return;
     }
     struct DataBus* bus = &globalConfig.data_buses[busId];
     if(bus->bus_type != 0x01){
-        writeSerial("ERROR: Bus " + String(busId) + " is not an I2C bus", true);
+        od_log_error("ERROR: Bus %u is not an I2C bus", busId);
         return;
     }
     if(!initOrRestoreWireForBus(busId)){
-        writeSerial("ERROR: Failed to (re)init I2C bus " + String(busId) + " for AXP2101", true);
+        od_log_error("ERROR: Failed to (re)init I2C bus %u for AXP2101", busId);
         return;
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     uint8_t error = Wire.endTransmission();
     if(error != 0){
-        writeSerial("ERROR: AXP2101 not found at address 0x" + String(AXP2101_SLAVE_ADDRESS, HEX) + " (error: " + String(error) + ")", true);
+        od_log_error("ERROR: AXP2101 not found at address 0x%02X (error: %u)", AXP2101_SLAVE_ADDRESS, error);
         return;
     }
-    writeSerial("AXP2101 detected at address 0x" + String(AXP2101_SLAVE_ADDRESS, HEX), true);
+    od_log_debug("AXP2101 detected at address 0x%02X", AXP2101_SLAVE_ADDRESS);
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_POWER_STATUS);
     error = Wire.endTransmission();
@@ -1070,7 +1075,7 @@ void initAXP2101(uint8_t busId){
         Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
         if(Wire.available()){
             uint8_t status = Wire.read();
-            writeSerial("Power status: 0x" + String(status, HEX), true);
+            od_log_debug("Power status: 0x%02X", status);
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1078,9 +1083,9 @@ void initAXP2101(uint8_t busId){
     Wire.write(0x12);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("DCDC1 voltage set to 3.3V", true);
+        od_log_debug("DCDC1 voltage set to 3.3V");
     } else {
-        writeSerial("ERROR: Failed to set DCDC1 voltage", true);
+        od_log_error("ERROR: Failed to set DCDC1 voltage");
     }
     delay(10);
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1099,9 +1104,9 @@ void initAXP2101(uint8_t busId){
     Wire.write(dcEnable);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("DCDC1 enabled (3.3V)", true);
+        od_log_debug("DCDC1 enabled (3.3V)");
     } else {
-        writeSerial("ERROR: Failed to enable DCDC1", true);
+        od_log_error("ERROR: Failed to enable DCDC1");
     }
     delay(10);
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1130,7 +1135,7 @@ void initAXP2101(uint8_t busId){
     Wire.write(aldo3VolReg);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("ALDO3 voltage set to 3.3V", true);
+        od_log_debug("ALDO3 voltage set to 3.3V");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_LDO_VOL3_CTRL);
@@ -1148,7 +1153,7 @@ void initAXP2101(uint8_t busId){
     Wire.write(aldo4VolReg);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("ALDO4 voltage set to 3.3V", true);
+        od_log_debug("ALDO4 voltage set to 3.3V");
     }
     aldoEnable |= 0x0C;
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1156,7 +1161,7 @@ void initAXP2101(uint8_t busId){
     Wire.write(aldoEnable);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("ALDO3 and ALDO4 enabled (3.3V)", true);
+        od_log_debug("ALDO3 and ALDO4 enabled (3.3V)");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_POWER_WAKEUP_CTL);
@@ -1165,29 +1170,29 @@ void initAXP2101(uint8_t busId){
         Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
         if(Wire.available()){
             uint8_t wakeupCtl = Wire.read();
-            writeSerial("Wakeup control: 0x" + String(wakeupCtl, HEX), true);
+            od_log_debug("Wakeup control: 0x%02X", wakeupCtl);
             if(wakeupCtl & 0x01){
-                writeSerial("Wakeup already enabled", true);
+                od_log_debug("Wakeup already enabled");
             } else {
                 Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
                 Wire.write(AXP2101_REG_POWER_WAKEUP_CTL);
                 Wire.write(wakeupCtl | 0x01);
                 error = Wire.endTransmission();
                 if(error == 0){
-                    writeSerial("Wakeup enabled", true);
+                    od_log_debug("Wakeup enabled");
                 }
             }
         }
     }
-    writeSerial("=== AXP2101 PMIC Initialization Complete ===", true);
+    od_log_info("=== AXP2101 PMIC Initialization Complete ===");
 }
 
 void readAXP2101Data(){
-    writeSerial("=== Reading AXP2101 PMIC Data ===", true);
+    od_log_info("=== Reading AXP2101 PMIC Data ===");
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     uint8_t error = Wire.endTransmission();
     if(error != 0){
-        writeSerial("ERROR: AXP2101 not found at address 0x" + String(AXP2101_SLAVE_ADDRESS, HEX), true);
+        od_log_error("ERROR: AXP2101 not found at address 0x%02X", AXP2101_SLAVE_ADDRESS);
         return;
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1203,14 +1208,14 @@ void readAXP2101Data(){
         if(Wire.available() >= 2){
             uint8_t status1 = Wire.read();
             uint8_t status2 = Wire.read();
-            writeSerial("Power Status 1: 0x" + String(status1, HEX), true);
-            writeSerial("Power Status 2: 0x" + String(status2, HEX), true);
+            od_log_debug("Power Status 1: 0x%02X", status1);
+            od_log_debug("Power Status 2: 0x%02X", status2);
             bool batteryPresent = (status1 & 0x20) != 0;
             bool charging = (status1 & 0x04) != 0;
             bool vbusPresent = (status1 & 0x08) != 0;
-            writeSerial("Battery Present: " + String(batteryPresent ? "Yes" : "No"), true);
-            writeSerial("Charging: " + String(charging ? "Yes" : "No"), true);
-            writeSerial("VBUS Present: " + String(vbusPresent ? "Yes" : "No"), true);
+            od_log_debug("Battery Present: %s", batteryPresent ? "Yes" : "No");
+            od_log_debug("Charging: %s", charging ? "Yes" : "No");
+            od_log_debug("VBUS Present: %s", vbusPresent ? "Yes" : "No");
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1220,7 +1225,7 @@ void readAXP2101Data(){
         Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
         if(Wire.available()){
             uint8_t pwronStatus = Wire.read();
-            writeSerial("Power On Status: 0x" + String(pwronStatus, HEX), true);
+            od_log_debug("Power On Status: 0x%02X", pwronStatus);
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1233,7 +1238,7 @@ void readAXP2101Data(){
             uint8_t batVolL = Wire.read();
             uint16_t batVolRaw = ((uint16_t)batVolH << 4) | (batVolL & 0x0F);
             float batVoltage = batVolRaw * 0.5;
-            writeSerial("Battery Voltage: " + String(batVoltage, 1) + " mV (" + String(batVoltage / 1000.0, 2) + " V)", true);
+            od_log_debug("Battery Voltage: %.1f mV (%.2f V)", batVoltage, batVoltage / 1000.0);
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1246,7 +1251,7 @@ void readAXP2101Data(){
             uint8_t vbusVolL = Wire.read();
             uint16_t vbusVolRaw = ((uint16_t)vbusVolH << 4) | (vbusVolL & 0x0F);
             float vbusVoltage = vbusVolRaw * 1.7;
-            writeSerial("VBUS Voltage: " + String(vbusVoltage, 1) + " mV (" + String(vbusVoltage / 1000.0, 2) + " V)", true);
+            od_log_debug("VBUS Voltage: %.1f mV (%.2f V)", vbusVoltage, vbusVoltage / 1000.0);
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1259,7 +1264,7 @@ void readAXP2101Data(){
             uint8_t sysVolL = Wire.read();
             uint16_t sysVolRaw = ((uint16_t)sysVolH << 4) | (sysVolL & 0x0F);
             float sysVoltage = sysVolRaw * 1.4;
-            writeSerial("System Voltage: " + String(sysVoltage, 1) + " mV (" + String(sysVoltage / 1000.0, 2) + " V)", true);
+            od_log_debug("System Voltage: %.1f mV (%.2f V)", sysVoltage, sysVoltage / 1000.0);
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1270,9 +1275,9 @@ void readAXP2101Data(){
         if(Wire.available()){
             uint8_t batPercent = Wire.read();
             if(batPercent <= 100){
-                writeSerial("Battery Percentage: " + String(batPercent) + "%", true);
+                od_log_debug("Battery Percentage: %u%%", batPercent);
             } else {
-                writeSerial("Battery Percentage: Not available (fuel gauge may be disabled)", true);
+                od_log_debug("Battery Percentage: Not available (fuel gauge may be disabled)");
             }
         }
     }
@@ -1283,12 +1288,12 @@ void readAXP2101Data(){
         Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
         if(Wire.available()){
             uint8_t dcEnable = Wire.read();
-            writeSerial("DC Enable Status: 0x" + String(dcEnable, HEX), true);
-            writeSerial("  DCDC1: " + String((dcEnable & 0x01) ? "ON" : "OFF"), true);
-            writeSerial("  DCDC2: " + String((dcEnable & 0x02) ? "ON" : "OFF"), true);
-            writeSerial("  DCDC3: " + String((dcEnable & 0x04) ? "ON" : "OFF"), true);
-            writeSerial("  DCDC4: " + String((dcEnable & 0x08) ? "ON" : "OFF"), true);
-            writeSerial("  DCDC5: " + String((dcEnable & 0x10) ? "ON" : "OFF"), true);
+            od_log_debug("DC Enable Status: 0x%02X", dcEnable);
+            od_log_debug("  DCDC1: %s", (dcEnable & 0x01) ? "ON" : "OFF");
+            od_log_debug("  DCDC2: %s", (dcEnable & 0x02) ? "ON" : "OFF");
+            od_log_debug("  DCDC3: %s", (dcEnable & 0x04) ? "ON" : "OFF");
+            od_log_debug("  DCDC4: %s", (dcEnable & 0x08) ? "ON" : "OFF");
+            od_log_debug("  DCDC5: %s", (dcEnable & 0x10) ? "ON" : "OFF");
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1298,22 +1303,22 @@ void readAXP2101Data(){
         Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
         if(Wire.available()){
             uint8_t aldoEnable = Wire.read();
-            writeSerial("ALDO Enable Status: 0x" + String(aldoEnable, HEX), true);
-            writeSerial("  ALDO1: " + String((aldoEnable & 0x01) ? "ON" : "OFF"), true);
-            writeSerial("  ALDO2: " + String((aldoEnable & 0x02) ? "ON" : "OFF"), true);
-            writeSerial("  ALDO3: " + String((aldoEnable & 0x04) ? "ON" : "OFF"), true);
-            writeSerial("  ALDO4: " + String((aldoEnable & 0x08) ? "ON" : "OFF"), true);
+            od_log_debug("ALDO Enable Status: 0x%02X", aldoEnable);
+            od_log_debug("  ALDO1: %s", (aldoEnable & 0x01) ? "ON" : "OFF");
+            od_log_debug("  ALDO2: %s", (aldoEnable & 0x02) ? "ON" : "OFF");
+            od_log_debug("  ALDO3: %s", (aldoEnable & 0x04) ? "ON" : "OFF");
+            od_log_debug("  ALDO4: %s", (aldoEnable & 0x08) ? "ON" : "OFF");
         }
     }
-    writeSerial("=== AXP2101 Data Read Complete ===", true);
+    od_log_info("=== AXP2101 Data Read Complete ===");
 }
 
 void powerDownAXP2101(){
-    writeSerial("=== Powering Down AXP2101 PMIC Rails ===", true);
+    od_log_info("=== Powering Down AXP2101 PMIC Rails ===");
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     uint8_t error = Wire.endTransmission();
     if(error != 0){
-        writeSerial("ERROR: AXP2101 not found at address 0x" + String(AXP2101_SLAVE_ADDRESS, HEX) + " (error: " + String(error) + ")", true);
+        od_log_error("ERROR: AXP2101 not found at address 0x%02X (error: %u)", AXP2101_SLAVE_ADDRESS, error);
         return;
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1362,7 +1367,7 @@ void powerDownAXP2101(){
         Wire.write(0xFF);
         error = Wire.endTransmission();
         if(error == 0){
-            writeSerial("All IRQs disabled and status cleared", true);
+            od_log_debug("All IRQs disabled and status cleared");
         }
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1381,18 +1386,18 @@ void powerDownAXP2101(){
     Wire.write(dcEnable);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("DC2-5 disabled (DC1 kept enabled)", true);
+        od_log_debug("DC2-5 disabled (DC1 kept enabled)");
     } else {
-        writeSerial("ERROR: Failed to disable DC2-5", true);
+        od_log_error("ERROR: Failed to disable DC2-5");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_LDO_ONOFF_CTRL1);
     Wire.write(0x00);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("BLDO1-2, CPUSLDO, DLDO1-2 disabled", true);
+        od_log_debug("BLDO1-2, CPUSLDO, DLDO1-2 disabled");
     } else {
-        writeSerial("ERROR: Failed to disable BLDO/CPUSLDO/DLDO rails", true);
+        od_log_error("ERROR: Failed to disable BLDO/CPUSLDO/DLDO rails");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_LDO_ONOFF_CTRL0);
@@ -1410,9 +1415,9 @@ void powerDownAXP2101(){
     Wire.write(aldoEnable);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("ALDO1-4 disabled", true);
+        od_log_debug("ALDO1-4 disabled");
     } else {
-        writeSerial("ERROR: Failed to disable ALDO rails", true);
+        od_log_error("ERROR: Failed to disable ALDO rails");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_POWER_WAKEUP_CTL);
@@ -1439,20 +1444,20 @@ void powerDownAXP2101(){
     Wire.write(wakeupCtrl);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("AXP2101 wake-up configured and sleep mode enabled", true);
+        od_log_debug("AXP2101 wake-up configured and sleep mode enabled");
     } else {
-        writeSerial("ERROR: Failed to configure AXP2101 sleep mode", true);
+        od_log_error("ERROR: Failed to configure AXP2101 sleep mode");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_ADC_CHANNEL_CTRL);
     Wire.write(0x00);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("All ADC channels disabled", true);
+        od_log_debug("All ADC channels disabled");
     } else {
-        writeSerial("ERROR: Failed to disable ADC channels", true);
+        od_log_error("ERROR: Failed to disable ADC channels");
     }
-    writeSerial("=== AXP2101 PMIC Rails Powered Down ===", true);
+    od_log_info("=== AXP2101 PMIC Rails Powered Down ===");
 }
 
 static void renderChar_4BPP(uint8_t* rowBuffer, const uint8_t* fontData, int fontRow, int charIdx, int startX, int charWidth, int pitch, int fontScale) {
@@ -1531,26 +1536,28 @@ static void renderChar_1BPP(uint8_t* rowBuffer, const uint8_t* fontData, int fon
 }
 
 void initDisplay(){
-    writeSerial("=== Initializing Display ===", true);
+    od_log_info("=== Initializing Display ===");
     if(globalConfig.display_count > 0){
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (fastepd_driver_used()) {
         pwrmgm(true);
-        writeSerial("Display: FastEPD IT8951 (panel_ic " + String(globalConfig.displays[0].panel_ic_type) + ", " +
-                    String(globalConfig.displays[0].pixel_width) + "x" + String(globalConfig.displays[0].pixel_height) + ", " +
-                    String(getBitsPerPixel()) + " bpp)", true);
+        int bitsPerPixel = getBitsPerPixel();
+        od_log_info("Display: FastEPD IT8951 (panel_ic %u, %ux%u, %d bpp)",
+                    globalConfig.displays[0].panel_ic_type,
+                    globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height,
+                    bitsPerPixel);
         fastepd_epaper_begin();
         if (fastepd_init_failed()) {
-            writeSerial("FastEPD init failed — skipping boot refresh", true);
+            od_log_warn("FastEPD init failed — skipping boot refresh");
             fastepd_mark_hw_deinitialized();
             pwrmgm(false);
             return;
         }
-        writeSerial(String("Height: ") + String(globalConfig.displays[0].pixel_height), true);
-        writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
+        od_log_info("Height: %u", globalConfig.displays[0].pixel_height);
+        od_log_info("Width: %u", globalConfig.displays[0].pixel_width);
         if (! (globalConfig.displays[0].transmission_modes & OD_TRANSMISSION_MODE_CLEAR_ON_BOOT)){
             writeBootScreenWithQr();
-            writeSerial("EPD refresh: FULL (boot, FastEPD)", true);
+            od_log_info("EPD refresh: FULL (boot, FastEPD)");
             touchSuspendForEpdRefresh();
             fastepd_full_update();
             waitforrefresh(60);
@@ -1574,20 +1581,20 @@ void initDisplay(){
             if (globalConfig.displays[0].pixel_width != bbep.native_width ||
                 globalConfig.displays[0].pixel_height != bbep.native_height ||
                 globalConfig.displays[0].color_scheme != OD_COLOR_SCHEME_BWGBRY_SPLIT) {
-                writeSerial("ERROR: E1004 requires a 1200x1600 bwgbry_split (8) display config", true);
+                od_log_error("ERROR: E1004 requires a 1200x1600 bwgbry_split (8) display config");
             } else {
                 e1004GeometryOk = true;
             }
         }
 #endif
         bbepSetRotation(&bbep, rotation);
-        writeSerial(String("Height: ") + String(globalConfig.displays[0].pixel_height), true);
-        writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
+        od_log_info("Height: %u", globalConfig.displays[0].pixel_height);
+        od_log_info("Width: %u", globalConfig.displays[0].pixel_width);
         initBbepPanelSession();
         if (! (globalConfig.displays[0].transmission_modes & OD_TRANSMISSION_MODE_CLEAR_ON_BOOT)){
             bool bootOk = refreshBootScreenFull();
             if (!bootOk && !nrfVbusPresent()) {
-                writeSerial("Boot refresh failed on battery — re-powering panel and retrying", true);
+                od_log_warn("Boot refresh failed on battery — re-powering panel and retrying");
                 touchResumeAfterEpdRefresh();
                 pwrmgm(false);
                 delay(200);
@@ -1596,7 +1603,7 @@ void initDisplay(){
                 bootOk = refreshBootScreenFull();
             }
             if (!bootOk) {
-                writeSerial("Boot screen refresh did not complete", true);
+                od_log_warn("Boot screen refresh did not complete");
             }
             // Boot ends PWR_OFF (no keep-alive at boot). pwrmgm(true) in boot set
             // PWR_ACTIVE, so ForceOff sleeps the controller + cuts the rail cleanly.
@@ -1610,7 +1617,7 @@ void initDisplay(){
     }
     }
     else{
-        writeSerial("No display found", true);
+        od_log_warn("No display found");
     }
 }
 
@@ -1797,14 +1804,17 @@ static uint8_t  imgLogLastHead[16];  // first bytes of most recent frame
 static uint8_t  imgLogLastHeadLen;   // valid bytes in imgLogLastHead
 static uint32_t imgLogStartMs;       // millis() at stream start (for throughput)
 
-static String imgLogHex(const uint8_t* buf, uint8_t n) {
-    String s;
-    for (uint8_t i = 0; i < n; i++) {
-        if (i > 0) s += " ";
-        if (buf[i] < 16) s += "0";
-        s += String(buf[i], HEX);
+// Builds a space-separated "%02X" hex dump of up to sizeof(imgLogLastHead) bytes into buf.
+static void imgLogHex(char* buf, size_t bufSize, const uint8_t* data, uint8_t n) {
+    int pos = 0;
+    buf[0] = '\0';
+    for (uint8_t i = 0; i < n && pos < (int)bufSize; i++) {
+        int written = snprintf(buf + pos, bufSize - pos, i > 0 ? " %02X" : "%02X", data[i]);
+        if (written < 0) {
+            break;
+        }
+        pos += written;
     }
-    return s;
 }
 
 static void imageWriteLogReset(void) {
@@ -1819,7 +1829,7 @@ static void imageWriteLogReset(void) {
 static void imageWriteLogStart(uint32_t totalBytes) {
     imgLogTotalBytes = totalBytes;
     imgLogStartMs = millis();
-    writeSerial("DW start: " + String(totalBytes) + " bytes expected", true);
+    od_log_debug("DW start: %u bytes expected", (unsigned)totalBytes);
 }
 
 static void imageWriteLogChunk(const uint8_t* data, uint16_t len) {
@@ -1828,10 +1838,12 @@ static void imageWriteLogChunk(const uint8_t* data, uint16_t len) {
     imgLogLastHeadLen = (len < sizeof(imgLogLastHead)) ? (uint8_t)len : (uint8_t)sizeof(imgLogLastHead);
     memcpy(imgLogLastHead, data, imgLogLastHeadLen);
     if (imgLogChunks == 1) {
-        writeSerial("DW frame 1: " + String(len) + " bytes: " + imgLogHex(imgLogLastHead, imgLogLastHeadLen), true);
+        char hex[64];
+        imgLogHex(hex, sizeof(hex), imgLogLastHead, imgLogLastHeadLen);
+        od_log_debug("DW frame 1: %u bytes: %s", len, hex);
         if (len > 0 && imgLogTotalBytes > 0) {
             uint32_t est = (imgLogTotalBytes + len - 1) / len;
-            writeSerial("DW expecting ~" + String(est) + " chunks", true);
+            od_log_debug("DW expecting ~%u chunks", (unsigned)est);
         }
     }
 }
@@ -1843,19 +1855,22 @@ static void imageWriteLogProgress(uint32_t written, uint32_t total) {
     uint8_t step = (uint8_t)(pct / 5u);
     if (step <= imgLogLastStep) return;
     imgLogLastStep = step;
-    writeSerial("DW " + String(pct) + "% (" + String(imgLogChunks) + " chunks, " +
-                String(written) + "/" + String(total) + " bytes)", true);
+    od_log_debug("DW %u%% (%u chunks, %u/%u bytes)", (unsigned)pct, (unsigned)imgLogChunks, (unsigned)written, (unsigned)total);
 }
 
 static void imageWriteLogFinish(uint32_t written, uint32_t total) {
-    writeSerial("DW final frame " + String(imgLogChunks) + ": " + String(imgLogLastLen) +
-                " bytes: " + imgLogHex(imgLogLastHead, imgLogLastHeadLen), true);
+    char hex[64];
+    imgLogHex(hex, sizeof(hex), imgLogLastHead, imgLogLastHeadLen);
+    od_log_debug("DW final frame %u: %u bytes: %s", (unsigned)imgLogChunks, imgLogLastLen, hex);
     uint32_t elapsedMs = millis() - imgLogStartMs;   // unsigned wrap-safe over one stream
-    String rate = "n/a";
-    if (elapsedMs > 0) rate = String((float)written / 1.024f / (float)elapsedMs, 1);  // bytes/ms /1.024 = KB/s
-    writeSerial("DW complete: " + String(imgLogChunks) + " chunks, " +
-                String(written) + "/" + String(total) + " bytes, " +
-                String(elapsedMs / 1000.0f, 2) + " s, " + rate + " KB/s", true);
+    if (elapsedMs > 0) {
+        float rate = (float)written / 1.024f / (float)elapsedMs;  // bytes/ms /1.024 = KB/s
+        od_log_debug("DW complete: %u chunks, %u/%u bytes, %.2f s, %.1f KB/s",
+                    (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, elapsedMs / 1000.0f, rate);
+    } else {
+        od_log_debug("DW complete: %u chunks, %u/%u bytes, %.2f s, n/a KB/s",
+                    (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, elapsedMs / 1000.0f);
+    }
 }
 
 bool imageWriteLogQuietCmd(void) {
@@ -2026,7 +2041,7 @@ static void directWriteActivatePanel(void) {
 #ifdef BBEP_T133A01
     if (e1004_panel_used()) {
         if (!e1004_begin_plane()) {
-            writeSerial("ERROR: E1004 dual-CS plane open failed", true);
+            od_log_error("ERROR: E1004 dual-CS plane open failed");
         }
     } else
 #endif
@@ -2304,18 +2319,12 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     int refreshMode = REFRESH_FULL;
     if (data != nullptr && len >= 1 && data[0] == 1) refreshMode = REFRESH_FAST;
     if (e1004_panel_used()) refreshMode = REFRESH_FULL;  // fast re-init would wipe RAM
-    writeSerial("EPD refresh: ", false);
-    writeSerial(refreshMode == REFRESH_FAST ? "FAST" : "FULL", false);
-    writeSerial(" (mode=", false);
-    writeSerial(String(refreshMode), false);
-    writeSerial(", end payload ", false);
+    const char* modeName = (refreshMode == REFRESH_FAST) ? "FAST" : "FULL";
     if (data != nullptr && len > 0) {
-        writeSerial("0x", false);
-        writeSerial(String(data[0], HEX), false);
+        od_log_info("EPD refresh: %s (mode=%d, end payload 0x%02X)", modeName, refreshMode, data[0]);
     } else {
-        writeSerial("none (auto)", false);
+        od_log_info("EPD refresh: %s (mode=%d, end payload none (auto))", modeName, refreshMode);
     }
-    writeSerial(")", true);
     uint8_t ackResponse[] = {0x00, endOpcode};
     sendResponse(ackResponse, sizeof(ackResponse));
     delay(20);
@@ -3019,7 +3028,8 @@ static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
 static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool final) {
     od_zlib_status_t status = od_zlib_stream_push(data, len, final);
     if (status == OD_ZLIB_STATUS_ERROR) {
-        writeSerial(String("zlib stream error: ") + od_zlib_stream_error(), true);
+        const char* zlibErr = od_zlib_stream_error();
+        od_log_error("zlib stream error: %s", zlibErr);
         return false;
     }
 
@@ -3055,7 +3065,8 @@ static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool 
             }
             return true;
         }
-        writeSerial(String("zlib stream error: ") + od_zlib_stream_error(), true);
+        const char* zlibErr = od_zlib_stream_error();
+        od_log_error("zlib stream error: %s", zlibErr);
         return false;
     }
 }
@@ -3063,7 +3074,8 @@ static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool 
 static bool zlib_stream_to_partial_write(const uint8_t* data, uint32_t len, bool final) {
     od_zlib_status_t status = od_zlib_stream_push(data, len, final);
     if (status == OD_ZLIB_STATUS_ERROR) {
-        writeSerial(String("partial zlib stream error: ") + od_zlib_stream_error(), true);
+        const char* zlibErr = od_zlib_stream_error();
+        od_log_error("partial zlib stream error: %s", zlibErr);
         return false;
     }
 
@@ -3074,7 +3086,8 @@ static bool zlib_stream_to_partial_write(const uint8_t* data, uint32_t len, bool
         if (status == OD_ZLIB_STATUS_OUTPUT_READY) continue;
         if (status == OD_ZLIB_STATUS_NEEDS_INPUT) return !final;
         if (status == OD_ZLIB_STATUS_DONE) return partialCtx.bytes_written == partialCtx.expected_stream_size;
-        writeSerial(String("partial zlib stream error: ") + od_zlib_stream_error(), true);
+        const char* zlibErr = od_zlib_stream_error();
+        od_log_error("partial zlib stream error: %s", zlibErr);
         return false;
     }
 }
@@ -3133,16 +3146,15 @@ static bool partial_trigger_refresh(int refreshMode) {
 static void partial_prepare_panel_ram(void) {
     // Delta in ms since function entry, to profile where prep wall-clock goes.
     uint32_t t0 = millis();
-    writeSerial("[+" + String(millis() - t0) + "ms] EPD partial start: acquire panel session", true);
+    od_log_debug("[+%ums] EPD partial start: acquire panel session", (unsigned)(millis() - t0));
     // Acquire subsumes pwrmgm(true) + bbepInitIO + bbepWakeUp + init-seq resend.
     // Warm re-acquire skips the ~900 ms rail bring-up + bbepInitIO (Phase 1).
     bool cold = epdSessionAcquire(true);
-    writeSerial("[+" + String(millis() - t0) + "ms] after epdSessionAcquire (" +
-                String(cold ? "cold" : "warm") + ")", true);
+    od_log_debug("[+%ums] after epdSessionAcquire (%s)", (unsigned)(millis() - t0), cold ? "cold" : "warm");
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (fastepd_driver_used()) {
         fastepd_partial_prepare(partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
-        writeSerial("[+" + String(millis() - t0) + "ms] FastEPD partial prepare done", true);
+        od_log_debug("[+%ums] FastEPD partial prepare done", (unsigned)(millis() - t0));
         return;
     }
 #endif
@@ -3157,22 +3169,15 @@ static void partial_prepare_panel_ram(void) {
     if (!fullFrame) {
         bbepFill(&bbep, BBEP_WHITE, PLANE_1);
         bbepFill(&bbep, BBEP_WHITE, PLANE_0);
-        writeSerial("[+" + String(millis() - t0) + "ms] after fills (ran: sub-rect)", true);
+        od_log_debug("[+%ums] after fills (ran: sub-rect)", (unsigned)(millis() - t0));
     } else {
-        writeSerial("[+" + String(millis() - t0) + "ms] fills skipped (full-frame rect)", true);
+        od_log_debug("[+%ums] fills skipped (full-frame rect)", (unsigned)(millis() - t0));
     }
 }
 
 static bool partial_write_to_panel(int refreshMode) {
-    writeSerial("EPD refresh: PARTIAL (raw rect ", false);
-    writeSerial(String(partialCtx.x), false);
-    writeSerial(",", false);
-    writeSerial(String(partialCtx.y), false);
-    writeSerial(" ", false);
-    writeSerial(String(partialCtx.width), false);
-    writeSerial("x", false);
-    writeSerial(String(partialCtx.height), false);
-    writeSerial(")", true);
+    od_log_info("EPD refresh: PARTIAL (raw rect %u,%u %ux%u)",
+                partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
 
     if (partialCtx.bytes_written != partialCtx.expected_stream_size) return false;
     epdRefreshInProgress = true;
