@@ -92,7 +92,7 @@ public:
             if (!quiet) {
                 // One-line RX log, mirroring the "BLE: TX ..." response log.
                 uint16_t cmd = (len >= 2) ? ((data[0] << 8) | data[1]) : data[0];
-                char line[160];
+                char line[160] = {0};
                 int pos = snprintf(line, sizeof(line), "BLE: RX 0x%04X (%u B):", cmd, (unsigned)len);
                 if (pos < 0) {
                     pos = 0;
