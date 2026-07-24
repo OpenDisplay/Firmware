@@ -131,9 +131,7 @@ uint8_t ledFlashPosition = 0;  // Current position in LED flash pattern group
 uint8_t activeLedInstance = 0xFF;  // LED instance index for flashing (0xFF = none configured)
 bool ledFlashActive = false;  // Flag to indicate if LED flashing is active (set by command)
 
-uint8_t staticWhiteRow[680];
 uint8_t staticRowBuffer[BOOT_ROW_BUFFER_SIZE];
-char staticLineBuffer[256];
 
 char wifiSsid[33] = {0};  // 32 bytes + null terminator
 char wifiPassword[33] = {0};  // 32 bytes + null terminator

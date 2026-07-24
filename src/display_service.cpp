@@ -595,9 +595,7 @@ void cleanupPartialWriteOnDisconnect(void) {
 #define FONT_SMALL_THRESHOLD 264
 
 extern const uint8_t writelineFont[] PROGMEM;
-extern uint8_t staticWhiteRow[680];
 extern uint8_t staticRowBuffer[BOOT_ROW_BUFFER_SIZE];
-extern char staticLineBuffer[256];
 
 int bbepSetPanelType(BBEPDISP *pBBEP, int iPanel);
 void bbepSetRotation(BBEPDISP *pBBEP, int iRotation);
