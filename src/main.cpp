@@ -496,9 +496,9 @@ void idleDelay(uint32_t delayMs) {
 void fullSetupAfterConnection() {
     writeSerial("=== Full Setup After Connection ===");
     initWiFi(false);
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (globalConfig.display_count > 0 && seeed_driver_used()) {
-        writeSerial("Panel: Seeed ED103 (bb_epaper not used)", true);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (globalConfig.display_count > 0 && fastepd_driver_used()) {
+        writeSerial("Panel: FastEPD ED103/IT8951 (bb_epaper not used)", true);
         writeSerial("=== Full setup completed ===");
         return;
     }
@@ -647,10 +647,10 @@ void pwrmgm(bool onoff){
             digitalWrite(48, HIGH);
         }
     }
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    const bool seeed_driver_spi = seeed_driver_used();
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    const bool fastepd_driver_spi = fastepd_driver_used();
 #else
-    const bool seeed_driver_spi = false;
+    const bool fastepd_driver_spi = false;
 #endif
     const DisplayConfig& disp = globalConfig.displays[0];
     if (onoff) {
@@ -660,7 +660,7 @@ void pwrmgm(bool onoff){
         } else {
             writeSerial("Power pin not set");
         }
-        if (!seeed_driver_spi) {
+        if (!fastepd_driver_spi) {
             if (disp.reset_pin != 0xFF) {
                 pinMode(disp.reset_pin, OUTPUT);
                 digitalWrite(disp.reset_pin, HIGH);
@@ -694,7 +694,7 @@ void pwrmgm(bool onoff){
         }
         initOrRestoreWireForOpenDisplay();
     } else {
-        if (!seeed_driver_spi) {
+        if (!fastepd_driver_spi) {
             SPI.end();
         }
         // Keep I2C alive when sensors/touch use data_bus[0] (e.g. reTerminal MISC_I2C on GPIO0/1).

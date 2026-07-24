@@ -13,8 +13,8 @@
 #include "boot_screen.h"
 #include "touch_input.h"
 #include "uzlib.h"
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-#include "display_seeed_gfx.h"
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+#include "display_fastepd.h"
 #endif
 
 #ifdef TARGET_NRF
@@ -347,9 +347,9 @@ static bool epdSessionInitWasPartial = false;
 // Not consulted for fill-skip in Phase 1 (full-frame skip is unconditional-safe).
 static bool epdPlanesPrepared = false;
 
-static bool epdSessionUsesSeeed(void) {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    return seeed_driver_used();
+static bool epdSessionUsesFastepd(void) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    return fastepd_driver_used();
 #else
     return false;
 #endif
@@ -397,12 +397,12 @@ static void pwrmgmLockGive(void) {
 static void epdSessionForceOffLocked(void) {
     if (pwrmgmState == PWR_OFF) return;   // idempotent
     writeSerial("[EPD session] force off", true);
-    if (epdSessionUsesSeeed()) {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        seeed_gfx_direct_sleep();
+    if (epdSessionUsesFastepd()) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+        fastepd_direct_sleep();
         // Rail is about to drop: force the next push to fully re-init the TCON
         // rather than wake() a power-cycled IT8951 (garbled refresh otherwise).
-        seeed_gfx_mark_hw_deinitialized();
+        fastepd_mark_hw_deinitialized();
 #endif
     } else {
         bbepSleep(&bbep, 1);
@@ -420,7 +420,7 @@ static bool epdSessionAcquire(bool partialInit) {
     if (pwrmgmState == PWR_OFF) {
         writeSerial("[EPD session] acquire: COLD bring-up", true);
         pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
-        if (!epdSessionUsesSeeed()) {
+        if (!epdSessionUsesFastepd()) {
             const DisplayConfig& d = globalConfig.displays[0];
 #ifdef BBEP_T133A01
             if (e1004_panel_used()) {
@@ -447,7 +447,7 @@ static bool epdSessionAcquire(bool partialInit) {
         pwrmgmOffDeadlineMs = 0;   // cancel keep-alive
         // Phase 1: full re-init on warm re-acquire (HW reset => registers identical
         // to cold, safest). Phase 2a will skip bbepWakeUp + resend only on change.
-        if (!epdSessionUsesSeeed()) {
+        if (!epdSessionUsesFastepd()) {
 #ifdef BBEP_T133A01
             if (e1004_panel_used()) {
                 epdSessionInitWasPartial = false;
@@ -687,8 +687,8 @@ int mapEpd(int id){
     }
 }
 
-bool seeed_driver_used(void) {
-#if !defined(TARGET_ESP32) || !defined(OPENDISPLAY_SEEED_GFX)
+bool fastepd_driver_used(void) {
+#if !defined(TARGET_ESP32) || !defined(OPENDISPLAY_FASTEPD)
     return false;
 #else
     if (globalConfig.display_count < 1) return false;
@@ -717,8 +717,8 @@ uint8_t e1004_cs2_pin(void) {
 }
 
 bool waitforrefresh(int timeout){
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) return seeed_gfx_wait_refresh(timeout);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) return fastepd_wait_refresh(timeout);
 #endif
     if (e1004_panel_used() && !bbepIsBusy(&bbep)) {
         // bbepRefresh already waited; idle here means refresh finished.
@@ -1533,19 +1533,16 @@ static void renderChar_1BPP(uint8_t* rowBuffer, const uint8_t* fontData, int fon
 void initDisplay(){
     writeSerial("=== Initializing Display ===", true);
     if(globalConfig.display_count > 0){
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
         pwrmgm(true);
-        writeSerial("Display: Seeed_GFX (panel_ic " + String(globalConfig.displays[0].panel_ic_type) + ", " +
+        writeSerial("Display: FastEPD IT8951 (panel_ic " + String(globalConfig.displays[0].panel_ic_type) + ", " +
                     String(globalConfig.displays[0].pixel_width) + "x" + String(globalConfig.displays[0].pixel_height) + ", " +
                     String(getBitsPerPixel()) + " bpp)", true);
-        seeed_gfx_epaper_begin();
-        if (opnd_seeed_tcon_busy_timeout_occurred()) {
-            writeSerial("Seeed_GFX init failed (TCON busy timeout) — skipping boot refresh", true);
-            // begin() sets seeed_gfx_hw_initialized=true even on TCON timeout; clear it
-            // so the next push takes the full begin() path. Raw pwrmgm(false) (not
-            // ForceOff): don't send sleep to a TCON that just timed out on BUSY.
-            seeed_gfx_mark_hw_deinitialized();
+        fastepd_epaper_begin();
+        if (fastepd_init_failed()) {
+            writeSerial("FastEPD init failed — skipping boot refresh", true);
+            fastepd_mark_hw_deinitialized();
             pwrmgm(false);
             return;
         }
@@ -1553,17 +1550,13 @@ void initDisplay(){
         writeSerial(String("Width: ") + String(globalConfig.displays[0].pixel_width), true);
         if (! (globalConfig.displays[0].transmission_modes & OD_TRANSMISSION_MODE_CLEAR_ON_BOOT)){
             writeBootScreenWithQr();
-            writeSerial("EPD refresh: FULL (boot, Seeed)", true);
+            writeSerial("EPD refresh: FULL (boot, FastEPD)", true);
             touchSuspendForEpdRefresh();
-            seeed_gfx_full_update();
+            fastepd_full_update();
             waitforrefresh(60);
-            // Boot ends PWR_OFF (no keep-alive at boot). ForceOff sleeps the TCON
-            // (+ clears the Seeed hw-init flag, Commit 5) and cuts the rail.
             epdSessionForceOff();
             touchResumeAfterEpdRefresh();
         } else {
-            // CLEAR_ON_BOOT: begin() succeeded (hw flag true) but the rail is being
-            // cut — ForceOff sleeps the TCON, clears the hw flag, and cuts the rail.
             epdSessionForceOff();
         }
     } else
@@ -1631,7 +1624,7 @@ int getplane() {
 }
 
 int getBitsPerPixel() {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (globalConfig.display_count > 0 &&
         globalConfig.displays[0].panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY) {
         return 4;
@@ -1898,11 +1891,11 @@ bool handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
 }
 
 // True when the active display uses the bb_epaper 4-gray scheme (two 1-bit
-// controller planes). The Seeed driver path has its own 4bpp handling.
+// controller planes). The FastEPD IT8951 path has its own 4bpp handling.
 static inline bool directWriteIsGray4(void) {
     return (globalConfig.displays[0].color_scheme == OD_COLOR_SCHEME_GRAY4)
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        && !seeed_driver_used()
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+        && !fastepd_driver_used()
 #endif
         ;
 }
@@ -2025,9 +2018,9 @@ static void directWriteActivatePanel(void) {
     // full-frame direct write does not preserve partial plane consistency.
     epdSessionAcquire(false);
     epdPlanesPrepared = false;
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
-        seeed_gfx_direct_write_reset();
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_direct_write_reset();
     } else
 #endif
 #ifdef BBEP_T133A01
@@ -2055,9 +2048,9 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     imageWriteLogReset();
     touchSuspendForEpdRefresh();
     directWriteTouchSuspended = true;
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
-        seeed_gfx_prepare_hardware();
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_prepare_hardware();
     }
 #endif
     bool compressed = (len >= 4);
@@ -2220,9 +2213,9 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
     uint32_t remainingBytes = (directWriteBytesWritten < directWriteTotalBytes) ? (directWriteTotalBytes - directWriteBytesWritten) : 0;
     uint16_t bytesToWrite = (len > remainingBytes) ? remainingBytes : len;
     if (bytesToWrite > 0) {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        if (seeed_driver_used()) {
-            seeed_gfx_direct_write_chunk(data, bytesToWrite);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+        if (fastepd_driver_used()) {
+            fastepd_direct_write_chunk(data, bytesToWrite);
             directWriteBytesWritten += bytesToWrite;
         } else
 #endif
@@ -2331,11 +2324,11 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     uint32_t newEtag = 0;
     bool hasNewEtag = data != nullptr && len >= 5;
     if (hasNewEtag) newEtag = parse_be_u32(data + 1);
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
-        seeed_gfx_direct_refresh(refreshMode);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_direct_refresh(refreshMode);
         refreshSuccess = waitforrefresh(60);
-        seeed_gfx_direct_sleep();
+        // No sleep here: cleanupDirectWriteState releases the session (warm or ForceOff).
     } else
 #endif
     {
@@ -2389,7 +2382,7 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
 // 0x0082 END carries the refresh selector (0->FULL,1->FAST,2/absent->PARTIAL) and
 // new_etag [refresh:1][new_etag:4 BE], driving partial_write_to_panel().
 // START NACK codes: 0x01 len/ver, 0x02 unknown flag, 0x03 size mismatch,
-// 0x05 ETAG_MISMATCH (partial), 0x06 PARTIAL_UNSUPPORTED (partial, bpp!=1/seeed),
+// 0x05 ETAG_MISMATCH (partial), 0x06 PARTIAL_UNSUPPORTED (partial, bpp!=1/E1004),
 // 0x07 RECT_INVALID (partial, zero/OOB/misaligned rect). Any partial START NACK
 // at the geometry/etag stages clears displayed_etag (parity with 0x76).
 // ===========================================================================
@@ -2518,9 +2511,9 @@ static bool pipeConsumePayload(uint8_t* data, uint16_t len) {
                        ? (directWriteTotalBytes - directWriteBytesWritten) : 0;
     uint16_t toWrite = (len > remaining) ? (uint16_t)remaining : len;
     if (toWrite > 0) {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        if (seeed_driver_used()) {
-            seeed_gfx_direct_write_chunk(data, toWrite);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+        if (fastepd_driver_used()) {
+            fastepd_direct_write_chunk(data, toWrite);
             directWriteBytesWritten += toWrite;
         } else
 #endif
@@ -2583,8 +2576,9 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
         // the same checks the 0x76 handler runs (bpp, etag, bounds, alignment).
         uint16_t dispW = globalConfig.displays[0].pixel_width;
         uint16_t dispH = globalConfig.displays[0].pixel_height;
-        // 5: two 1bpp controller planes are the partial mechanism; seeed/IT8951 has no equivalent.
-        if (getBitsPerPixel() != 1 || seeed_driver_used() || e1004_panel_used()) {
+        // 5: partial uses two 1bpp planes (old+new). FastEPD IT8951 accepts that stream
+        // and applies a row-band update; 2bpp+/E1004 remain unsupported.
+        if (getBitsPerPixel() != 1 || e1004_panel_used()) {
             displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_PARTIAL_UNSUPPORTED); return;
         }
         // 6: etag gate — nonzero and must match what is currently on the panel.
@@ -2696,9 +2690,9 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     imageWriteLogReset();
     touchSuspendForEpdRefresh();
     directWriteTouchSuspended = true;
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
-        seeed_gfx_prepare_hardware();
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_prepare_hardware();
     }
 #endif
     directWriteDecompressedTotal = total_size;   // compressed zlib reset + overflow guard
@@ -3033,9 +3027,9 @@ static bool zlib_stream_to_direct_write(const uint8_t* data, uint32_t len, bool 
         size_t bytesOut = 0;
         status = od_zlib_stream_poll(decompressionChunk, OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE, &bytesOut);
         if (bytesOut > 0) {
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-            if (seeed_driver_used()) {
-                seeed_gfx_direct_write_chunk(decompressionChunk, (uint32_t)bytesOut);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+            if (fastepd_driver_used()) {
+                fastepd_direct_write_chunk(decompressionChunk, (uint32_t)bytesOut);
                 directWriteBytesWritten += (uint32_t)bytesOut;
             } else
 #endif
@@ -3086,6 +3080,17 @@ static bool zlib_stream_to_partial_write(const uint8_t* data, uint32_t len, bool
 }
 
 static bool partial_write_stream_bytes(uint8_t* data, uint32_t len) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        if (partialCtx.bytes_written > partialCtx.expected_stream_size ||
+            len > partialCtx.expected_stream_size - partialCtx.bytes_written) {
+            return false;
+        }
+        if (!fastepd_partial_write_chunk(data, len)) return false;
+        partialCtx.bytes_written += len;
+        return true;
+    }
+#endif
     uint32_t offset = 0;
     while (offset < len) {
         if (partialCtx.bytes_written >= partialCtx.expected_stream_size) return false;
@@ -3134,6 +3139,13 @@ static void partial_prepare_panel_ram(void) {
     bool cold = epdSessionAcquire(true);
     writeSerial("[+" + String(millis() - t0) + "ms] after epdSessionAcquire (" +
                 String(cold ? "cold" : "warm") + ")", true);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_partial_prepare(partialCtx.x, partialCtx.y, partialCtx.width, partialCtx.height);
+        writeSerial("[+" + String(millis() - t0) + "ms] FastEPD partial prepare done", true);
+        return;
+    }
+#endif
     // The two white fills guarantee PLANE_0 == PLANE_1 OUTSIDE the rect so uninit
     // controller RAM can't flash noise during MASTER_ACTIVATE. A full-frame rect's
     // enforced plane_size*2 stream overwrites 100% of both planes, so there is no
@@ -3163,9 +3175,16 @@ static bool partial_write_to_panel(int refreshMode) {
     writeSerial(")", true);
 
     if (partialCtx.bytes_written != partialCtx.expected_stream_size) return false;
-//    delay(20);  THIS DELAY IS UNNEEDED
     epdRefreshInProgress = true;
-    bool refreshSuccess = partial_trigger_refresh(refreshMode);
+    bool refreshSuccess = false;
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        refreshSuccess = fastepd_partial_refresh(refreshMode);
+    } else
+#endif
+    {
+        refreshSuccess = partial_trigger_refresh(refreshMode);
+    }
     epdRefreshInProgress = false;
     // A successful partial refresh leaves both controller planes consistent.
     if (refreshSuccess) epdPlanesPrepared = true;
