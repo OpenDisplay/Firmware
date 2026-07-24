@@ -9,6 +9,7 @@
 #include "touch_input.h"
 #include "encryption.h"
 #include "ble_init.h"
+#include "od_log.h"
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
 #include <HardwareSerial.h>
@@ -53,6 +54,11 @@ void setup() {
     #elif !defined(DISABLE_USB_SERIAL)
     Serial.begin(115200);
     delay(100);
+    #endif
+    #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
+    od_log_init(&LogSerialPort);
+    #elif !defined(DISABLE_USB_SERIAL)
+    od_log_init(&Serial);
     #endif
     writeSerial("=== FIRMWARE INFO ===");
     writeSerial("Firmware Version: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()));
@@ -155,6 +161,14 @@ void setup() {
     lastActivityMs = millis();
     #endif
     writeSerial("=== Setup completed successfully ===");
+}
+
+uint32_t getDeepSleepCount() {
+#ifdef TARGET_ESP32
+    return deep_sleep_count;
+#else
+    return 0;
+#endif
 }
 
 #ifdef TARGET_ESP32
