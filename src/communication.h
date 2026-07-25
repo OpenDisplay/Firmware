@@ -8,6 +8,7 @@ void sendResponse(uint8_t* response, uint16_t len);
 uint16_t calculateCRC16CCITT(uint8_t* data, uint32_t len);
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
+uint8_t getFirmwarePatch();
 const char* getFirmwareShaString();
 void handleFirmwareVersion();
 void handleReadMSD();

@@ -7,8 +7,8 @@ it to /config.bin when none is stored.
 
 Examples:
   ./tools/provision_firmware.py build -e nrf52840custom --config-hex "BD 00 01 ..."
-  ./tools/provision_firmware.py build --env nrf52840custom --version 1.4
-  ./tools/provision_firmware.py build --env nrf52840custom --version 1.4 --upload
+  ./tools/provision_firmware.py build --env nrf52840custom --version 1.4.0
+  ./tools/provision_firmware.py build --env nrf52840custom --version 1.4.0 --upload
   ./tools/provision_firmware.py clear --env nrf52840custom --upload
 """
 
@@ -101,7 +101,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--version",
         metavar="VER",
-        help='Firmware BUILD_VERSION string (major.minor, e.g. "1.4")',
+        help='Firmware BUILD_VERSION string (major.minor.patch, e.g. "1.4.0"; two-part "1.4" implies patch 0)',
     )
     parser.add_argument(
         "--sha",

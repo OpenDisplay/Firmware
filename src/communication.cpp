@@ -82,7 +82,7 @@ static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
 /** Mirror responses to BLE only when a central is connected; LAN already got send_wifi_lan_frame. */
 static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
     if (len > MAX_RESPONSE_SIZE) {
-        od_log_error("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE) + ")", true);
+        od_log_error("ERROR: Response too large for queue (%u > %u)", len, MAX_RESPONSE_SIZE);
         return;
     }
     if (pServer == nullptr || pServer->getConnectedCount() == 0) {
@@ -97,7 +97,10 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
     responseQueue[responseQueueHead].len = len;
     responseQueue[responseQueueHead].pending = true;
     responseQueueHead = nextHead;
-    if (!quiet) od_log_debug("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE) + ")", true);
+    if (!quiet) {
+        uint8_t queueSize = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
+        od_log_debug("ESP32: Response queued (queue size: %u)", queueSize);
+    }
 }
 #endif
 
@@ -106,7 +109,7 @@ extern BLECharacteristic imageCharacteristic;
 #endif
 
 #ifndef BUILD_VERSION
-#define BUILD_VERSION "1.0"
+#define BUILD_VERSION "1.0.0"
 #endif
 #ifndef SHA
 #define SHA ""
@@ -118,6 +121,42 @@ extern BLECharacteristic imageCharacteristic;
 static constexpr uint8_t FIRMWARE_SHA_HEX_BYTES = 40;
 static const char kFirmwareShaPlaceholder[FIRMWARE_SHA_HEX_BYTES + 1] =
     "0000000000000000000000000000000000000000";
+
+// BUILD_VERSION is major.minor or major.minor.patch (optional leading 'v').
+// Two-part tags imply patch 0. Component index: 0=major, 1=minor, 2=patch.
+static uint8_t parseFirmwareVersionComponent(unsigned index) {
+    const char* v = BUILD_VERSION;
+    if (v == nullptr || v[0] == '\0') {
+        return 0;
+    }
+    if (v[0] == '"') {
+        v++;
+    }
+    while (*v == ' ' || *v == 'v' || *v == 'V') {
+        v++;
+    }
+    for (unsigned i = 0; i < index; i++) {
+        while (*v >= '0' && *v <= '9') {
+            v++;
+        }
+        if (*v != '.') {
+            return 0;
+        }
+        v++;
+    }
+    if (*v < '0' || *v > '9') {
+        return 0;
+    }
+    unsigned n = 0;
+    while (*v >= '0' && *v <= '9') {
+        n = n * 10U + (unsigned)(*v - '0');
+        if (n > 255U) {
+            return 255;
+        }
+        v++;
+    }
+    return (uint8_t)n;
+}
 
 // Builds "<label><space-separated %02X bytes, up to 32><' ...' if truncated>" into buf.
 static void buildHexDump(char* buf, size_t bufSize, const char* label, const uint8_t* data, uint16_t len) {
@@ -292,29 +331,15 @@ uint16_t calculateCRC16CCITT(uint8_t* data, uint32_t len) {
 }
 
 uint8_t getFirmwareMajor() {
-    String version = String(BUILD_VERSION);
-    version.trim();
-    if (version.length() == 0) {
-        return 0;
-    }
-    int dotIndex = version.indexOf('.');
-    if (dotIndex > 0) {
-        return version.substring(0, dotIndex).toInt();
-    }
-    return 0;
+    return parseFirmwareVersionComponent(0);
 }
 
 uint8_t getFirmwareMinor() {
-    String version = String(BUILD_VERSION);
-    version.trim();
-    if (version.length() == 0) {
-        return 0;
-    }
-    int dotIndex = version.indexOf('.');
-    if (dotIndex > 0 && dotIndex < (int)(version.length() - 1)) {
-        return version.substring(dotIndex + 1).toInt();
-    }
-    return 0;
+    return parseFirmwareVersionComponent(1);
+}
+
+uint8_t getFirmwarePatch() {
+    return parseFirmwareVersionComponent(2);
 }
 
 const char* getFirmwareShaString() {
@@ -324,6 +349,7 @@ const char* getFirmwareShaString() {
 void handleFirmwareVersion() {
     uint8_t major = getFirmwareMajor();
     uint8_t minor = getFirmwareMinor();
+    uint8_t patch = getFirmwarePatch();
     String shaStr = String(getFirmwareShaString());
     if (shaStr.length() >= 2 && shaStr.charAt(0) == '"' && shaStr.charAt(shaStr.length() - 1) == '"') {
         shaStr = shaStr.substring(1, shaStr.length() - 1);
@@ -333,15 +359,13 @@ void handleFirmwareVersion() {
     if (noShaCompiled) {
         shaStr = kFirmwareShaPlaceholder;
     }
-    if (String(BUILD_VERSION).length() == 0) {
-        major = 0;
-        minor = 0;
-    }
-    od_log_info("Firmware version: %u.%u", major, minor);
+    od_log_info("Firmware version: %u.%u.%u", major, minor, patch);
     od_log_info("SHA: %s", shaStr.c_str());
     uint8_t shaLen = shaStr.length();
     if (shaLen > 40) shaLen = 40;
-    uint8_t response[2 + 1 + 1 + 1 + 40];
+    // [ACK][0x43][major][minor][shaLen][sha…][patch] — patch is trailing so
+    // old hosts that stop after SHA keep working.
+    uint8_t response[2 + 1 + 1 + 1 + 40 + 1];
     uint16_t offset = 0;
     response[offset++] = RESP_ACK;
     response[offset++] = RESP_FIRMWARE_VERSION;
@@ -351,6 +375,7 @@ void handleFirmwareVersion() {
     for (uint8_t i = 0; i < shaLen && i < 40; i++) {
         response[offset++] = shaStr.charAt(i);
     }
+    response[offset++] = patch;
     sendResponse(response, offset);
 }
 

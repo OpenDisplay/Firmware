@@ -24,6 +24,7 @@ extern uint8_t staticRowBuffer[BOOT_ROW_BUFFER_SIZE];
 String getChipIdHex();
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
+uint8_t getFirmwarePatch();
 int getBitsPerPixel();
 int getplane();
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
@@ -706,10 +707,12 @@ bool writeBootScreenWithQr() {
     char fwLine[32];
     if (useZoneLayout) {
         snprintf(nameLine, sizeof(nameLine), "ID:   OD%s", last6.c_str());
-        snprintf(fwLine, sizeof(fwLine), "FW:   OD ver %u.%u", (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor());
+        snprintf(fwLine, sizeof(fwLine), "FW:   OD ver %u.%u.%u",
+                 (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor(), (unsigned)getFirmwarePatch());
     } else {
         snprintf(nameLine, sizeof(nameLine), "OD%s", last6.c_str());
-        snprintf(fwLine, sizeof(fwLine), "FW:O %u.%u", (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor());
+        snprintf(fwLine, sizeof(fwLine), "FW:O %u.%u.%u",
+                 (unsigned)getFirmwareMajor(), (unsigned)getFirmwareMinor(), (unsigned)getFirmwarePatch());
     }
     char k1[24], k2[24];
     if (useZoneLayout) {

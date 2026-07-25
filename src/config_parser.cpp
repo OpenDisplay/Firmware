@@ -183,7 +183,7 @@ bool loadConfig(uint8_t* configData, uint32_t* len){
     config_header_t header;
     size_t bytesRead = file.read((uint8_t*)&header, sizeof(header));
     if (bytesRead != sizeof(header)) {
-        od_log_error("ERROR: Failed to read config header (expected " + String(sizeof(header)) + ", got " + String(bytesRead) + ")");
+        od_log_error("ERROR: Failed to read config header (expected %u, got %u)", (unsigned)sizeof(header), (unsigned)bytesRead);
         file.close();
         return false;
     }
@@ -208,7 +208,7 @@ bool loadConfig(uint8_t* configData, uint32_t* len){
     bytesRead = file.read(configData, header.data_len);
     file.close();
     if (bytesRead != header.data_len) {
-        od_log_error("ERROR: Failed to read complete config data (expected " + String(header.data_len) + ", read " + String(bytesRead) + ")");
+        od_log_error("ERROR: Failed to read complete config data (expected %u, read %u)", (unsigned)header.data_len, (unsigned)bytesRead);
         return false;
     }
     uint32_t calculatedCRC = calculateConfigCRC(configData, header.data_len);

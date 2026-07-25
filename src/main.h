@@ -10,7 +10,7 @@
 #include "display_service.h"
 
 #ifndef BUILD_VERSION
-#define BUILD_VERSION "1.0"
+#define BUILD_VERSION "1.0.0"
 #endif
 #ifndef SHA
 #define SHA ""
@@ -248,6 +248,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len);
 int mapEpd(int id);
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
+uint8_t getFirmwarePatch();
 uint32_t getDeepSleepCount();  // RTC-persisted wake cycle count on ESP32; always 0 on nRF52840
 float readBatteryVoltage();  // Returns battery voltage in volts, or -1.0 if not configured
 float readChipTemperature();  // Returns chip temperature in degrees Celsius

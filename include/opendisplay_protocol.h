@@ -334,7 +334,12 @@
 /* --------------------------------------------------------------------------
  * @opcode: 0x0043   @name: CMD_FIRMWARE_VERSION   @dir: host->device
  * @request:  [0x00][0x43]  (no payload)
- * @response: [0x00][0x43][major:1][minor:1][... optional git/SHA string]
+ * @response: [0x00][0x43][major:1][minor:1][shaLen:1][sha:shaLen]
+ *            [patch:1]?
+ *            shaLen is the ASCII git/SHA byte count (0..40). Older firmware
+ *            omits [patch]; hosts MUST treat a missing trailing byte as patch 0.
+ *            Newer firmware always appends [patch] after the SHA so major.minor
+ *            and shaLen stay at the same offsets for old hosts.
  * @errors:   none
  * @state:    ALWAYS PLAINTEXT (never encrypted) so version is readable pre-auth.
  * @limits:   -

@@ -63,7 +63,8 @@ void setup() {
     od_log_info("=== FIRMWARE INFO ===");
     uint8_t fwMajor = getFirmwareMajor();
     uint8_t fwMinor = getFirmwareMinor();
-    od_log_info("Firmware Version: %u.%u", fwMajor, fwMinor);
+    uint8_t fwPatch = getFirmwarePatch();
+    od_log_info("Firmware Version: %u.%u.%u", fwMajor, fwMinor, fwPatch);
     const char* shaCStr = SHA_STRING;
     String shaStr = String(shaCStr);
     if (shaStr.length() >= 2 && shaStr.charAt(0) == '"' && shaStr.charAt(shaStr.length() - 1) == '"') {

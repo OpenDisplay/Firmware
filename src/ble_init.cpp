@@ -251,7 +251,7 @@ void ble_init_esp32(bool update_manufacturer_data) {
     od_log_info("Device name will be: %s", deviceName.c_str());
     BLEDevice::init(deviceName.c_str());
     // Preferred only: the central drives the exchange and may settle lower.
-    od_log_info("Setting preferred BLE ATT MTU to " + String(OD_BLE_PREFERRED_ATT_MTU) + "...");
+    od_log_info("Setting preferred BLE ATT MTU to %u...", (unsigned)OD_BLE_PREFERRED_ATT_MTU);
     BLEDevice::setMTU(OD_BLE_PREFERRED_ATT_MTU);
     pServer = BLEDevice::createServer();
     if (pServer == nullptr) {
