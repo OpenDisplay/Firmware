@@ -104,6 +104,15 @@ void setup() {
     od_log_info("Starting setup...");
     if (is_deep_sleep_wake) { od_log_info("[wake] >> full_config_init"); od_log_flush(); }
     full_config_init();
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Reserve mbedTLS's two ~16.7 KB record buffers HERE and nowhere else: config is
+    // loaded (so we know whether TLS is even used) but ble_init() and initWiFi() have not
+    // yet taken their ~100 KB, so internal DRAM is still contiguous. mbedtls_ssl_setup()
+    // needs both buffers contiguous and cannot be satisfied later on a churned heap --
+    // observed failing with -0x7f00 at 51 KB free / 31.7 KB largest block. No-op when
+    // encryption is disabled.
+    od_tls_reserve_records();
+#endif
     if (is_deep_sleep_wake) { od_log_info("[wake] << full_config_init >> initio"); od_log_flush(); }
     initio();
 #ifdef TARGET_NRF
@@ -129,7 +138,7 @@ void setup() {
 #elif defined(TARGET_NRF)
     ble_nrf_advertising_start();
 #endif
-    #ifdef TARGET_ESP32
+    #ifdef OPENDISPLAY_HAS_WIFI
     if (!is_deep_sleep_wake) {
         initWiFi(false);  // wake: WiFi stays deferred to fullSetupAfterConnection()
     }
@@ -223,7 +232,11 @@ static void pollActivity() {
     // Covers connect and disconnect. The disconnect edge is what re-arms the
     // window so a dropped client gets a full reconnect opportunity.
     const uint8_t connCount = (pServer != nullptr) ? (uint8_t)pServer->getConnectedCount() : 0;
+#ifdef OPENDISPLAY_HAS_WIFI
     const bool lanSession = wifiInitialized && wifiServerConnected && wifiClient.connected();
+#else
+    const bool lanSession = false;
+#endif
 
     if (!activityPrimed) {
         activityPrimed = true;
@@ -277,11 +290,15 @@ void flushResponseQueueToBle() {
             }
             responseQueue[responseQueueTail].pending = false;
             responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
-            // One line per drained response, reporting the remaining queue depth
-            // (replaces the old "Sending queued response" + "Response sent successfully").
+            // The "[BLE][Q:n] TX ..." line in sendResponse() already logs every
+            // response with its queue depth, so the nominal drain (depth back to
+            // 0) is redundant. Report only the interesting case: entries still
+            // queued after this notify, i.e. the drain is behind the producer.
             if (!quietAck) {
                 uint8_t depth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
-                od_log_debug("BLE Response Sent (queue size: %u)", depth);
+                // Only when a backlog actually forms -- a depth-0 line on every
+                // response is noise that hides the interesting case.
+                if (depth > 0) od_log_debug("BLE Response Sent (queue size: %u)", depth);
             }
             bleDrain++;
         }
@@ -304,6 +321,21 @@ void flushResponseQueueToBle() {
 static void serviceBleDisconnectCleanup() {
     if (!bleDisconnectCleanupPending || epdRefreshInProgress) return;
     bleDisconnectCleanupPending = false;
+    // BLE and LAN both raise this flag, so tear down only when the transport that
+    // OWNS the in-flight transfer is the one that went away. Otherwise a BLE
+    // disconnect kills a live LAN push (and a LAN disconnect kills a BLE push)
+    // purely because the other link dropped. Owner is recorded at START.
+#ifdef OPENDISPLAY_HAS_WIFI
+    const bool lanOwnsSession = (transferSessionOrigin() != 0);   // != ORIGIN_BLE
+    const bool ownerStillUp = lanOwnsSession
+                                  ? wifiLanClientConnected()
+                                  : (pServer != nullptr && pServer->getConnectedCount() > 0);
+    if (ownerStillUp) {
+        od_log_info("Disconnect cleanup skipped: transfer still owned by a live %s session",
+                    lanOwnsSession ? "LAN" : "BLE");
+        return;
+    }
+#endif
     // ACTIVE-only-teardown invariant: a WARM (post-successful-refresh) panel
     // SURVIVES disconnect and keeps its keep-alive window, so the cleanups below
     // no-op on power when WARM and only tear down a mid-transfer (PWR_ACTIVE)
@@ -409,6 +441,25 @@ void loop() {
         }
     }
     checkPartialWriteTimeout();
+    #ifdef OPENDISPLAY_HAS_WIFI
+    // Belt-and-braces for the transfer-scoped WIFI_PS_NONE. The suspend/restore pair is
+    // already closed by construction (restore lives in the sole clearer of each active
+    // flag), so this should never fire -- but a stuck WIFI_PS_NONE is a silent battery
+    // drain with no user-visible symptom, and a future fourth way to end a transfer
+    // would leak it. Re-arm only after the state has been quiet for a while, so a brief
+    // gap between two back-to-back pushes does not thrash the radio.
+    static uint32_t psIdleSinceMs = 0;
+    if (lanPowerSaveSuspended() && !directWriteActive && !partialWriteActive()) {
+        if (psIdleSinceMs == 0) {
+            psIdleSinceMs = millis();
+        } else if ((millis() - psIdleSinceMs) > 5000UL) {
+            od_log_warn("WARNING: WiFi power save left suspended with no transfer active - restoring");
+            lanPowerSaveRestore();
+            psIdleSinceMs = 0;
+        }
+    } else {
+        psIdleSinceMs = 0;
+    }
     // WiFi handling runs after BLE queue processing to avoid blocking
     // BLE command responses (moved from top of loop in v1.6 fix).
     handleWiFiServer();
@@ -429,7 +480,8 @@ void loop() {
             restartWiFiLanAfterReconnect();
         }
     }
-    #ifdef TARGET_ESP32
+    #endif
+    #ifdef OPENDISPLAY_HAS_WIFI
     const bool wifiLanSession = wifiInitialized && wifiServerConnected && wifiClient.connected();
     #else
     const bool wifiLanSession = false;
@@ -520,7 +572,9 @@ void idleDelay(uint32_t delayMs) {
 #ifdef TARGET_ESP32
 void fullSetupAfterConnection() {
     od_log_info("=== Full Setup After Connection ===");
+#ifdef OPENDISPLAY_HAS_WIFI
     initWiFi(false);
+#endif
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (globalConfig.display_count > 0 && fastepd_driver_used()) {
         od_log_info("Panel: FastEPD ED103/IT8951 (bb_epaper not used)");

@@ -72,8 +72,14 @@ bool imageWriteLogQuietAck(void);
 bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
 extern volatile bool epdRefreshInProgress;
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
+// True while a PARTIAL_WRITE stream is active. partialCtx is file-static, so the
+// dispatcher and loop() read the flag through here.
+bool partialWriteActive(void);
 void checkPartialWriteTimeout(void);
 void cleanupPartialWriteOnDisconnect(void);
+// Origin (see commandOrigin()) of the transport that opened the in-flight transfer.
+// A disconnect must only tear down a session its own transport owns.
+uint8_t transferSessionOrigin(void);
 int getplane();
 int getBitsPerPixel();
 

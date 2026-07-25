@@ -139,15 +139,25 @@ uint8_t wifiEncryptionType = 0;  // 0x00=none, 0x01=WEP, 0x02=WPA, 0x03=WPA2, 0x
 bool wifiConfigured = false;  // True if WiFi config packet (0x26) was received and parsed
 #ifdef TARGET_ESP32
 #include <WiFi.h>
+// Small config-storage / status globals: kept on all ESP32 targets (config_parser
+// and the config-dump report reference them regardless of whether the WiFi
+// transport is compiled in). Trivial RAM cost.
 bool wifiConnected = false;
 bool wifiInitialized = false;
 char wifiServerUrl[65] = {0};
 uint16_t wifiServerPort = 2446;
-bool wifiServerConfigured = false;
+// bool wifiServerConfigured = false;  // dead -- nothing reads it (config_parser.cpp)
+#endif
+#ifdef OPENDISPLAY_HAS_WIFI
+// Heavy WiFi-transport surface: the TCP server/client objects and the 16 KB RX
+// reassembly buffer exist ONLY when the WiFi transport is compiled in (S3/C6).
+// C3 / classic esp32-N4 reclaim this RAM.
+// 16 KB = four max wire frames (OD_LAN_MAX_FRAME 4096): headroom for the
+// streaming client to keep whole frames queued ahead of the parser.
 WiFiServer wifiServer;
 WiFiClient wifiClient;
 bool wifiServerConnected = false;
-uint8_t tcpReceiveBuffer[8192];
+uint8_t tcpReceiveBuffer[16384];
 uint32_t tcpReceiveBufferPos = 0;
 #endif
 

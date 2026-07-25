@@ -23,6 +23,7 @@ extern "C" void bootloader_util_app_start(uint32_t start_addr);
 #include "driver/gpio.h"
 #include "esp32-hal-gpio.h"
 #include "ble_init.h"          // BLEDevice/BLEServer/BLEAdvertising aliases + esp32_ble_clear_handles()
+#include "wifi_service.h"      // OPENDISPLAY_HAS_WIFI + opendisplay_lan_teardown()
 extern BLEServer* pServer;     // defined in main.cpp
 #endif
 
@@ -245,6 +246,12 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
 // only a physical power cycle clears. Mirrors the deep-sleep teardown in
 // enterDeepSleep() (main.cpp), which is why sleep->wake re-inits cleanly.
 static void esp32_ble_deinit_before_restart() {
+#ifdef OPENDISPLAY_HAS_WIFI
+    // F5 (extends PR #114): esp_restart() resets the CPU but not the WiFi radio or
+    // open sockets/TLS context. Tear the LAN listener + mbedTLS state down first so
+    // the next boot re-inits WiFi cleanly (mirrors the BLE deinit below).
+    opendisplay_lan_teardown();
+#endif
     if (pServer != nullptr) {
         BLEAdvertising* pAdvertising = pServer->getAdvertising();
         if (pAdvertising != nullptr) pAdvertising->stop();

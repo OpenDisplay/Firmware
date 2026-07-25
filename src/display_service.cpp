@@ -18,6 +18,28 @@
 #include "display_fastepd.h"
 #endif
 
+// On ESP32-WiFi BUILDS, route this file's streaming-inflate calls to the ROM `tinfl`
+// engine (src/od_inflate_tinfl.*) instead of the uzlib bit-serial inflater. uzlib
+// (lib/uzlib) is left completely untouched — it is simply not called here, so the
+// linker drops it. The od_zlib_stream_* call sites below are unchanged; the macros
+// rebind them at compile time. od_zlib_status_t / OD_ZLIB_STATUS_* stay shared
+// (from uzlib.h).
+//
+// This remap is UNCONDITIONAL within such a build — it is not gated per transport, so
+// it rebinds EVERY compressed path in this file: direct-write (0x70/0x71), partial
+// region (0x76), and PIPE_WRITE (0x80-0x82). PIPE_WRITE is BLE-only, so BLE transfers
+// decode through tinfl here too. The WiFi keying of OPENDISPLAY_USE_TINFL selects
+// which builds opt in (the LAN wire is what makes software inflate the bottleneck and
+// justifies tinfl's ~11 KB of DRAM tables); it does NOT restrict the engine to LAN
+// traffic. See od_inflate_tinfl.h for the full rationale and RAM cost.
+#include "od_inflate_tinfl.h"
+#if OPENDISPLAY_USE_TINFL
+#define od_zlib_stream_reset  od_inflate_tinfl_reset
+#define od_zlib_stream_push   od_inflate_tinfl_push
+#define od_zlib_stream_poll   od_inflate_tinfl_poll
+#define od_zlib_stream_error  od_inflate_tinfl_error
+#endif
+
 #ifdef TARGET_NRF
 extern "C" {
 #include "nrf_soc.h"
@@ -539,6 +561,13 @@ static PartialStreamContext partialCtx = {};
 static void directWriteComputeGeometry(bool compressed);
 static void directWriteActivatePanel(void);
 static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t endOpcode);
+
+#ifdef TARGET_ESP32
+// Defined in main.cpp. The response ring's only drainer is the loop task, which is
+// the same task running these handlers — so anything queued here stays queued until
+// we return. Call it before any multi-second blocking work (see the refresh tail).
+extern void flushResponseQueueToBle();
+#endif
 
 // PIPE_WRITE (0x0080-0x0082) sliding-window receive state + reorder queue. Declared
 // early so the quiet-logging predicates below can consult pipeState.active. The
@@ -1703,7 +1732,7 @@ float readChipTemperature() {
 }
 
 void updatemsdata(){
-    // writeSerial("updatemsdata() called (mloopcounter: " + String(mloopcounter) + ")", true);
+    // od_log_debug("updatemsdata() called (mloopcounter: %u)", mloopcounter);
     pollSht40SensorsForMsd();
     pollBq27220ForMsd();
     float batteryVoltage = readBatteryVoltage();
@@ -1783,7 +1812,9 @@ void updatemsdata(){
             pAdvertising->start();
         }
     }
+#ifdef OPENDISPLAY_HAS_WIFI
     opendisplay_mdns_update_msd_txt();
+#endif
 #endif
     mloopcounter++;
     mloopcounter &= 0x0F;
@@ -1829,7 +1860,12 @@ static void imageWriteLogReset(void) {
 static void imageWriteLogStart(uint32_t totalBytes) {
     imgLogTotalBytes = totalBytes;
     imgLogStartMs = millis();
-    od_log_debug("DW start: %u bytes expected", (unsigned)totalBytes);
+    // Whether the sender compressed is decided per transfer (START header flag), not
+    // by config, so the transmission_modes dump at boot does not answer it. State the
+    // active mode here: without it a slow push is ambiguous between "sent raw" and
+    // "compressed but the link is the bottleneck".
+    od_log_debug("DW start: %u bytes expected, %s", (unsigned)totalBytes,
+                 directWriteCompressed ? "zlib streaming" : "raw (uncompressed)");
 }
 
 static void imageWriteLogChunk(const uint8_t* data, uint16_t len) {
@@ -1863,13 +1899,26 @@ static void imageWriteLogFinish(uint32_t written, uint32_t total) {
     imgLogHex(hex, sizeof(hex), imgLogLastHead, imgLogLastHeadLen);
     od_log_debug("DW final frame %u: %u bytes: %s", (unsigned)imgLogChunks, imgLogLastLen, hex);
     uint32_t elapsedMs = millis() - imgLogStartMs;   // unsigned wrap-safe over one stream
+    char mode[48] = " raw";
+    if (directWriteCompressed) {
+        // On-wire bytes vs bytes handed to the panel: the ratio is the only direct
+        // evidence the stream actually inflated, and it makes a mis-sized or
+        // already-compressed payload obvious.
+        if (directWriteCompressedReceived > 0 && written > 0) {
+            snprintf(mode, sizeof(mode), " zlib %u B on wire (%.2fx)",
+                     (unsigned)directWriteCompressedReceived,
+                     (float)written / (float)directWriteCompressedReceived);
+        } else {
+            snprintf(mode, sizeof(mode), " zlib %u B on wire", (unsigned)directWriteCompressedReceived);
+        }
+    }
     if (elapsedMs > 0) {
         float rate = (float)written / 1.024f / (float)elapsedMs;  // bytes/ms /1.024 = KB/s
-        od_log_debug("DW complete: %u chunks, %u/%u bytes, %.2f s, %.1f KB/s",
-                    (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, elapsedMs / 1000.0f, rate);
+        od_log_debug("DW complete: %u chunks, %u/%u bytes,%s, %.2f s, %.1f KB/s",
+                    (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, mode, elapsedMs / 1000.0f, rate);
     } else {
-        od_log_debug("DW complete: %u chunks, %u/%u bytes, %.2f s, n/a KB/s",
-                    (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, elapsedMs / 1000.0f);
+        od_log_debug("DW complete: %u chunks, %u/%u bytes,%s, %.2f s, n/a KB/s",
+                    (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, mode, elapsedMs / 1000.0f);
     }
 }
 
@@ -1959,6 +2008,11 @@ static void directWriteSinkBytes(uint8_t* data, uint32_t len) {
 static bool directWriteTouchSuspended = false;
 
 void cleanupDirectWriteState(bool refreshDisplay) {
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Sole clearer of directWriteActive, so this is the one place that reliably
+    // re-arms modem sleep after a full-frame transfer. No-op when nothing suspended it.
+    lanPowerSaveRestore();
+#endif
     directWriteActive = false;
     directWriteCompressed = false;
     directWriteBitplanes = false;
@@ -2054,7 +2108,30 @@ static void directWriteActivatePanel(void) {
     }
 }
 
+// ------------------------------------------------------- session ownership ---
+// Transfer state (directWriteActive, the zlib window, pipeState, partialCtx, panel
+// power) is a single global set, while g_commandOrigin is per-FRAME. Without an
+// owner recorded at START, a frame from the other transport joins the in-flight
+// session -- feeding a BLE chunk into a LAN transfer's zlib stream corrupts it
+// silently, and its ack goes back to the injector rather than the owning client.
+// The same gap lets a BLE disconnect tear down a live LAN transfer (see
+// transferSessionOrigin() use in main.cpp's serviceBleDisconnectCleanup).
+static uint8_t sessionOrigin = 0;   // ORIGIN_BLE
+
+uint8_t transferSessionOrigin(void) { return sessionOrigin; }
+
+// True when the frame being dispatched belongs to the transport that opened the
+// session. Logs once per rejected frame: silent discard is what made this class of
+// corruption invisible in the first place.
+static bool frameOwnsSession(const char* what) {
+    if (commandOrigin() == sessionOrigin) return true;
+    od_log_warn("WARNING: %s frame from origin %d dropped; session owned by origin %d",
+                what, (int)commandOrigin(), (int)sessionOrigin);
+    return false;
+}
+
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
+    sessionOrigin = commandOrigin();
     if (partialCtx.active) cleanup_partial_write_state();
     if (directWriteActive) {
         cleanupDirectWriteState(false);
@@ -2079,6 +2156,15 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
             return;
         }
     }
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Modem sleep only wakes the radio at each DTIM beacon, so the per-chunk 0x71 ack
+    // ladder that follows can stall up to DTIM x 102.4 ms on every inbound frame.
+    // Position is load-bearing: the prior-session cleanups at the head of this function
+    // each call lanPowerSaveRestore(), so a suspend above them is undone. Below them
+    // every exit funnels through cleanupDirectWriteState(), which re-arms modem sleep --
+    // including the zlib-failure return just after this call.
+    if (sessionOrigin != ORIGIN_BLE) lanPowerSaveSuspend();
+#endif
     directWriteActivatePanel();
     if (compressed && len > 4) {
         uint32_t compressedDataLen = len - 4;
@@ -2095,6 +2181,7 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
 }
 
 void handlePartialWriteStart(uint8_t* data, uint16_t len) {
+    sessionOrigin = commandOrigin();
     if (directWriteActive) cleanupDirectWriteState(false);
     if (partialCtx.active) cleanup_partial_write_state();
     resetPipeWriteState();
@@ -2163,6 +2250,14 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
     memset(&partialCtx, 0, sizeof(partialCtx));
     partialCtx.active = true;
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Same per-chunk 0x71 ack ladder as a full-frame write. Must go AFTER active=true,
+    // not earlier in this function: every validation return above passes
+    // cleanupState=false to send_direct_write_nack, so none reaches a restore and a
+    // malformed header would strand the radio at full power. From here on,
+    // cleanup_partial_write_state() covers every exit.
+    if (sessionOrigin != ORIGIN_BLE) lanPowerSaveSuspend();
+#endif
     partialCtx.compressed = (flags & PARTIAL_FLAG_COMPRESSED) != 0;
     partialCtx.flags = flags;
     partialCtx.new_etag = newEtag;
@@ -2200,6 +2295,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
     if (pipeState.active) return;
     if (partialCtx.active) {
         if (len == 0) return;
+        if (!frameOwnsSession("0x0071 (partial)")) return;
         imageWriteLogChunk(data, len);
         if (!partial_consume_bytes(data, (uint32_t)len)) {
             send_direct_write_nack(RESP_DIRECT_WRITE_DATA_ACK, OD_ERR_PARTIAL_STREAM, true);
@@ -2211,6 +2307,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
         return;
     }
     if (!directWriteActive || len == 0) return;
+    if (!frameOwnsSession("0x0071")) return;
     imageWriteLogChunk(data, len);
     if (directWriteCompressed) {
         if (!handleDirectWriteCompressedData(data, len)) {
@@ -2254,6 +2351,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     // finalize/refresh a pipe-owned session (partial would commit new_etag==0 and
     // leave pipeState zombied; full-frame would refresh with pipeState still active).
     if (pipeState.active) return;
+    if ((directWriteActive || partialCtx.active) && !frameOwnsSession("0x0072")) return;
     if (partialCtx.active) {
         if (data != nullptr && len > 1) {
             send_direct_write_nack(RESP_DIRECT_WRITE_END_ACK, OD_ERR_PARTIAL_STREAM, true);
@@ -2327,6 +2425,14 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     }
     uint8_t ackResponse[] = {0x00, endOpcode};
     sendResponse(ackResponse, sizeof(ackResponse));
+#ifdef TARGET_ESP32
+    // Push the END ack — and the final tail ACK the auto-complete path queued just
+    // before calling us — onto the air BEFORE the blocking refresh below. bbepRefresh
+    // + waitforrefresh occupy the loop task for seconds on a big panel, and the loop
+    // task is the response ring's only drainer, so without this the client sits in its
+    // tail-flush probe loop and aborts the (already complete) transfer on PTO.
+    flushResponseQueueToBle();
+#endif
     delay(20);
     epdRefreshInProgress = true;
     bool refreshSuccess = false;
@@ -2404,6 +2510,8 @@ void resetPipeWriteState(void) {
 }
 
 bool pipeWriteActive(void) { return pipeState.active; }
+
+bool partialWriteActive(void) { return partialCtx.active; }
 
 // A chunk c is "received" for ACK purposes if it was accepted in-order (lies just
 // below expected_seq within the mask window) or is currently held in the reorder
@@ -2537,6 +2645,7 @@ static bool pipeConsumePayload(uint8_t* data, uint16_t len) {
 }
 
 void handlePipeWriteStart(uint8_t* data, uint16_t len) {
+    sessionOrigin = commandOrigin();
     // A new START aborts any in-flight transfer of any family and resets pipe state
     // (mirrors legacy START). Reset happens up-front so even a malformed START is safe.
     if (partialCtx.active) cleanup_partial_write_state();
@@ -2711,6 +2820,7 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
 void handlePipeWriteData(uint8_t* data, uint16_t len) {
     if (!pipeState.active || pipeState.error) return;   // silent discard
     if (len < 1) return;
+    if (!frameOwnsSession("0x0081")) return;
     uint8_t  seq     = data[0];
     uint8_t* payload = data + 1;
     uint16_t plen    = (uint16_t)(len - 1);
@@ -2800,6 +2910,7 @@ void handlePipeWriteData(uint8_t* data, uint16_t len) {
 }
 
 void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
+    if (pipeState.active && !frameOwnsSession("0x0082")) return;
     if (!pipeState.active) {
         uint8_t n[2] = {RESP_NACK, 0x82};   // no active pipe transfer
         sendResponse(n, sizeof(n));
@@ -2880,6 +2991,11 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
 }
 
 static void cleanup_partial_write_state(void) {
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Sole clearer of partialCtx.active, so this is the one place that reliably
+    // re-arms modem sleep for a partial transfer. No-op when nothing suspended it.
+    lanPowerSaveRestore();
+#endif
     // Tear the panel down only when a transfer/refresh is actually in flight
     // (PWR_ACTIVE) — i.e. on error / NACK / disconnect-mid-stream / watchdog. After
     // a successful refresh, epdSessionRelease already moved to PWR_WARM, so

@@ -90,7 +90,10 @@ public:
             uint8_t* data = (uint8_t*)value.c_str();
             uint16_t len = value.length();
             if (!quiet) {
-                // One-line RX log, mirroring the "BLE: TX ..." response log.
+                // One-line RX log, mirroring the "[BLE] TX ..." response log. This
+                // callback is the BLE write path only, so the tag is always [BLE];
+                // LAN frames are identified by the dispatch banner in
+                // imageDataWritten(), which reads g_commandOrigin.
                 uint16_t cmd = (len >= 2) ? ((data[0] << 8) | data[1]) : data[0];
                 char line[160] = {0};
                 int pos = snprintf(line, sizeof(line), "BLE: RX 0x%04X (%u B):", cmd, (unsigned)len);
