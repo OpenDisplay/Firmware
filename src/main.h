@@ -270,15 +270,8 @@ bool verifyNonceReplay(uint8_t* nonce);
 void incrementNonceCounter();
 void getCurrentNonce(uint8_t* nonce);
 
-typedef struct {
-    bool active;
-    uint32_t totalSize;
-    uint32_t receivedSize;
-    uint8_t buffer[MAX_CONFIG_SIZE];
-    uint32_t expectedChunks;
-    uint32_t receivedChunks;
-} chunked_write_state_t;
-
+// chunked_write_state_t comes from config_parser.h so this file and
+// communication.cpp cannot drift apart on the buffer size.
 extern chunked_write_state_t chunkedWriteState;
 chunked_write_state_t chunkedWriteState = {false, 0, 0, {0}, 0, 0};
 struct GlobalConfig globalConfig = {0};

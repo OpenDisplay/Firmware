@@ -47,14 +47,8 @@ bool isEncryptionEnabled();
 void sendResponseUnencrypted(uint8_t* response, uint16_t len);
 void secureEraseConfig();
 extern struct SecurityConfig securityConfig;
-typedef struct {
-    bool active;
-    uint32_t totalSize;
-    uint32_t receivedSize;
-    uint8_t buffer[4096];
-    uint32_t expectedChunks;
-    uint32_t receivedChunks;
-} chunked_write_state_t;
+// chunked_write_state_t comes from config_parser.h; this file used to redefine it
+// with a hardcoded 4096 in place of MAX_CONFIG_SIZE.
 extern chunked_write_state_t chunkedWriteState;
 extern uint8_t configReadResponseBuffer[128];
 extern uint8_t msd_payload[16];
@@ -348,8 +342,11 @@ void handleFirmwareVersion() {
 }
 
 void handleReadConfig() {
-    uint8_t configData[4096];
-    uint32_t configLen = 4096;
+    // Shared scratch rather than a 4 KB stack array: this runs on the loop task,
+    // where a 4 KB frame is a real overflow risk. Nothing below re-enters a config
+    // path, so no other consumer can claim the scratch while we hold it.
+    uint8_t* configData = getConfigScratch();
+    uint32_t configLen = MAX_CONFIG_SIZE;
     if (loadConfig(configData, &configLen)) {
         uint32_t remaining = configLen;
         uint32_t offset = 0;
@@ -467,7 +464,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         }
         secureEraseConfig();
     }
-    if (len == 0 || len > CONFIG_CHUNK_SIZE || chunkedWriteState.receivedSize + len > 4096 || chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
+    if (len == 0 || len > CONFIG_CHUNK_SIZE || chunkedWriteState.receivedSize + len > MAX_CONFIG_SIZE || chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
         chunkedWriteState.active = false;
         uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));

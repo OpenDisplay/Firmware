@@ -77,19 +77,32 @@ void formatConfigStorage(){
     #endif
 }
 
+// See getConfigScratch() in config_parser.h for the sharing contract. Replaces a
+// per-consumer 4 KB buffer each in loadGlobalConfig (static), hasValidStoredConfig
+// (static) and handleReadConfig (stack -- a 4 KB spike on the loop task).
+static uint8_t configScratch[MAX_CONFIG_SIZE];
+
+uint8_t* getConfigScratch(void) {
+    return configScratch;
+}
+
 bool saveConfig(uint8_t* configData, uint32_t len){
     if (len > MAX_CONFIG_SIZE) {
         writeSerial("ERROR: Config data too large (" + String(len) + " bytes)");
         return false;
     }
-    static config_storage_t config;
-    config.magic = 0xDEADBEEF;
-    config.version = 1;
-    config.data_len = len;
-    config.crc = calculateConfigCRC(configData, len);
-    memcpy(config.data, configData, len);
-    size_t headerSize = sizeof(config_storage_t) - MAX_CONFIG_SIZE; // Size without data array
-    size_t totalSize = headerSize + len; // Header + actual data length
+    if (configData == nullptr) {
+        return false;
+    }
+    // Header on the stack; the payload is written straight from the caller's
+    // buffer. Two writes produce the same bytes the old single write did, and
+    // the factory-provisioning caller passes a flash pointer, so this also drops
+    // a 4 KB flash->RAM copy at first boot.
+    config_header_t header;
+    header.magic = CONFIG_STORAGE_MAGIC;
+    header.version = CONFIG_STORAGE_VERSION;
+    header.crc = calculateConfigCRC(configData, len);
+    header.data_len = len;
     #ifdef TARGET_NRF
     if (InternalFS.exists(CONFIG_FILE_PATH)) {
         InternalFS.remove(CONFIG_FILE_PATH);
@@ -113,7 +126,11 @@ bool saveConfig(uint8_t* configData, uint32_t len){
         return false;
         }
     }
-    size_t bytesWritten = file.write((uint8_t*)&config, totalSize);
+    const size_t totalSize = sizeof(config_header_t) + len;
+    size_t bytesWritten = file.write((uint8_t*)&header, sizeof(header));
+    if (bytesWritten == sizeof(header) && len > 0) {
+        bytesWritten += file.write(configData, len);
+    }
     file.close();
     if (bytesWritten != totalSize) {
         writeSerial("ERROR: Failed to write complete config data (expected " + String(totalSize) + ", wrote " + String(bytesWritten) + ")");
@@ -156,45 +173,50 @@ bool loadConfig(uint8_t* configData, uint32_t* len){
     if (!file) {
         return false;
     }
-    static config_storage_t config;
-    static size_t bytesRead;
-    static size_t headerSize = sizeof(config_storage_t) - MAX_CONFIG_SIZE; // Size without data array
-    bytesRead = file.read((uint8_t*)&config, headerSize);
-    if (bytesRead != headerSize) {
-        writeSerial("ERROR: Failed to read config header (expected " + String(headerSize) + ", got " + String(bytesRead) + ")");
+    if (configData == nullptr || len == nullptr) {
         file.close();
         return false;
     }
-    if (config.magic != 0xDEADBEEF) {
+    // Header staged on the stack, payload read straight into the caller's buffer.
+    // On any failure below configData may hold unvalidated bytes; every caller
+    // gates on the return value, so it is never read after a false return.
+    config_header_t header;
+    size_t bytesRead = file.read((uint8_t*)&header, sizeof(header));
+    if (bytesRead != sizeof(header)) {
+        writeSerial("ERROR: Failed to read config header (expected " + String(sizeof(header)) + ", got " + String(bytesRead) + ")");
+        file.close();
+        return false;
+    }
+    if (header.magic != CONFIG_STORAGE_MAGIC) {
         writeSerial("ERROR: Invalid config magic number");
         file.close();
         return false;
     }
-    if (config.data_len > MAX_CONFIG_SIZE) {
+    if (header.data_len > MAX_CONFIG_SIZE) {
         writeSerial("ERROR: Config data too large");
         file.close();
         return false;
     }
-    bytesRead = file.read(config.data, config.data_len);
-    file.flush();
-    file.close();
-    if (bytesRead != config.data_len) {
-        writeSerial("ERROR: Failed to read complete config data (expected " + String(config.data_len) + ", read " + String(bytesRead) + ")");
+    // Capacity is now checked BEFORE the read rather than after staging: the
+    // read target is the caller's buffer, so this bound is what keeps a large
+    // (but in-spec) config from overrunning a smaller caller buffer.
+    if (header.data_len > *len) {
+        writeSerial("ERROR: Config data larger than buffer");
+        file.close();
         return false;
     }
-    uint32_t calculatedCRC = calculateConfigCRC(config.data, config.data_len);
-    if (config.crc != calculatedCRC) {
+    bytesRead = file.read(configData, header.data_len);
+    file.close();
+    if (bytesRead != header.data_len) {
+        writeSerial("ERROR: Failed to read complete config data (expected " + String(header.data_len) + ", read " + String(bytesRead) + ")");
+        return false;
+    }
+    uint32_t calculatedCRC = calculateConfigCRC(configData, header.data_len);
+    if (header.crc != calculatedCRC) {
         writeSerial("ERROR: Config CRC mismatch");
         return false;
     }
-    if (config.data_len > *len) {
-        writeSerial("ERROR: Config data larger than buffer");
-        return false;
-    }
-    for (uint32_t i = 0; i < config.data_len && i < *len; i++) {
-        configData[i] = config.data[i];
-    }
-    *len = config.data_len;
+    *len = header.data_len;
     return true;
 }
 
@@ -208,9 +230,8 @@ bool hasValidStoredConfig(void) {
         return false;
     }
 #endif
-    static uint8_t buf[MAX_CONFIG_SIZE];
     uint32_t len = MAX_CONFIG_SIZE;
-    return loadConfig(buf, &len);
+    return loadConfig(getConfigScratch(), &len);
 }
 
 static uint16_t crc16_ccitt_feed(uint16_t crc, uint8_t b) {
@@ -270,7 +291,7 @@ bool loadGlobalConfig(){
     wifiPassword[0] = '\0';
     wifiEncryptionType = 0;
     globalConfig.data_extended_loaded = false;
-    static uint8_t configData[MAX_CONFIG_SIZE];
+    uint8_t* configData = getConfigScratch();
     uint32_t configLen = MAX_CONFIG_SIZE;
     if (!loadConfig(configData, &configLen)) {
         globalConfig.loaded = false;
