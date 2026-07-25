@@ -66,10 +66,9 @@ static void lanLog(const String& message, bool newLine = true) {
 extern volatile uint8_t g_commandOrigin;
 
 // Roam gating: never re-associate (or full-channel scan, which steals the shared radio
-// from BLE under coex) while a transfer is in flight. directWriteActive is in main.h;
-// pipeWriteActive() is declared in display_service.h.
-extern bool directWriteActive;
-bool pipeWriteActive(void);
+// from BLE under coex) while a transfer is in flight. transferActive() covers all three
+// transfer types and is declared in display_service.h.
+bool transferActive(void);
 
 String getChipIdHex();
 static void lanBeginConnect(void);   // defined with the roaming / RTC AP-cache block below
@@ -696,9 +695,12 @@ void serviceLanRoam(void) {
     }
     if (!roamPending || !wifiConnected) return;
     // A LAN client implies a possible in-flight transfer; BLE transfers would also be
-    // disrupted by a full-channel scan under coex. Wait for genuine idle.
+    // disrupted by a full-channel scan under coex. Wait for genuine idle. transferActive()
+    // covers DIRECT/PIPE/PARTIAL -- the previous direct+pipe test let a BLE-origin partial
+    // write (no LAN client attached, so the check above does not fire either) be
+    // interrupted by the scan.
     if (wifiClient.connected() || wifiServerConnected) return;
-    if (directWriteActive || pipeWriteActive()) return;
+    if (transferActive()) return;
 
     roamPending = false;
     lanLog("WiFi: roaming -- re-associating to the strongest AP for this SSID");

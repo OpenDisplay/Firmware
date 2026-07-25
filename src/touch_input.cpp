@@ -15,7 +15,8 @@
 extern struct GlobalConfig globalConfig;
 extern uint8_t dynamicreturndata[11];
 #ifdef TARGET_ESP32
-extern bool directWriteActive;
+// True while any of DIRECT / PIPE / PARTIAL is streaming (display_service.cpp).
+bool transferActive(void);
 #endif
 void updatemsdata(void);
 
@@ -577,7 +578,10 @@ void processTouchInput(void) {
         return;
     }
 #ifdef TARGET_ESP32
-    if (directWriteActive || s_epd_refresh_suspend > 0) {
+    // Skip the I2C poll while a transfer is streaming or an EPD refresh is in flight:
+    // GT911 reads contend with the transfer for the bus and the loop task. This used to
+    // test directWriteActive alone, so a PIPE or PARTIAL stream was left unprotected.
+    if (transferActive() || s_epd_refresh_suspend > 0) {
         return;
     }
 #endif

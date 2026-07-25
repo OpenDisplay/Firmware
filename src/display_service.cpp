@@ -1923,11 +1923,11 @@ static void imageWriteLogFinish(uint32_t written, uint32_t total) {
 }
 
 bool imageWriteLogQuietCmd(void) {
-    return (directWriteActive || partialCtx.active || pipeState.active) && imgLogChunks >= 1;
+    return transferActive() && imgLogChunks >= 1;
 }
 
 bool imageWriteLogQuietAck(void) {
-    return (directWriteActive || partialCtx.active || pipeState.active) && imgLogChunks >= 2;
+    return transferActive() && imgLogChunks >= 2;
 }
 
 // True when this raw frame is a mid-stream image-write data chunk (command
@@ -2489,7 +2489,19 @@ void resetPipeWriteState(void) {
 
 bool pipeWriteActive(void) { return pipeState.active; }
 
-bool partialWriteActive(void) { return partialCtx.active; }
+// True while ANY of the three transfer types is streaming. The three flags live in
+// three different places (directWriteActive is a global; pipeState/partialCtx are
+// file-static here), so every caller that just means "a transfer is in flight" used
+// to spell the disjunction out itself -- and drifted: the WiFi roam gate checked
+// direct+pipe but not partial, so a BLE-origin partial write with no LAN client
+// attached could be interrupted by a full-channel scan. Add a fourth transfer type
+// here, not in each caller.
+//
+// Callers wanting ONE specific transfer keep testing that flag directly (the
+// direct-write watchdog and its teardown, the 0x0072 session-ownership check).
+bool transferActive(void) {
+    return directWriteActive || pipeState.active || partialCtx.active;
+}
 
 // A chunk c is "received" for ACK purposes if it was accepted in-order (lies just
 // below expected_seq within the mask window) or is currently held in the reorder

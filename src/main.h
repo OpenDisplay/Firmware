@@ -222,7 +222,6 @@ void enterDFUMode();
 void initio();
 void initDataBuses();
 void initButtons();
-void handleButtonPress(uint8_t buttonIndex);
 void processButtonEvents();  // Process button events and update BLE data
 void idleDelay(uint32_t delayMs);  // Non-blocking delay that processes buttons at 100ms intervals
 void flashLed(uint8_t color, uint8_t brightness);  // Flash LED with color and brightness
