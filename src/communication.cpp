@@ -117,6 +117,9 @@ extern BLECharacteristic imageCharacteristic;
 #define STRINGIFY_LOCAL(x) #x
 #define XSTRINGIFY_LOCAL(x) STRINGIFY_LOCAL(x)
 #define SHA_STRING_LOCAL XSTRINGIFY_LOCAL(SHA)
+// Always stringify so -DBUILD_VERSION=2.24.0 works: three-part tags are not
+// valid C numeric literals (two-part tags like 2.23 accidentally compiled as floats).
+#define BUILD_VERSION_STRING_LOCAL XSTRINGIFY_LOCAL(BUILD_VERSION)
 
 static constexpr uint8_t FIRMWARE_SHA_HEX_BYTES = 40;
 static const char kFirmwareShaPlaceholder[FIRMWARE_SHA_HEX_BYTES + 1] =
@@ -125,10 +128,12 @@ static const char kFirmwareShaPlaceholder[FIRMWARE_SHA_HEX_BYTES + 1] =
 // BUILD_VERSION is major.minor or major.minor.patch (optional leading 'v').
 // Two-part tags imply patch 0. Component index: 0=major, 1=minor, 2=patch.
 static uint8_t parseFirmwareVersionComponent(unsigned index) {
-    const char* v = BUILD_VERSION;
+    const char* v = BUILD_VERSION_STRING_LOCAL;
     if (v == nullptr || v[0] == '\0') {
         return 0;
     }
+    // XSTRINGIFY of a quoted macro yields "\"1.0.0\""; of an unquoted
+    // 2.24.0 yields "2.24.0". Strip one leading quote when present.
     if (v[0] == '"') {
         v++;
     }
