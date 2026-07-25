@@ -12,9 +12,21 @@ pio run -e <env> -t upload       # build + flash
 pio run                          # build every environment
 ```
 
-Common envs: `nrf52840custom`, `esp32-s3-N16R8`, `esp32-s3-N8R8`, `esp32-c3-N16`, `esp32-c6-N4`. CI (`.github/workflows/main.yaml`) builds `nrf52840custom`, `esp32-s3-N16R8`, and `esp32-c3-N16` on every push — keep those three green.
+Common envs: `nrf52840custom`, `esp32-s3-N16R8`, `esp32-s3-N8R8`, `esp32-c3-N16`, `esp32-c6-N4`. CI (`.github/workflows/main.yaml`) builds **all eleven** environments on every push — keep them all green.
 
 Factory provisioning: `OPENDISPLAY_FACTORY_CONFIG_HEX="..." pio run -e <env>` (or `tools/provision_firmware.py`). `scripts/factory_config_gen.py` runs as a pre-build step.
+
+### Do NOT bump the ESP platform past IDF 5.5.4 (C6 / NimBLE-Arduino)
+
+Every ESP env pins pioarduino **`55.03.39`** (Arduino 3.3.9 / **IDF 5.5.4**) by exact version, never the floating `stable` URL. **Do not move to `55.03.311` (IDF 5.5.5) or later until NimBLE-Arduino ships a release built against it.**
+
+**NimBLE-Arduino 2.5.0 depends on IDF ≤ 5.5.4.** IDF 5.5.5 dropped the `r_` prefix on the C6 BLE controller's mempool exports and moved them from `libble_app.a` to `libbt.a` (`r_os_mempool_init` → `os_mempool_init`, same for `os_memblock_get`/`_put`). NimBLE-Arduino 2.5.0 — the latest release, 2026-04-02 — still calls the `r_` names, so `esp32-c6-N4` fails to link with a wall of `undefined reference to r_os_mempool_init`. There is no library-side fix; it has to land upstream in NimBLE-Arduino.
+
+Only C6 is affected: it is the sole target whose BLE controller ships as a precompiled blob carrying its own NimBLE porting layer (`CONFIG_BT_LE_CONTROLLER_NPL_OS_PORTING_SUPPORT=y`). ESP32/S3/C3 compile that layer from source and build fine on IDF 5.5.5.
+
+`scripts/esp32c6_nimble_mempool_link.py` force-links the mempool object for C6 and **warns-and-skips on every failure path** — never abort the build from it, or a future platform change hides the real linker error behind a missing-member message. Full analysis, including a `--defsym` workaround that links but is unvalidated on hardware: `docs/FINDINGS_C6_NIMBLE_IDF555_MEMPOOL_ABI_2026-07-25.md`.
+
+Note for whenever the bump does happen: `55.03.311` also requires PlatformIO Core ≥ 6.1.19 (it silently uninstalls itself on older Core with an `IncompatiblePlatform` error). The pinned `.39` has no such requirement.
 
 ## The vendored protocol header (critical invariant)
 
