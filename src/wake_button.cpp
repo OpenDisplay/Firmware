@@ -10,6 +10,7 @@
 #include "driver/rtc_io.h"  // RTC pull retention for ext0/ext1 pads
 #endif
 #include "structs.h"
+#include "od_log.h"
 
 #ifndef DEVICE_FLAG_BATTERY_LATCH
 #define DEVICE_FLAG_BATTERY_LATCH (1 << 3)
@@ -21,7 +22,6 @@
 extern struct GlobalConfig globalConfig;
 extern ButtonState buttonStates[MAX_BUTTONS];
 extern uint8_t buttonStateCount;
-void writeSerial(String message, bool newLine = true);
 
 // There is no ext0 status register, so the armed pin is remembered across the
 // sleep for detectButtonWake() to name. 0xFF = ext0 not armed this cycle.
@@ -38,18 +38,6 @@ struct WakeCandidate {
     bool pulldown;
 };
 
-String maskToHex(uint64_t mask) {
-    String s = "";
-    bool started = false;
-    for (int shift = 60; shift >= 0; shift -= 4) {
-        uint8_t nib = (mask >> shift) & 0xF;
-        if (!started && nib == 0 && shift != 0) continue;
-        started = true;
-        s += (char)(nib < 10 ? ('0' + nib) : ('A' + nib - 10));
-    }
-    return s;
-}
-
 #if !SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP && SOC_PM_SUPPORT_EXT1_WAKEUP
 // With RTC_PERIPH powered down, IDF maintains pulls configured through the RTC
 // IO registers via the HOLD feature — the digital-domain pinMode pulls do not
@@ -64,14 +52,14 @@ void retainWakePull(const WakeCandidate& c) {
         rtc_gpio_pulldown_en(gpio);
         rtc_gpio_pullup_dis(gpio);
     } else {
-        writeSerial("Wake: pin " + String(c.pin) + " has no internal pull - floating wake pin may cause spurious wakes");
+        od_log_warn("Wake: pin %u has no internal pull - floating wake pin may cause spurious wakes", c.pin);
     }
 }
 
 void warnUnarmedPins(uint64_t mask, const char* reason) {
     for (uint8_t pin = 0; pin < 64; pin++) {
         if (mask & (1ULL << pin)) {
-            writeSerial("Wake: pin " + String(pin) + " not armed (" + String(reason) + ") - timer-only for this button");
+            od_log_warn("Wake: pin %u not armed (%s) - timer-only for this button", pin, reason);
         }
     }
 }
@@ -81,7 +69,7 @@ void warnUnarmedPins(uint64_t mask, const char* reason) {
 
 void armButtonWakeSources() {
     if (globalConfig.power_option.sleep_flags & OD_SLEEP_FLAG_BUTTON_WAKE_DISABLE) {
-        writeSerial("Button wake disabled (sleep_flags) - timer-only deep sleep");
+        od_log_info("Button wake disabled (sleep_flags) - timer-only deep sleep");
         return;
     }
     const uint8_t deviceFlags = globalConfig.system_config.device_flags;
@@ -121,23 +109,23 @@ void armButtonWakeSources() {
         if (validPin(pwrPin2) && c.pin == pwrPin2) {
             // pwr_pin_2 is the latch hold pin (MOSFET enable / D-FF D input);
             // it is an output, never a wake button.
-            writeSerial("Wake: pin " + String(c.pin) + " is the power latch pin - not armed");
+            od_log_debug("Wake: pin %u is the power latch pin - not armed", c.pin);
             continue;
         }
         if ((deviceFlags & DEVICE_FLAG_PWR_LATCH_DFF) && validPin(pwrPin3) && c.pin == pwrPin3) {
             // On D-FF boards pwr_pin_3 is the 74AHC1G79 CP clock: a wake-armed
             // pull or level change could clock the latch off and cut power.
-            writeSerial("Wake: pin " + String(c.pin) + " is the D-FF latch clock - not armed");
+            od_log_debug("Wake: pin %u is the D-FF latch clock - not armed", c.pin);
             continue;
         }
         if (!esp_sleep_is_valid_wakeup_gpio((gpio_num_t)c.pin)) {
-            writeSerial("Wake: pin " + String(c.pin) + " not wake-capable on this chip - timer-only for this button");
+            od_log_debug("Wake: pin %u not wake-capable on this chip - timer-only for this button", c.pin);
             continue;
         }
         if (digitalRead(c.pin) == (c.wakeHigh ? HIGH : LOW)) {
             // Already at its wake level: arming would wake instantly and
             // ping-pong. The pin re-qualifies next sleep entry after release.
-            writeSerial("Wake: pin " + String(c.pin) + " held at sleep entry - skipped this cycle");
+            od_log_debug("Wake: pin %u held at sleep entry - skipped this cycle", c.pin);
             continue;
         }
         if (c.wakeHigh) highMask |= 1ULL << c.pin;
@@ -146,7 +134,7 @@ void armButtonWakeSources() {
     }
 
     if (lowMask == 0 && highMask == 0) {
-        writeSerial("No wake-capable buttons - timer-only deep sleep");
+        od_log_warn("No wake-capable buttons - timer-only deep sleep");
         return;
     }
 
@@ -156,9 +144,9 @@ void armButtonWakeSources() {
     if (lowMask) {
         esp_err_t err = esp_deep_sleep_enable_gpio_wakeup(lowMask, ESP_GPIO_WAKEUP_GPIO_LOW);
         if (err != ESP_OK) {
-            writeSerial("Wake: gpio LOW arm failed (err " + String(err) + ") - timer-only for mask 0x" + maskToHex(lowMask));
+            od_log_warn("Wake: gpio LOW arm failed (err %d) - timer-only for mask 0x%llX", err, (unsigned long long)lowMask);
         } else {
-            writeSerial("Wake: gpio LOW armed, mask 0x" + maskToHex(lowMask));
+            od_log_info("Wake: gpio LOW armed, mask 0x%llX", (unsigned long long)lowMask);
         }
     }
     if (highMask) {
@@ -166,9 +154,9 @@ void armButtonWakeSources() {
         // keep the LOW group and never abort the sleep.
         esp_err_t err = esp_deep_sleep_enable_gpio_wakeup(highMask, ESP_GPIO_WAKEUP_GPIO_HIGH);
         if (err != ESP_OK) {
-            writeSerial("Wake: gpio HIGH arm failed (err " + String(err) + ") - timer-only for mask 0x" + maskToHex(highMask));
+            od_log_warn("Wake: gpio HIGH arm failed (err %d) - timer-only for mask 0x%llX", err, (unsigned long long)highMask);
         } else {
-            writeSerial("Wake: gpio HIGH armed, mask 0x" + maskToHex(highMask));
+            od_log_info("Wake: gpio HIGH armed, mask 0x%llX", (unsigned long long)highMask);
         }
     }
 #elif SOC_PM_SUPPORT_EXT1_WAKEUP
@@ -179,14 +167,14 @@ void armButtonWakeSources() {
     if (highMask) {
         esp_sleep_enable_ext1_wakeup(highMask, ESP_EXT1_WAKEUP_ANY_HIGH);
         armedMask |= highMask;
-        writeSerial("Wake: ext1 ANY_HIGH armed, mask 0x" + maskToHex(highMask));
+        od_log_info("Wake: ext1 ANY_HIGH armed, mask 0x%llX", (unsigned long long)highMask);
     }
     if (lowMask) {
         const uint8_t firstLowPin = (uint8_t)__builtin_ctzll(lowMask);
         esp_sleep_enable_ext0_wakeup((gpio_num_t)firstLowPin, 0);
         s_ext0WakePin = firstLowPin;
         armedMask |= 1ULL << firstLowPin;
-        writeSerial("Wake: ext0 LOW armed on pin " + String(firstLowPin));
+        od_log_info("Wake: ext0 LOW armed on pin %u", firstLowPin);
         warnUnarmedPins(lowMask & ~(1ULL << firstLowPin), "classic ESP32 ext0 takes one LOW pin");
     }
 #else
@@ -196,26 +184,26 @@ void armButtonWakeSources() {
         if (highMask) {
             esp_sleep_enable_ext1_wakeup(highMask, ESP_EXT1_WAKEUP_ANY_HIGH);
             armedMask |= highMask;
-            writeSerial("Wake: ext1 ANY_HIGH armed, mask 0x" + maskToHex(highMask));
+            od_log_info("Wake: ext1 ANY_HIGH armed, mask 0x%llX", (unsigned long long)highMask);
         }
         if (lowMask) {
             const uint8_t firstLowPin = (uint8_t)__builtin_ctzll(lowMask);
             esp_sleep_enable_ext0_wakeup((gpio_num_t)firstLowPin, 0);
             s_ext0WakePin = firstLowPin;
             armedMask |= 1ULL << firstLowPin;
-            writeSerial("Wake: ext0 LOW armed on pin " + String(firstLowPin));
+            od_log_info("Wake: ext0 LOW armed on pin %u", firstLowPin);
             warnUnarmedPins(lowMask & ~(1ULL << firstLowPin), "ext1 taken by HIGH group, ext0 takes one pin");
         }
     } else {
         esp_sleep_enable_ext1_wakeup(lowMask, ESP_EXT1_WAKEUP_ANY_LOW);
         armedMask |= lowMask;
-        writeSerial("Wake: ext1 ANY_LOW armed, mask 0x" + maskToHex(lowMask));
+        od_log_info("Wake: ext1 ANY_LOW armed, mask 0x%llX", (unsigned long long)lowMask);
         if (highMask) {
             const uint8_t firstHighPin = (uint8_t)__builtin_ctzll(highMask);
             esp_sleep_enable_ext0_wakeup((gpio_num_t)firstHighPin, 1);
             s_ext0WakePin = firstHighPin;
             armedMask |= 1ULL << firstHighPin;
-            writeSerial("Wake: ext0 HIGH armed on pin " + String(firstHighPin));
+            od_log_info("Wake: ext0 HIGH armed on pin %u", firstHighPin);
             warnUnarmedPins(highMask & ~(1ULL << firstHighPin), "ext1 taken by LOW group, ext0 takes one pin");
         }
     }
@@ -238,24 +226,24 @@ bool detectButtonWake(int wakeupCause) {
         // hardware is absent — the default case covers them defensively.
 #if SOC_PM_SUPPORT_EXT0_WAKEUP
         case ESP_SLEEP_WAKEUP_EXT0:
-            writeSerial("Wake-up reason: EXT0 button (pin " + String(s_ext0WakePin) + ")");
+            od_log_info("Wake-up reason: EXT0 button (pin %u)", s_ext0WakePin);
             return true;
 #endif
 #if SOC_PM_SUPPORT_EXT1_WAKEUP
         case ESP_SLEEP_WAKEUP_EXT1:
-            writeSerial("Wake-up reason: EXT1 button (pin mask 0x" + maskToHex(esp_sleep_get_ext1_wakeup_status()) + ")");
+            od_log_info("Wake-up reason: EXT1 button (pin mask 0x%llX)", (unsigned long long)esp_sleep_get_ext1_wakeup_status());
             return true;
 #endif
 #if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
         case ESP_SLEEP_WAKEUP_GPIO:
-            writeSerial("Wake-up reason: GPIO button (pin mask 0x" + maskToHex(esp_sleep_get_gpio_wakeup_status()) + ")");
+            od_log_info("Wake-up reason: GPIO button (pin mask 0x%llX)", (unsigned long long)esp_sleep_get_gpio_wakeup_status());
             return true;
 #endif
         case ESP_SLEEP_WAKEUP_TIMER:
-            writeSerial("Wake-up reason: timer");
+            od_log_info("Wake-up reason: timer");
             return false;
         default:
-            writeSerial("Wake-up reason: " + String(wakeupCause) + " (not a button)");
+            od_log_info("Wake-up reason: %d (not a button)", wakeupCause);
             return false;
     }
 }

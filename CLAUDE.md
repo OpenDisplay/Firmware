@@ -55,7 +55,7 @@ What the header contains and what it does **not**:
 - `communication.cpp` — BLE command dispatch (opcode switch on `CMD_*`).
 - `structs.h` — config-packet structs + Firmware-local constants; includes the vendored protocol header.
 - `config_parser.*` — parse the factory/BLE config blob into the structs.
-- `display_service.*`, `display_seeed_gfx.*` — rendering + panel drive (PIPE/DIRECT/PARTIAL write paths).
+- `display_service.*`, `display_fastepd.*` — rendering + panel drive (PIPE/DIRECT/PARTIAL write paths).
 - `encryption.*`, `encryption_state.h` — BLE session auth + CCM.
 - `ble_init.*`, `esp32_ble_callbacks.h` — NimBLE-Arduino setup and callbacks (ESP32 migrated Bluedroid → NimBLE).
 - Peripherals: `buzzer_*`, `sensor_*`, `touch_input.*`, `wake_button.*`, `power_latch.*`, `wifi_service.*`.

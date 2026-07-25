@@ -101,8 +101,8 @@ power/init/teardown. Public entry points are declared in
   `PWR_WARM`, leaving the controller **awake** (no `bbepSleep`, so `is_awake`
   stays 1) and the rail/SPI up. On failure or when the window is 0: power fully off.
 - **`epdSessionForceOff()`** — power the panel fully down now: sleep the controller
-  (`bbepSleep(&bbep,1)` for bb_epaper, or `seeed_gfx_direct_sleep()` +
-  `seeed_gfx_mark_hw_deinitialized()` for Seeed), then `pwrmgm(false)`. Idempotent
+  (`bbepSleep(&bbep,1)` for bb_epaper, or `fastepd_direct_sleep()` +
+  `fastepd_mark_hw_deinitialized()` for FastEPD IT8951), then `pwrmgm(false)`. Idempotent
   (`PWR_OFF` → returns immediately).
 - **`epdSessionTick()`** — the keep-alive timer poll (§4).
 - **`epdSessionIsWarm()`** — `true` when `PWR_WARM`.

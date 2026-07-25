@@ -4,11 +4,18 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "structs.h"
+#ifdef TARGET_ESP32
+#include "mbedtls/ccm.h"
+#endif
 
 struct EncryptionSession {
     bool authenticated;
     uint8_t session_key[16];
     uint8_t session_id[8];
+#ifdef TARGET_ESP32
+    mbedtls_ccm_context ccm_ctx;
+    bool is_ccm_ready;
+#endif
     uint64_t nonce_counter;
     uint64_t last_seen_counter;
     uint64_t replay_window[64];

@@ -1,5 +1,6 @@
 #include "encryption.h"
 #include "encryption_state.h"
+#include "od_log.h"
 
 #ifdef TARGET_NRF
 #include <Arduino.h>
@@ -40,7 +41,10 @@ bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
                      uint8_t* plaintext, const uint8_t* tag, size_t tag_len);
 bool constantTimeCompare(const uint8_t* a, const uint8_t* b, size_t len);
 void secure_random(uint8_t* output, size_t len);
-void writeSerial(String message, bool newLine = true);
+#ifdef TARGET_ESP32
+static void ccm_session_init(EncryptionSession& session);
+static void ccm_session_free(EncryptionSession& session);
+#endif
 
 void getAuthDeviceIdBytes(uint8_t* device_id) {
     if (device_id == nullptr) return;
@@ -116,21 +120,17 @@ bool verifyNonceReplay(uint8_t* nonce) {
         nonce_counter = (nonce_counter << 8) | nonce[8 + i];
     }
     if (!constantTimeCompare(nonce_session_id, encryptionSession.session_id, 8)) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "ERROR: Nonce session_id mismatch\n  Nonce ID: %02X%02X%02X%02X%02X%02X%02X%02X\n  Expected: %02X%02X%02X%02X%02X%02X%02X%02X",
-                 nonce_session_id[0], nonce_session_id[1], nonce_session_id[2], nonce_session_id[3],
-                 nonce_session_id[4], nonce_session_id[5], nonce_session_id[6], nonce_session_id[7],
-                 encryptionSession.session_id[0], encryptionSession.session_id[1], encryptionSession.session_id[2], encryptionSession.session_id[3],
-                 encryptionSession.session_id[4], encryptionSession.session_id[5], encryptionSession.session_id[6], encryptionSession.session_id[7]);
-        writeSerial(buf, true);
+        od_log_error("ERROR: Nonce session_id mismatch\n  Nonce ID: %02X%02X%02X%02X%02X%02X%02X%02X\n  Expected: %02X%02X%02X%02X%02X%02X%02X%02X",
+                     nonce_session_id[0], nonce_session_id[1], nonce_session_id[2], nonce_session_id[3],
+                     nonce_session_id[4], nonce_session_id[5], nonce_session_id[6], nonce_session_id[7],
+                     encryptionSession.session_id[0], encryptionSession.session_id[1], encryptionSession.session_id[2], encryptionSession.session_id[3],
+                     encryptionSession.session_id[4], encryptionSession.session_id[5], encryptionSession.session_id[6], encryptionSession.session_id[7]);
         return false;
     }
     int64_t counter_diff = (int64_t)nonce_counter - (int64_t)encryptionSession.last_seen_counter;
     if (counter_diff < -32 || counter_diff > 32) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "ERROR: Nonce counter outside replay window (counter=%llu, last_seen=%llu, diff=%lld)",
-                 (unsigned long long)nonce_counter, (unsigned long long)encryptionSession.last_seen_counter, (long long)counter_diff);
-        writeSerial(buf, true);
+        od_log_error("ERROR: Nonce counter outside replay window (counter=%llu, last_seen=%llu, diff=%lld)",
+                     (unsigned long long)nonce_counter, (unsigned long long)encryptionSession.last_seen_counter, (long long)counter_diff);
         return false;
     }
     if (nonce_counter <= encryptionSession.last_seen_counter && counter_diff != 0) {
@@ -142,7 +142,7 @@ bool verifyNonceReplay(uint8_t* nonce) {
             }
         }
         if (already_seen) {
-            writeSerial("ERROR: Nonce counter already seen (replay detected)", true);
+            od_log_error("ERROR: Nonce counter already seen (replay detected)");
             return false;
         }
     }
@@ -186,6 +186,9 @@ bool isAuthenticated() {
 }
 
 void clearEncryptionSession() {
+#ifdef TARGET_ESP32
+    ccm_session_free(encryptionSession);
+#endif
     memset(encryptionSession.session_key, 0, 16);
     memset(encryptionSession.client_nonce, 0, 16);
     memset(encryptionSession.server_nonce, 0, 16);
@@ -199,7 +202,7 @@ void clearEncryptionSession() {
     encryptionSession.auth_attempts = 0;
     encryptionSession.server_nonce_time = 0;
     memset(encryptionSession.replay_window, 0, sizeof(encryptionSession.replay_window));
-    writeSerial("Encryption session cleared");
+    od_log_info("Encryption session cleared");
 }
 
 bool checkEncryptionSessionTimeout() {
@@ -208,8 +211,7 @@ bool checkEncryptionSessionTimeout() {
     uint32_t currentTime = millis() / 1000;
     uint32_t sessionAge = currentTime - (encryptionSession.session_start_time / 1000);
     if (sessionAge >= securityConfig.session_timeout_seconds) {
-        writeSerial("Encryption session timeout (" + String(sessionAge) + "s >= " +
-                   String(securityConfig.session_timeout_seconds) + "s)");
+        od_log_info("Encryption session timeout (%us >= %us)", (unsigned)sessionAge, securityConfig.session_timeout_seconds);
         clearEncryptionSession();
         return false;
     }
@@ -231,31 +233,53 @@ bool constantTimeCompare(const uint8_t* a, const uint8_t* b, size_t len) {
 }
 
 #ifdef TARGET_ESP32
+
+static void ccm_session_init(EncryptionSession& session) {
+    if (session.is_ccm_ready) {
+        mbedtls_ccm_free(&session.ccm_ctx);
+    }
+    mbedtls_ccm_init(&session.ccm_ctx);
+    if (mbedtls_ccm_setkey(&session.ccm_ctx, MBEDTLS_CIPHER_ID_AES, session.session_key, 128) == 0) {
+        session.is_ccm_ready = true;
+    } else {
+        mbedtls_ccm_free(&session.ccm_ctx);
+        session.is_ccm_ready = false;
+        od_log_error("ERROR: Failed to initialize CCM session context");
+    }
+}
+
+static void ccm_session_free(EncryptionSession& session) {
+    if (session.is_ccm_ready) {
+        mbedtls_ccm_free(&session.ccm_ctx);
+        session.is_ccm_ready = false;
+    }
+}
+
 bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, uint8_t* mac) {
     mbedtls_cipher_context_t ctx;
     const mbedtls_cipher_info_t* cipher_info = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_128_ECB);
     if (cipher_info == NULL) {
-        writeSerial("ERROR: Failed to get cipher info for AES-128-ECB");
+        od_log_error("ERROR: Failed to get cipher info for AES-128-ECB");
         return false;
     }
     mbedtls_cipher_init(&ctx);
     if (mbedtls_cipher_setup(&ctx, cipher_info) != 0) {
-        writeSerial("ERROR: Failed to setup cipher");
+        od_log_error("ERROR: Failed to setup cipher");
         mbedtls_cipher_free(&ctx);
         return false;
     }
     if (mbedtls_cipher_cmac_starts(&ctx, key, 128) != 0) {
-        writeSerial("ERROR: Failed to start CMAC");
+        od_log_error("ERROR: Failed to start CMAC");
         mbedtls_cipher_free(&ctx);
         return false;
     }
     if (mbedtls_cipher_cmac_update(&ctx, message, message_len) != 0) {
-        writeSerial("ERROR: Failed to update CMAC");
+        od_log_error("ERROR: Failed to update CMAC");
         mbedtls_cipher_free(&ctx);
         return false;
     }
     if (mbedtls_cipher_cmac_finish(&ctx, mac) != 0) {
-        writeSerial("ERROR: Failed to finish CMAC");
+        od_log_error("ERROR: Failed to finish CMAC");
         mbedtls_cipher_free(&ctx);
         return false;
     }
@@ -267,12 +291,12 @@ bool aes_ecb_encrypt(const uint8_t* key, const uint8_t* input, uint8_t* output) 
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     if (mbedtls_aes_setkey_enc(&aes, key, 128) != 0) {
-        writeSerial("ERROR: Failed to set AES key");
+        od_log_error("ERROR: Failed to set AES key");
         mbedtls_aes_free(&aes);
         return false;
     }
     if (mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, input, output) != 0) {
-        writeSerial("ERROR: Failed to encrypt with AES-ECB");
+        od_log_error("ERROR: Failed to encrypt with AES-ECB");
         mbedtls_aes_free(&aes);
         return false;
     }
@@ -284,18 +308,26 @@ bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
                      const uint8_t* ad, size_t ad_len,
                      const uint8_t* plaintext, size_t plaintext_len,
                      uint8_t* ciphertext, uint8_t* tag, size_t tag_len) {
-    mbedtls_ccm_context ccm;
-    mbedtls_ccm_init(&ccm);
-    if (mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
-        writeSerial("ERROR: Failed to set CCM key");
-        mbedtls_ccm_free(&ccm);
-        return false;
+    mbedtls_ccm_context *ctx = NULL;
+    mbedtls_ccm_context local_ctx = {0};
+    if (encryptionSession.is_ccm_ready) {
+        ctx = &encryptionSession.ccm_ctx;
+    } else {
+        mbedtls_ccm_init(&local_ctx);
+        if (mbedtls_ccm_setkey(&local_ctx, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+            od_log_error("ERROR: Failed to set CCM key");
+            mbedtls_ccm_free(&local_ctx);
+            return false;
+        }
+        ctx = &local_ctx;
     }
-    int ret = mbedtls_ccm_encrypt_and_tag(&ccm, plaintext_len, nonce, nonce_len,
+    int ret = mbedtls_ccm_encrypt_and_tag(ctx, plaintext_len, nonce, nonce_len,
                                           ad, ad_len, plaintext, ciphertext, tag, tag_len);
-    mbedtls_ccm_free(&ccm);
+    if (ctx == &local_ctx) {
+        mbedtls_ccm_free(&local_ctx);
+    }
     if (ret != 0) {
-        writeSerial("ERROR: CCM encrypt failed: " + String((int)ret));
+        od_log_error("ERROR: CCM encrypt failed: %d", ret);
         return false;
     }
     return true;
@@ -305,38 +337,41 @@ bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
                      const uint8_t* ad, size_t ad_len,
                      const uint8_t* ciphertext, size_t ciphertext_len,
                      uint8_t* plaintext, const uint8_t* tag, size_t tag_len) {
-    mbedtls_ccm_context ccm;
-    mbedtls_ccm_init(&ccm);
-    if (mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
-        writeSerial("ERROR: Failed to set CCM key");
-        mbedtls_ccm_free(&ccm);
-        return false;
-    }
     if (nonce_len < 7 || nonce_len > 13) {
-        writeSerial("ERROR: Invalid CCM nonce length (must be 7-13 bytes)");
-        mbedtls_ccm_free(&ccm);
+        od_log_error("ERROR: Invalid CCM nonce length (must be 7-13 bytes)");
         return false;
     }
     if (tag_len != 4 && tag_len != 6 && tag_len != 8 && tag_len != 10 && tag_len != 12 && tag_len != 14 && tag_len != 16) {
-        writeSerial("ERROR: Invalid CCM tag length (must be 4, 6, 8, 10, 12, 14, or 16 bytes)");
-        mbedtls_ccm_free(&ccm);
+        od_log_error("ERROR: Invalid CCM tag length (must be 4, 6, 8, 10, 12, 14, or 16 bytes)");
         return false;
     }
     if (ciphertext_len == 0) {
-        writeSerial("ERROR: CCM ciphertext length is 0 (must be at least 1 byte)");
-        mbedtls_ccm_free(&ccm);
+        od_log_error("ERROR: CCM ciphertext length is 0 (must be at least 1 byte)");
         return false;
     }
-    int ret = mbedtls_ccm_auth_decrypt(&ccm, ciphertext_len, nonce, nonce_len,
+    mbedtls_ccm_context *ctx = NULL;
+    mbedtls_ccm_context local_ctx = {0};
+    if (encryptionSession.is_ccm_ready) {
+        ctx = &encryptionSession.ccm_ctx;
+    } else {
+        mbedtls_ccm_init(&local_ctx);
+        if (mbedtls_ccm_setkey(&local_ctx, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+            od_log_error("ERROR: Failed to set CCM key");
+            mbedtls_ccm_free(&local_ctx);
+            return false;
+        }
+        ctx = &local_ctx;
+    }
+    int ret = mbedtls_ccm_auth_decrypt(ctx, ciphertext_len, nonce, nonce_len,
                                        ad, ad_len, ciphertext, plaintext, tag, tag_len);
-    mbedtls_ccm_free(&ccm);
+    if (ctx == &local_ctx) {
+        mbedtls_ccm_free(&local_ctx);
+    }
     if (ret != 0) {
-        char err_buf[128];
-        snprintf(err_buf, sizeof(err_buf), "ERROR: CCM decrypt failed: %d (ciphertext_len=%zu, nonce_len=%zu, tag_len=%zu)",
-                 ret, ciphertext_len, nonce_len, tag_len);
-        writeSerial(err_buf);
+        od_log_error("ERROR: CCM decrypt failed: %d (ciphertext_len=%zu, nonce_len=%zu, tag_len=%zu)",
+                     ret, ciphertext_len, nonce_len, tag_len);
         if (ret == -15) {
-            writeSerial("ERROR: MBEDTLS_ERR_CCM_BAD_INPUT - invalid input parameters");
+            od_log_error("ERROR: MBEDTLS_ERR_CCM_BAD_INPUT - invalid input parameters");
         }
         return false;
     }
@@ -352,11 +387,11 @@ static bool cc310_initialized = false;
 static bool init_cc310() {
     if (cc310_initialized) return true;
     if (!nRFCrypto.begin()) {
-        writeSerial("ERROR: Failed to initialize CryptoCell CC310");
+        od_log_error("ERROR: Failed to initialize CryptoCell CC310");
         return false;
     }
     cc310_initialized = true;
-    writeSerial("CryptoCell CC310 initialized successfully");
+    od_log_info("CryptoCell CC310 initialized successfully");
     return true;
 }
 
@@ -368,12 +403,12 @@ bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, ui
     keyData.keySize = 16;
     SaSiError_t err = SaSi_AesInit(&ctx, SASI_AES_ENCRYPT, SASI_AES_MODE_CMAC, SASI_AES_PADDING_NONE);
     if (err != SASI_OK) {
-        writeSerial("ERROR: SaSi_AesInit (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: SaSi_AesInit (CMAC) failed: 0x%lX", (unsigned long)err);
         return false;
     }
     err = SaSi_AesSetKey(&ctx, SASI_AES_USER_KEY, &keyData, sizeof(keyData));
     if (err != SASI_OK) {
-        writeSerial("ERROR: SaSi_AesSetKey (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: SaSi_AesSetKey (CMAC) failed: 0x%lX", (unsigned long)err);
         SaSi_AesFree(&ctx);
         return false;
     }
@@ -389,7 +424,7 @@ bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, ui
     if (block_len > 0) {
         err = SaSi_AesBlock(&ctx, (uint8_t*)message, block_len, NULL);
         if (err != SASI_OK) {
-            writeSerial("ERROR: SaSi_AesBlock (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+            od_log_error("ERROR: SaSi_AesBlock (CMAC) failed: 0x%lX", (unsigned long)err);
             SaSi_AesFree(&ctx);
             return false;
         }
@@ -397,7 +432,7 @@ bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, ui
     size_t mac_size = 16;
     err = SaSi_AesFinish(&ctx, finish_len, (uint8_t*)message + finish_offset, finish_len, mac, &mac_size);
     if (err != SASI_OK) {
-        writeSerial("ERROR: SaSi_AesFinish (CMAC) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: SaSi_AesFinish (CMAC) failed: 0x%lX", (unsigned long)err);
         SaSi_AesFree(&ctx);
         return false;
     }
@@ -413,19 +448,19 @@ bool aes_ecb_encrypt(const uint8_t* key, const uint8_t* input, uint8_t* output) 
     keyData.keySize = 16;
     SaSiError_t err = SaSi_AesInit(&ctx, SASI_AES_ENCRYPT, SASI_AES_MODE_ECB, SASI_AES_PADDING_NONE);
     if (err != SASI_OK) {
-        writeSerial("ERROR: SaSi_AesInit (ECB) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: SaSi_AesInit (ECB) failed: 0x%lX", (unsigned long)err);
         return false;
     }
     err = SaSi_AesSetKey(&ctx, SASI_AES_USER_KEY, &keyData, sizeof(keyData));
     if (err != SASI_OK) {
-        writeSerial("ERROR: SaSi_AesSetKey (ECB) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: SaSi_AesSetKey (ECB) failed: 0x%lX", (unsigned long)err);
         SaSi_AesFree(&ctx);
         return false;
     }
     size_t out_size = 16;
     err = SaSi_AesFinish(&ctx, 16, (uint8_t*)input, 16, output, &out_size);
     if (err != SASI_OK) {
-        writeSerial("ERROR: SaSi_AesFinish (ECB) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: SaSi_AesFinish (ECB) failed: 0x%lX", (unsigned long)err);
         SaSi_AesFree(&ctx);
         return false;
     }
@@ -439,11 +474,11 @@ bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
                      uint8_t* ciphertext, uint8_t* tag, size_t tag_len) {
     if (!init_cc310()) return false;
     if (nonce_len < 7 || nonce_len > 13) {
-        writeSerial("ERROR: Invalid CCM nonce length: " + String((int)nonce_len));
+        od_log_error("ERROR: Invalid CCM nonce length: %d", (int)nonce_len);
         return false;
     }
     if (tag_len < 4 || tag_len > 16 || (tag_len % 2 != 0)) {
-        writeSerial("ERROR: Invalid CCM tag length: " + String((int)tag_len));
+        od_log_error("ERROR: Invalid CCM tag length: %d", (int)tag_len);
         return false;
     }
     CRYS_AESCCM_Key_t ccmKey;
@@ -458,7 +493,7 @@ bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
         (uint8_t*)plaintext, (uint32_t)plaintext_len,
         ciphertext, (uint8_t)tag_len, macRes);
     if (err != CRYS_OK) {
-        writeSerial("ERROR: CRYS_AESCCM (encrypt) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: CRYS_AESCCM (encrypt) failed: 0x%lX", (unsigned long)err);
         return false;
     }
     memcpy(tag, macRes, tag_len);
@@ -471,11 +506,11 @@ bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
                      uint8_t* plaintext, const uint8_t* tag, size_t tag_len) {
     if (!init_cc310()) return false;
     if (nonce_len < 7 || nonce_len > 13) {
-        writeSerial("ERROR: Invalid CCM nonce length: " + String((int)nonce_len));
+        od_log_error("ERROR: Invalid CCM nonce length: %d", (int)nonce_len);
         return false;
     }
     if (tag_len < 4 || tag_len > 16 || (tag_len % 2 != 0)) {
-        writeSerial("ERROR: Invalid CCM tag length: " + String((int)tag_len));
+        od_log_error("ERROR: Invalid CCM tag length: %d", (int)tag_len);
         return false;
     }
     CRYS_AESCCM_Key_t ccmKey;
@@ -491,7 +526,7 @@ bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
         (uint8_t*)ciphertext, (uint32_t)ciphertext_len,
         plaintext, (uint8_t)tag_len, macRes);
     if (err != CRYS_OK) {
-        writeSerial("ERROR: CRYS_AESCCM (decrypt) failed: 0x" + String((unsigned long)err, HEX));
+        od_log_error("ERROR: CRYS_AESCCM (decrypt) failed: 0x%lX", (unsigned long)err);
         return false;
     }
     return true;
@@ -499,12 +534,12 @@ bool aes_ccm_decrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
 
 void secure_random(uint8_t* output, size_t len) {
     if (!init_cc310()) {
-        writeSerial("WARNING: CC310 not initialized, using non-secure random");
+        od_log_warn("WARNING: CC310 not initialized, using non-secure random");
         for (size_t i = 0; i < len; i++) output[i] = random(256);
         return;
     }
     if (!nRFCrypto.Random.generate(output, (uint16_t)len)) {
-        writeSerial("ERROR: CC310 RNG failed, using non-secure fallback");
+        od_log_error("ERROR: CC310 RNG failed, using non-secure fallback");
         for (size_t i = 0; i < len; i++) output[i] = random(256);
     }
 }
@@ -533,7 +568,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
     encryptionSession.last_auth_time = currentTime;
     if (len == 1 && data[0] == 0x00) {
         if (encryptionSession.authenticated && checkEncryptionSessionTimeout()) {
-            writeSerial("New authentication requested, clearing existing session");
+            od_log_info("New authentication requested, clearing existing session");
             clearEncryptionSession();
         }
         secure_random(encryptionSession.pending_server_nonce, 16);
@@ -545,7 +580,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         memcpy(response + 3, encryptionSession.pending_server_nonce, 16);
         memcpy(response + 19, device_id, 4);
         sendResponse(response, sizeof(response));
-        writeSerial("Authentication challenge sent");
+        od_log_info("Authentication challenge sent");
         return false;
     }
     if (len == 32) {
@@ -554,7 +589,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         memcpy(client_nonce, data, 16);
         memcpy(challenge_response, data + 16, 16);
         if (currentTime - encryptionSession.server_nonce_time > 30000) {
-            writeSerial("ERROR: Server nonce expired");
+            od_log_error("ERROR: Server nonce expired");
             uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
@@ -567,13 +602,13 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         memcpy(challenge_input + 32, device_id, 4);
         uint8_t expected_response[16];
         if (!aes_cmac(securityConfig.encryption_key, challenge_input, 36, expected_response)) {
-            writeSerial("ERROR: Failed to compute expected CMAC");
+            od_log_error("ERROR: Failed to compute expected CMAC");
             uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
         }
         if (!constantTimeCompare(challenge_response, expected_response, 16)) {
-            writeSerial("ERROR: Authentication failed (wrong key)");
+            od_log_error("ERROR: Authentication failed (wrong key)");
             uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_FAILED};
             sendResponse(response, sizeof(response));
             memset(encryptionSession.pending_server_nonce, 0, 16);
@@ -583,11 +618,14 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         memcpy(encryptionSession.server_nonce, encryptionSession.pending_server_nonce, 16);
         if (!deriveSessionKey(securityConfig.encryption_key, client_nonce,
                               encryptionSession.pending_server_nonce, encryptionSession.session_key)) {
-            writeSerial("ERROR: Failed to derive session key");
+            od_log_error("ERROR: Failed to derive session key");
             uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
         }
+#ifdef TARGET_ESP32
+        ccm_session_init(encryptionSession);
+#endif
         deriveSessionId(encryptionSession.session_key, client_nonce,
                         encryptionSession.server_nonce, encryptionSession.session_id);
         bool session_id_valid = false;
@@ -595,7 +633,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
             if (encryptionSession.session_id[i] != 0) { session_id_valid = true; break; }
         }
         if (!session_id_valid) {
-            writeSerial("ERROR: Session ID is invalid (all zeros)!");
+            od_log_error("ERROR: Session ID is invalid (all zeros)!");
             uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
             return false;
@@ -615,7 +653,7 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         memcpy(server_input + 16, client_nonce, 16);
         memcpy(server_input + 32, device_id, 4);
         if (!aes_cmac(encryptionSession.session_key, server_input, 36, server_response)) {
-            writeSerial("ERROR: Failed to compute server response");
+            od_log_error("ERROR: Failed to compute server response");
             clearEncryptionSession();
             uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
             sendResponse(response, sizeof(response));
@@ -625,10 +663,10 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         response[0] = RESP_ACK; response[1] = RESP_AUTHENTICATE; response[2] = AUTH_STATUS_SUCCESS;
         memcpy(response + 3, server_response, 16);
         sendResponse(response, sizeof(response));
-        writeSerial("Authentication successful, session established");
+        od_log_info("Authentication successful, session established");
         return true;
     }
-    writeSerial("ERROR: Invalid authentication request format (len=" + String(len) + ")");
+    od_log_error("ERROR: Invalid authentication request format (len=%u)", len);
     uint8_t response[] = {RESP_ACK, RESP_AUTHENTICATE, AUTH_STATUS_ERROR};
     sendResponse(response, sizeof(response));
     return false;
@@ -640,14 +678,14 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
     if (!verifyNonceReplay(nonce_full)) {
         encryptionSession.integrity_failures++;
         if (encryptionSession.integrity_failures >= 3) {
-            writeSerial("Too many integrity failures, clearing session");
+            od_log_warn("Too many integrity failures, clearing session");
             clearEncryptionSession();
         }
         return false;
     }
     uint16_t encrypted_len = ciphertext_len;
     if (encrypted_len > 512) {
-        writeSerial("ERROR: Encrypted payload too large");
+        od_log_error("ERROR: Encrypted payload too large");
         return false;
     }
     uint8_t nonce[13];
@@ -656,7 +694,7 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
     ad[0] = (command_header >> 8) & 0xFF;
     ad[1] = command_header & 0xFF;
     if (encrypted_len == 0) {
-        writeSerial("ERROR: Encrypted payload is 0 bytes (should include length byte)");
+        od_log_error("ERROR: Encrypted payload is 0 bytes (should include length byte)");
         return false;
     }
     static uint8_t decrypted_with_length[512];
@@ -666,7 +704,7 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
     if (success) {
         uint8_t payload_length = decrypted_with_length[0];
         if (payload_length > encrypted_len - 1) {
-            writeSerial("ERROR: Invalid payload length in decrypted data");
+            od_log_error("ERROR: Invalid payload length in decrypted data");
             return false;
         }
         if (payload_length > 0) memcpy(plaintext, decrypted_with_length + 1, payload_length);
@@ -677,7 +715,7 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
     }
     encryptionSession.integrity_failures++;
     if (encryptionSession.integrity_failures >= 3) {
-        writeSerial("Too many integrity failures, clearing session");
+        od_log_warn("Too many integrity failures, clearing session");
         clearEncryptionSession();
     }
     return false;
@@ -699,7 +737,7 @@ bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* cipher
     // 1-byte. No response reaches 255 B today; refuse rather than silently wrap
     // if one ever would.
     if (payload_len > 255) {
-        writeSerial("ERROR: Encrypted response payload exceeds 255 bytes");
+        od_log_error("ERROR: Encrypted response payload exceeds 255 bytes");
         return false;
     }
     payload_with_length[0] = payload_len & 0xFF;
@@ -732,8 +770,8 @@ String getChipIdHex() {
     while (hexId.length() < 6) {
         hexId = "0" + hexId;
     }
-    writeSerial("Chip ID: " + String(id1, HEX) + String(id2, HEX), true);
-    writeSerial("Using last 3 bytes: " + hexId, true);
+    od_log_debug("Chip ID: %08X%08X", (unsigned)id1, (unsigned)id2);
+    od_log_debug("Using last 3 bytes: %s", hexId.c_str());
     return hexId;
 #endif
 #ifdef TARGET_ESP32
@@ -744,15 +782,15 @@ String getChipIdHex() {
     while (hexId.length() < 6) {
         hexId = "0" + hexId;
     }
-    writeSerial("Chip ID: " + String(chipId, HEX), true);
-    writeSerial("Using chip ID: " + hexId, true);
+    od_log_debug("Chip ID: %06X", (unsigned)chipId);
+    od_log_debug("Using chip ID: %s", hexId.c_str());
     return hexId;
 #endif
     return "";
 }
 
 void secureEraseConfig() {
-    writeSerial("=== SECURE ERASE CONFIG ===", true);
+    od_log_info("=== SECURE ERASE CONFIG ===");
     static uint8_t zeroBuffer[512];
     memset(zeroBuffer, 0, sizeof(zeroBuffer));
 
@@ -769,7 +807,7 @@ void secureEraseConfig() {
                 written += toWrite;
             }
             file.close();
-            writeSerial("Config file securely erased (" + String(written) + " bytes)", true);
+            od_log_info("Config file securely erased (%zu bytes)", written);
         }
         InternalFS.remove(CONFIG_FILE_PATH_LOCAL);
     }
@@ -786,12 +824,12 @@ void secureEraseConfig() {
                 written += toWrite;
             }
             file.close();
-            writeSerial("Config file securely erased (" + String(written) + " bytes)", true);
+            od_log_info("Config file securely erased (%zu bytes)", written);
         }
         LittleFS.remove(CONFIG_FILE_PATH_LOCAL);
     }
 #endif
-    writeSerial("Config securely erased", true);
+    od_log_info("Config securely erased");
 }
 
 void checkResetPin() {
@@ -804,8 +842,8 @@ void checkResetPin() {
     bool pullup = (securityConfig.flags & OD_SECURITY_FLAG_RESET_PIN_PULLUP) != 0;
     bool pulldown = (securityConfig.flags & OD_SECURITY_FLAG_RESET_PIN_PULLDOWN) != 0;
 
-    writeSerial("Checking reset pin " + String(pin) + " (polarity: " + String(polarity ? "HIGH" : "LOW") +
-                ", pullup: " + String(pullup) + ", pulldown: " + String(pulldown) + ")", true);
+    od_log_debug("Checking reset pin %u (polarity: %s, pullup: %d, pulldown: %d)",
+                 pin, polarity ? "HIGH" : "LOW", pullup, pulldown);
 
 #ifdef TARGET_ESP32
     pinMode(pin, INPUT);
@@ -825,11 +863,11 @@ void checkResetPin() {
     bool pinState = digitalRead(pin);
 
     if (pinState == polarity) {
-        writeSerial("Reset pin triggered! Securely erasing config and rebooting...", true);
+        od_log_warn("Reset pin triggered! Securely erasing config and rebooting...");
         secureEraseConfig();
         delay(100);
         reboot();
     } else {
-        writeSerial("Reset pin not triggered (state: " + String(pinState ? "HIGH" : "LOW") + ")", true);
+        od_log_debug("Reset pin not triggered (state: %s)", pinState ? "HIGH" : "LOW");
     }
 }

@@ -7,12 +7,13 @@
 #include <bb_epaper.h>
 #include "qr/qrcode.h"
 #include "display_service.h"
+#include "od_log.h"
 #if __has_include("logo_bitmap.h")
 #include "logo_bitmap.h"
 #define BOOT_HAS_LOGO
 #endif
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-#include "display_seeed_gfx.h"
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+#include "display_fastepd.h"
 #endif
 
 extern struct GlobalConfig globalConfig;
@@ -25,7 +26,6 @@ uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
 int getBitsPerPixel();
 int getplane();
-void writeSerial(String message, bool newLine);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
@@ -527,7 +527,7 @@ static const uint8_t kSchemeWhiteValue[] = {
     0x55,  // 3: OD_COLOR_SCHEME_BWRY   — 2bpp, code 01b per pixel = white
     0x11,  // 4: OD_COLOR_SCHEME_BWGBRY — 4bpp Spectra6, nibble 1 = white
     0xFF,  // 5: OD_COLOR_SCHEME_GRAY4  — 2bpp gray, code 11b per pixel = white
-    0xFF,  // 6: OD_COLOR_SCHEME_GRAY16 — 4bpp Seeed 16-gray, nibble 15 = white
+    0xFF,  // 6: OD_COLOR_SCHEME_GRAY16 — 4bpp 16-gray, nibble 15 = white
     // 7: OD_COLOR_SCHEME_SEVEN_COLOR — NOT properly implemented. There is no 7-color
     // rendering path; this entry deliberately treats scheme 7 as a 1bpp mono stub
     // (0xFF = all-ones white plane, same as MONO). Kept as a positional placeholder so
@@ -554,8 +554,8 @@ static bool bootGray4PanelUsesLutV2(uint16_t panelIc) {
 
 static void bootGray4FillSwatchCodes(uint16_t panelIc, uint8_t out[4]) {
     const uint8_t* stored = bootGray4PanelUsesLutV2(panelIc) ? kGray4StoredV2 : kGray4StoredBase;
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    const bool direct2bpp = seeed_driver_used();
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    const bool direct2bpp = fastepd_driver_used();
 #else
     const bool direct2bpp = false;
 #endif
@@ -910,8 +910,8 @@ bool writeBootScreenWithQr() {
     // 1-bit controller planes, so render the frame once per plane and
     // de-interleave. Every other scheme writes a single packed plane in one pass.
     const bool gray4Split = (colorScheme == OD_COLOR_SCHEME_GRAY4)
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        && !seeed_driver_used()
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+        && !fastepd_driver_used()
 #endif
         ;
     const int planePitch = (w + 7) / 8;
@@ -924,11 +924,11 @@ bool writeBootScreenWithQr() {
         if (e1004Stream) {
             if (halfPass == 0) {
                 if (!e1004_begin_plane()) {
-                    writeSerial("Boot screen: E1004 dual-CS plane open failed", true);
+                    od_log_error("Boot screen: E1004 dual-CS plane open failed");
                     return false;
                 }
             } else if (!e1004_advance_to_cs2()) {
-                writeSerial("Boot screen: E1004 CS2 advance failed", true);
+                od_log_error("Boot screen: E1004 CS2 advance failed");
                 e1004_end_plane();
                 return false;
             }
@@ -938,8 +938,8 @@ bool writeBootScreenWithQr() {
         const int targetPlane = gray4Split ? (pass == 0 ? PLANE_0 : PLANE_1)
                                            : (colorSwatchPlane1 ? (pass == 0 ? PLANE_0 : PLANE_1)
                                                                  : (useBitplanes ? PLANE_0 : getplane()));
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-        if (!seeed_driver_used() && !e1004Stream) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+        if (!fastepd_driver_used() && !e1004Stream) {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
             bbepStartWrite(&bbep, targetPlane);
         }
@@ -1020,9 +1020,9 @@ bool writeBootScreenWithQr() {
                     if (si >= 0) setBootPixelCode(row, x_native, pitch, bitsPerPixel, swatchCode[si]);
                 }
             }
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-            if (seeed_driver_used()) {
-                seeed_gfx_boot_write_row(y_native, row, pitch);
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+            if (fastepd_driver_used()) {
+                fastepd_boot_write_row(y_native, row, pitch);
             } else if (gray4Split) {
                 writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
             } else if (e1004Stream) {
@@ -1045,9 +1045,9 @@ bool writeBootScreenWithQr() {
 
     if (e1004Stream) e1004_end_plane();
 
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_SEEED_GFX)
-    if (seeed_driver_used()) {
-        seeed_gfx_boot_skip_planes();
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_boot_skip_planes();
     } else
 #endif
     {
@@ -1058,6 +1058,6 @@ bool writeBootScreenWithQr() {
             for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, pitch);
         }
     }
-    writeSerial("Boot screen with QR rendered", true);
+    od_log_info("Boot screen with QR rendered");
     return true;
 }

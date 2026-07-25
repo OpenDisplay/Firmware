@@ -5,6 +5,7 @@
 #include "device_control.h"
 #include "buzzer_control.h"
 #include "display_service.h"
+#include "od_log.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -20,17 +21,16 @@ extern BLEServer* pServer;
 #include <bluefruit.h>
 #endif
 
-void writeSerial(String message, bool newLine = true);
 bool isAuthenticated();
 extern struct GlobalConfig globalConfig;
 
 static void reloadConfigAfterSave(void) {
     if (!loadGlobalConfig()) {
-        writeSerial("WARNING: Config was saved but reload from storage failed (see errors above). "
+        od_log_warn("WARNING: Config was saved but reload from storage failed (see errors above). "
                     "Reboot may be required.");
         return;
     }
-    writeSerial("Config reloaded from storage after save");
+    od_log_info("Config reloaded from storage after save");
     // Live-disable takes effect now: with keep-alive off, drop a still-warm panel
     // here instead of waiting out the stale (<=30 s) deadline armed by the last push.
     if (globalConfig.power_option.screen_timeout_seconds == 0 && epdSessionIsWarm()) {
@@ -75,14 +75,14 @@ static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
     }
     uint8_t hdr[2] = { (uint8_t)(len & 0xFF), (uint8_t)((len >> 8) & 0xFF) };
     if (wifiClient.write(hdr, 2) != 2 || wifiClient.write(payload, len) != len) {
-        writeSerial("ERROR: LAN response write incomplete", true);
+        od_log_error("ERROR: LAN response write incomplete");
     }
 }
 
 /** Mirror responses to BLE only when a central is connected; LAN already got send_wifi_lan_frame. */
 static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
     if (len > MAX_RESPONSE_SIZE) {
-        writeSerial("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE) + ")", true);
+        od_log_error("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE) + ")", true);
         return;
     }
     if (pServer == nullptr || pServer->getConnectedCount() == 0) {
@@ -90,14 +90,14 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
     }
     uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE;
     if (nextHead == responseQueueTail) {
-        writeSerial("ERROR: Response queue full, dropping response", true);
+        od_log_error("ERROR: Response queue full, dropping response");
         return;
     }
     memcpy(responseQueue[responseQueueHead].data, response, len);
     responseQueue[responseQueueHead].len = len;
     responseQueue[responseQueueHead].pending = true;
     responseQueueHead = nextHead;
-    if (!quiet) writeSerial("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE) + ")", true);
+    if (!quiet) od_log_debug("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE) + ")", true);
 }
 #endif
 
@@ -119,38 +119,48 @@ static constexpr uint8_t FIRMWARE_SHA_HEX_BYTES = 40;
 static const char kFirmwareShaPlaceholder[FIRMWARE_SHA_HEX_BYTES + 1] =
     "0000000000000000000000000000000000000000";
 
-void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
-    writeSerial("Sending unencrypted response (error/status):", true);
-    writeSerial("  Length: " + String(len) + " bytes", true);
-    writeSerial("  Command: 0x" + String(response[0], HEX) + String(response[1], HEX), true);
-    String hexDump = "  Full command: ";
-    for (int i = 0; i < len && i < 32; i++) {
-        if (i > 0) hexDump += " ";
-        if (response[i] < 16) hexDump += "0";
-        hexDump += String(response[i], HEX);
+// Builds "<label><space-separated %02X bytes, up to 32><' ...' if truncated>" into buf.
+static void buildHexDump(char* buf, size_t bufSize, const char* label, const uint8_t* data, uint16_t len) {
+    int pos = snprintf(buf, bufSize, "%s", label);
+    if (pos < 0) {
+        pos = 0;
+        buf[0] = '\0';
     }
-    if (len > 32) hexDump += " ...";
-    writeSerial(hexDump, true);
+    int dumpLen = (len < 32) ? len : 32;
+    for (int i = 0; i < dumpLen && pos < (int)bufSize; i++) {
+        int n = snprintf(buf + pos, bufSize - pos, i > 0 ? " %02X" : "%02X", data[i]);
+        if (n < 0) {
+            break;
+        }
+        pos += n;
+    }
+    if (len > 32 && pos >= 0 && pos < (int)bufSize) {
+        snprintf(buf + pos, bufSize - pos, " ...");
+    }
+}
+
+void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
+    od_log_debug("Sending unencrypted response (error/status):");
+    od_log_debug("  Length: %u bytes", len);
+    od_log_debug("  Command: 0x%02X%02X", response[0], response[1]);
+    char hexDump[160];
+    buildHexDump(hexDump, sizeof(hexDump), "  Full command: ", response, len);
+    od_log_debug("%s", hexDump);
 #ifdef TARGET_ESP32
     send_wifi_lan_frame(response, len);
     esp32_queue_ble_notify_copy(response, len);
 #endif
 #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
-        String nrfHexDump = "NRF: Sending unencrypted response: ";
-        for (int i = 0; i < len && i < 32; i++) {
-            if (i > 0) nrfHexDump += " ";
-            if (response[i] < 16) nrfHexDump += "0";
-            nrfHexDump += String(response[i], HEX);
-        }
-        if (len > 32) nrfHexDump += "...";
-        writeSerial(nrfHexDump, true);
-        writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)", true);
+        char nrfHexDump[160] = {0};
+        buildHexDump(nrfHexDump, sizeof(nrfHexDump), "NRF: Sending unencrypted response: ", response, len);
+        od_log_debug("%s", nrfHexDump);
+        od_log_debug("NRF: BLE notification sent (%u bytes)", len);
         imageCharacteristic.notify(response, len);
     } else {
-        writeSerial("ERROR: Cannot send BLE response - not connected or notifications not enabled", true);
-        writeSerial("  Connected: " + String(Bluefruit.connected() ? "yes" : "no"), true);
-        writeSerial("  Notify enabled: " + String(imageCharacteristic.notifyEnabled() ? "yes" : "no"), true);
+        od_log_error("ERROR: Cannot send BLE response - not connected or notifications not enabled");
+        od_log_error("  Connected: %s", Bluefruit.connected() ? "yes" : "no");
+        od_log_error("  Notify enabled: %s", imageCharacteristic.notifyEnabled() ? "yes" : "no");
     }
 #endif
 }
@@ -184,14 +194,14 @@ void sendResponse(uint8_t* response, uint16_t len) {
             uint16_t encrypted_len = 0;
             if (encryptResponse(response, len, encrypted_response, &encrypted_len, nonce, auth_tag)) {
                 if (!quietAck) {
-                    writeSerial("Sending encrypted response:", true);
-                    writeSerial("  Original length: " + String(len) + " bytes", true);
-                    writeSerial("  Encrypted length: " + String(encrypted_len) + " bytes", true);
+                    od_log_debug("Sending encrypted response:");
+                    od_log_debug("  Original length: %u bytes", len);
+                    od_log_debug("  Encrypted length: %u bytes", encrypted_len);
                 }
                 response = encrypted_response;
                 len = encrypted_len;
             } else {
-                writeSerial("WARNING: Failed to encrypt response, sending unencrypted error response", true);
+                od_log_warn("WARNING: Failed to encrypt response, sending unencrypted error response");
                 errorResponse[0] = RESP_NACK;
                 errorResponse[1] = (uint8_t)(command & 0xFF);
                 errorResponse[2] = 0x00;
@@ -199,7 +209,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
                 len = sizeof(errorResponse);
             }
         } else if (!quietAck) {
-            writeSerial("Sending unencrypted response (authentication/firmware version/error)", true);
+            od_log_debug("Sending unencrypted response (authentication/firmware version/error)");
         }
     }
 
@@ -207,16 +217,24 @@ void sendResponse(uint8_t* response, uint16_t len) {
         // One-line TX log: opcode, length, and up to 32 payload bytes (the opcode
         // is also the first two bytes of the dump). Replaces the old 4-line block.
         uint16_t cmd = (response[0] << 8) | response[1];
-        char head[32];
-        snprintf(head, sizeof(head), "BLE: TX 0x%04X (%u B):", cmd, (unsigned)len);
-        String line = head;
-        for (int i = 0; i < len && i < 32; i++) {
-            char b[4];
-            snprintf(b, sizeof(b), " %02X", response[i]);
-            line += b;
+        char line[160];
+        int pos = snprintf(line, sizeof(line), "BLE: TX 0x%04X (%u B):", cmd, (unsigned)len);
+        if (pos < 0) {
+            pos = 0;
+            line[0] = '\0';
         }
-        if (len > 32) line += " ...";
-        writeSerial(line, true);
+        int dumpLen = (len < 32) ? len : 32;
+        for (int i = 0; i < dumpLen && pos < (int)sizeof(line); i++) {
+            int n = snprintf(line + pos, sizeof(line) - pos, " %02X", response[i]);
+            if (n < 0) {
+                break;
+            }
+            pos += n;
+        }
+        if (len > 32 && pos >= 0 && pos < (int)sizeof(line)) {
+            snprintf(line + pos, sizeof(line) - pos, " ...");
+        }
+        od_log_debug("%s", line);
     }
 #ifdef TARGET_ESP32
     send_wifi_lan_frame(response, len);
@@ -225,15 +243,10 @@ void sendResponse(uint8_t* response, uint16_t len) {
 #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
         if (!quietAck) {
-            String nrfHexDump = "NRF: Sending response: ";
-            for (int i = 0; i < len && i < 32; i++) {
-                if (i > 0) nrfHexDump += " ";
-                if (response[i] < 16) nrfHexDump += "0";
-                nrfHexDump += String(response[i], HEX);
-            }
-            if (len > 32) nrfHexDump += "...";
-            writeSerial(nrfHexDump, true);
-            writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)", true);
+            char nrfHexDump[160] = {0};
+            buildHexDump(nrfHexDump, sizeof(nrfHexDump), "NRF: Sending response: ", response, len);
+            od_log_debug("%s", nrfHexDump);
+            od_log_debug("NRF: BLE notification sent (%u bytes)", len);
         }
         // Bounded retry only when the SoftDevice TX queue is full (notify()==false).
         // Replaces an unconditional delay(20): pays latency only on backpressure and
@@ -244,9 +257,9 @@ void sendResponse(uint8_t* response, uint16_t len) {
             notified = imageCharacteristic.notify(response, len);
         }
     } else {
-        writeSerial("ERROR: Cannot send BLE response - not connected or notifications not enabled", true);
-        writeSerial("  Connected: " + String(Bluefruit.connected() ? "yes" : "no"), true);
-        writeSerial("  Notify enabled: " + String(imageCharacteristic.notifyEnabled() ? "yes" : "no"), true);
+        od_log_error("ERROR: Cannot send BLE response - not connected or notifications not enabled");
+        od_log_error("  Connected: %s", Bluefruit.connected() ? "yes" : "no");
+        od_log_error("  Notify enabled: %s", imageCharacteristic.notifyEnabled() ? "yes" : "no");
     }
 #endif
 }
@@ -259,7 +272,7 @@ void handleReadMSD() {
     memcpy(&response[responseLen], msd_payload, sizeof(msd_payload));
     responseLen += sizeof(msd_payload);
     sendResponse(response, responseLen);
-    writeSerial("MSD read response sent (" + String(responseLen) + " bytes)", true);
+    od_log_debug("MSD read response sent (%u bytes)", responseLen);
 }
 
 uint16_t calculateCRC16CCITT(uint8_t* data, uint32_t len) {
@@ -324,8 +337,8 @@ void handleFirmwareVersion() {
         major = 0;
         minor = 0;
     }
-    writeSerial("Firmware version: " + String(major) + "." + String(minor), true);
-    writeSerial("SHA: " + shaStr, true);
+    od_log_info("Firmware version: %u.%u", major, minor);
+    od_log_info("SHA: %s", shaStr.c_str());
     uint8_t shaLen = shaStr.length();
     if (shaLen > 40) shaLen = 40;
     uint8_t response[2 + 1 + 1 + 1 + 40];
@@ -444,7 +457,7 @@ void handleClearConfig(void) {
         return;
     }
 
-    writeSerial("Stored config cleared");
+    od_log_info("Stored config cleared");
     sendResponse(responseOk, sizeof(responseOk));
 }
 
@@ -536,7 +549,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     (void)conn_hdl;
     (void)chr;
     if (len < 2) {
-        writeSerial("ERROR: Command too short (" + String(len) + " bytes)");
+        od_log_error("ERROR: Command too short (%u bytes)", len);
         return;
     }
 
@@ -550,9 +563,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     if (!quietCmd) {
         const char* name = commandName(command);
         if (name != nullptr) {
-            char banner[64];
-            snprintf(banner, sizeof(banner), "=== %s COMMAND (0x%04X) ===", name, command);
-            writeSerial(banner);
+            od_log_info("=== %s COMMAND (0x%04X) ===", name, command);
         }
     }
 
@@ -570,14 +581,14 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
 
     if (isEncryptionEnabled()) {
         if (!isAuthenticated()) {
-            writeSerial("ERROR: Command requires authentication (encryption enabled)");
+            od_log_error("ERROR: Command requires authentication (encryption enabled)");
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
 
         if (len < BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE) {
-            writeSerial("ERROR: Unencrypted command received when encryption is enabled");
+            od_log_error("ERROR: Unencrypted command received when encryption is enabled");
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
@@ -594,21 +605,17 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         uint16_t encrypted_data_len = len - BLE_CMD_HEADER_SIZE - ENCRYPTION_NONCE_SIZE - ENCRYPTION_TAG_SIZE;
 
         if (!quietCmd) {
-            static char data_buf[256];
-            snprintf(data_buf, sizeof(data_buf), "Encrypted command: len=%u, command=0x%04X, encrypted_data_len=%u",
-                     (unsigned int)len, (unsigned int)command, (unsigned int)encrypted_data_len);
-            writeSerial(data_buf);
-            static char nonce_buf[64];
-            snprintf(nonce_buf, sizeof(nonce_buf), "Full nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
-                     nonce_full[0], nonce_full[1], nonce_full[2], nonce_full[3],
-                     nonce_full[4], nonce_full[5], nonce_full[6], nonce_full[7],
-                     nonce_full[8], nonce_full[9], nonce_full[10], nonce_full[11],
-                     nonce_full[12], nonce_full[13], nonce_full[14], nonce_full[15]);
-            writeSerial(nonce_buf);
+            od_log_debug("Encrypted command: len=%u, command=0x%04X, encrypted_data_len=%u",
+                         (unsigned int)len, (unsigned int)command, (unsigned int)encrypted_data_len);
+            od_log_debug("Full nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                         nonce_full[0], nonce_full[1], nonce_full[2], nonce_full[3],
+                         nonce_full[4], nonce_full[5], nonce_full[6], nonce_full[7],
+                         nonce_full[8], nonce_full[9], nonce_full[10], nonce_full[11],
+                         nonce_full[12], nonce_full[13], nonce_full[14], nonce_full[15]);
         }
 
         if (!decryptCommand(data + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
-            writeSerial("ERROR: Decryption failed");
+            od_log_error("ERROR: Decryption failed");
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_NACK};
             sendResponseUnencrypted(response, sizeof(response));
             return;
@@ -633,7 +640,6 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             reboot();
             break;
         case CMD_CONFIG_READ:         // 0x0040
-            writeSerial("Command received at time: " + String(millis()));
             handleReadConfig();
             break;
         case CMD_CONFIG_WRITE:        // 0x0041
@@ -692,7 +698,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             handlePipeWriteEnd(data + 2, len - 2);
             break;
         default:
-            writeSerial("ERROR: Unknown command: 0x" + String(command, HEX));
+            od_log_error("ERROR: Unknown command: 0x%04X", command);
             break;
     }
 }

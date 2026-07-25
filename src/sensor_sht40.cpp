@@ -1,13 +1,13 @@
 #include "sensor_sht40.h"
 #include "structs.h"
 #include "display_service.h"
+#include "od_log.h"
 
 #include <Arduino.h>
 #include <Wire.h>
 
 extern struct GlobalConfig globalConfig;
 extern uint8_t dynamicreturndata[11];
-void writeSerial(String message, bool newLine = true);
 
 static_assert(sizeof(SensorData) == 30, "SensorData must remain 30 bytes");
 
@@ -168,7 +168,7 @@ static void sht40_probe_bus_once(uint8_t bus_id) {
     for (uint8_t i = 0; i < sizeof(addrs); i++) {
         Wire.beginTransmission(addrs[i]);
         uint8_t err = Wire.endTransmission();
-        writeSerial("I2C bus " + String(bus_id) + " probe 0x" + String(addrs[i], HEX) + " err=" + String(err), true);
+        od_log_debug("I2C bus %u probe 0x%02X err=%u", bus_id, addrs[i], err);
     }
 }
 
@@ -262,9 +262,8 @@ void pollSht40SensorsForMsd(void) {
         if (!read_sht40_sample(s, &tc, &rhc, &err)) {
             if (!logged_fail) {
                 uint8_t bid = sht40_bus_id(s);
-                writeSerial("SHT40: read failed err=" + String(err) +
-                    " (I2C bus " + String(bid) + " SCL=GPIO" + String(globalConfig.data_buses[bid].pin_1) +
-                    " SDA=GPIO" + String(globalConfig.data_buses[bid].pin_2) + ")", true);
+                od_log_warn("SHT40: read failed err=%u (I2C bus %u SCL=GPIO%u SDA=GPIO%u)",
+                    err, bid, globalConfig.data_buses[bid].pin_1, globalConfig.data_buses[bid].pin_2);
                 logged_fail = true;
             }
             write_sht40_invalid(start);

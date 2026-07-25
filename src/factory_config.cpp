@@ -1,9 +1,8 @@
 #include "factory_config.h"
 #include "communication.h"
+#include "od_log.h"
 #include <Arduino.h>
 #include <string.h>
-
-void writeSerial(String message, bool newLine = true);
 
 static uint16_t toolboxOuterCrc(const uint8_t* data, uint32_t bodyLen) {
     uint16_t crc = 0xFFFF;
@@ -50,13 +49,13 @@ bool tryProvisionFactoryEmbed(void) {
         return false;
     }
 
-    writeSerial("No valid stored config; provisioning from factory embed...");
+    od_log_info("No valid stored config; provisioning from factory embed...");
     if (saveConfig(const_cast<uint8_t*>(g_factory_embed.data), g_factory_embed.len)) {
-        writeSerial("Factory config saved to filesystem");
+        od_log_info("Factory config saved to filesystem");
         return true;
     }
 
-    writeSerial("ERROR: Factory embed present but saveConfig failed");
+    od_log_error("ERROR: Factory embed present but saveConfig failed");
 #endif
     return false;
 }

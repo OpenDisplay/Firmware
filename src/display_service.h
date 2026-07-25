@@ -22,7 +22,7 @@ void epdSessionForceOff(void);   // power the panel fully down now (idempotent)
 void epdSessionTick(void);       // millis()-poll from loop()/idleDelay(): expire keep-alive
 bool epdSessionIsWarm(void);     // true when the panel is powered-idle (PWR_WARM)
 
-bool seeed_driver_used(void);
+bool fastepd_driver_used(void);
 bool e1004_panel_used(void);
 uint8_t e1004_cs2_pin(void);
 bool e1004_begin_plane(void);

@@ -1,6 +1,7 @@
 #include "touch_input.h"
 #include "display_service.h"
 #include "structs.h"
+#include "od_log.h"
 #include <Arduino.h>
 #include <Wire.h>
 #include <string.h>
@@ -17,7 +18,6 @@ extern uint8_t dynamicreturndata[11];
 extern bool directWriteActive;
 #endif
 void updatemsdata(void);
-void writeSerial(String message, bool newLine = true);
 
 static_assert(sizeof(TouchController) == 32, "TouchController must be 32 bytes for packet 0x28");
 
@@ -108,7 +108,7 @@ static void touch_disable_controller(uint8_t idx, TouchController* tc, TouchRunt
         s_touch_irq_mask &= (uint8_t)~(1u << idx);
         interrupts();
     }
-    writeSerial("Touch[" + String(idx) + "]: disabled (" + String(reason) + ")", true);
+    od_log_warn("Touch[%u]: disabled (%s)", idx, reason);
 }
 
 void touchSuspendForEpdRefresh(void) {
@@ -167,7 +167,7 @@ static void attach_touch_int(uint8_t idx, uint8_t pin) {
     }
     int irq_num = digitalPinToInterrupt(pin);
     if (irq_num < 0) {
-        writeSerial("Touch[" + String(idx) + "]: digitalPinToInterrupt failed for GPIO " + String(pin) + " — using poll only", true);
+        od_log_warn("Touch[%u]: digitalPinToInterrupt failed for GPIO %u — using poll only", idx, pin);
         return;
     }
     pinMode(pin, INPUT_PULLUP);
@@ -222,18 +222,18 @@ static bool gt911_probe_product(uint8_t addr7, uint8_t* reg_high_first) {
     if (gt911_read_reg(addr7, GT911_REG_PID, id, 4, false) && gt911_product_id_match(id)) {
         *reg_high_first = 0;
 #if TOUCH_DEBUG
-        writeSerial("GT911: PID OK @0x" + String(addr7, HEX) + " LE", true);
+        od_log_debug("GT911: PID OK @0x%02X LE", addr7);
 #endif
         return true;
     }
     if (gt911_read_reg(addr7, GT911_REG_PID, id, 4, true) && gt911_product_id_match(id)) {
         *reg_high_first = 1;
 #if TOUCH_DEBUG
-        writeSerial("GT911: PID OK @0x" + String(addr7, HEX) + " BE", true);
+        od_log_debug("GT911: PID OK @0x%02X BE", addr7);
 #endif
         return true;
     }
-    writeSerial("GT911: PID probe failed at 0x" + String(addr7, HEX), true);
+    od_log_debug("GT911: PID probe failed at 0x%02X", addr7);
     return false;
 }
 
@@ -322,7 +322,7 @@ static uint8_t gt911_resolve_and_init(const TouchController* t, TouchRuntime* rt
         if (gt911_probe_product(want, &rt->reg_high_first)) {
             return want;
         }
-        writeSerial("GT911: probe failed at configured addr 0x" + String(want, HEX), true);
+        od_log_warn("GT911: probe failed at configured addr 0x%02X", want);
         return 0;
     }
 
@@ -347,7 +347,7 @@ static uint8_t gt911_resolve_and_init(const TouchController* t, TouchRuntime* rt
             return a14;
         }
     }
-    writeSerial("GT911: not found on I2C (check wiring, pull-ups, RST/INT)", true);
+    od_log_warn("GT911: not found on I2C (check wiring, pull-ups, RST/INT)");
     return 0;
 }
 
@@ -433,11 +433,11 @@ void touchResumeAfterEpdRefresh(void) {
             continue;
         }
         if (touch_light_resume_gt911(i, tc, rt)) {
-            writeSerial("Touch[" + String(i) + "]: light resume after EPD @0x" + String(rt->addr7, HEX), true);
+            od_log_debug("Touch[%u]: light resume after EPD @0x%02X", i, rt->addr7);
         } else if (touch_reinit_gt911(i, tc, rt)) {
-            writeSerial("Touch[" + String(i) + "]: reinit OK after EPD @0x" + String(rt->addr7, HEX), true);
+            od_log_debug("Touch[%u]: reinit OK after EPD @0x%02X", i, rt->addr7);
         } else {
-            writeSerial("Touch[" + String(i) + "]: reinit failed after EPD refresh", true);
+            od_log_warn("Touch[%u]: reinit failed after EPD refresh", i);
         }
     }
 }
@@ -488,7 +488,7 @@ void initTouchInput(void) {
         return;
     }
 #if TOUCH_DEBUG
-    writeSerial("Touch: init " + String(enabled) + " enabled / " + String(globalConfig.touch_controller_count) + " packet(s)", true);
+    od_log_debug("Touch: init %u enabled / %u packet(s)", enabled, globalConfig.touch_controller_count);
 #endif
     for (uint8_t i = 0; i < globalConfig.touch_controller_count; i++) {
         TouchController* tc = &globalConfig.touch_controllers[i];
@@ -498,18 +498,18 @@ void initTouchInput(void) {
         }
         if (tc->touch_ic_type != OD_TOUCH_IC_GT911) {
             if (tc->touch_ic_type != OD_TOUCH_IC_NONE) {
-                writeSerial("Touch[" + String(i) + "]: skipped (only GT911=1 implemented, got " + String(tc->touch_ic_type) + ")", true);
+                od_log_warn("Touch[%u]: skipped (only GT911=1 implemented, got %u)", i, tc->touch_ic_type);
             }
             continue;
         }
         touch_apply_enable_pin(tc);
         if (!touch_bus_ok(tc)) {
-            writeSerial("Touch[" + String(i) + "]: invalid I2C data_bus " + String(touch_bus_id(tc)) +
-                        " (data_bus_count=" + String(globalConfig.data_bus_count) + ")", true);
+            uint8_t busId = touch_bus_id(tc);
+            od_log_warn("Touch[%u]: invalid I2C data_bus %u (data_bus_count=%u)", i, busId, globalConfig.data_bus_count);
             continue;
         }
         if (tc->touch_data_start_byte > 6u) {
-            writeSerial("Touch[" + String(i) + "]: touch_data_start_byte must be 0–6 (5-byte window)", true);
+            od_log_warn("Touch[%u]: touch_data_start_byte must be 0–6 (5-byte window)", i);
             continue;
         }
         if (prior_rt[i].ok && prior_rt[i].addr7 != 0) {
@@ -518,7 +518,7 @@ void initTouchInput(void) {
             rt->disabled = 0;
             rt->i2c_fail_streak = 0;
             if (!touch_ensure_bus(tc)) {
-                writeSerial("Touch[" + String(i) + "]: bus restore failed after EPD", true);
+                od_log_warn("Touch[%u]: bus restore failed after EPD", i);
                 rt->ok = 0;
                 continue;
             }
@@ -527,13 +527,13 @@ void initTouchInput(void) {
                 gt911_int_wake_before_irq(tc);
                 attach_touch_int(i, tc->int_pin);
             }
-            writeSerial("Touch[" + String(i) + "]: kept post-EPD GT911 @0x" + String(rt->addr7, HEX) +
-                (rt->reg_high_first ? " BE" : " LE") + (tc->int_pin != 0xFF ? " INT+poll" : " poll"), true);
+            od_log_info("Touch[%u]: kept post-EPD GT911 @0x%02X%s%s", i, rt->addr7,
+                        rt->reg_high_first ? " BE" : " LE", tc->int_pin != 0xFF ? " INT+poll" : " poll");
             rt->last_poll_ms = millis();
             continue;
         }
         if (!touch_reinit_gt911(i, tc, rt)) {
-            writeSerial("Touch[" + String(i) + "]: init failed", true);
+            od_log_warn("Touch[%u]: init failed", i);
             continue;
         }
         {
@@ -545,14 +545,14 @@ void initTouchInput(void) {
                 xres = (uint16_t)inf[6] | ((uint16_t)inf[7] << 8);
                 yres = (uint16_t)inf[8] | ((uint16_t)inf[9] << 8);
             }
-            writeSerial("Touch[" + String(i) + "]: GT911 @0x" + String(rt->addr7, HEX) + " " + String(rh ? "BE" : "LE") +
-                        " " + String(xres) + "x" + String(yres) + (tc->int_pin != 0xFF ? " INT+poll" : " poll"), true);
+            od_log_info("Touch[%u]: GT911 @0x%02X %s %ux%u%s", i, rt->addr7, rh ? "BE" : "LE",
+                        xres, yres, tc->int_pin != 0xFF ? " INT+poll" : " poll");
         }
 #if TOUCH_DEBUG
         if (tc->int_pin != 0xFF && rt->int_irq_attached) {
-            writeSerial("Touch[" + String(i) + "]: INT GPIO " + String(tc->int_pin) + " FALLING", true);
+            od_log_debug("Touch[%u]: INT GPIO %u FALLING", i, tc->int_pin);
         } else if (tc->int_pin != 0xFF) {
-            writeSerial("Touch[" + String(i) + "]: INT attach failed — polling only", true);
+            od_log_debug("Touch[%u]: INT attach failed — polling only", i);
         }
 #endif
         rt->last_poll_ms = millis();
@@ -638,7 +638,7 @@ void processTouchInput(void) {
             if (rt->i2c_fail_streak >= TOUCH_I2C_FAIL_DISABLE_THRESHOLD) {
                 touch_disable_controller(i, tc, rt, "too many I2C read failures");
             } else if (rt->i2c_fail_streak == 1) {
-                writeSerial("Touch[" + String(i) + "]: I2C read fail (status reg 0x814E, addr 0x" + String(rt->addr7, HEX) + ")", true);
+                od_log_warn("Touch[%u]: I2C read fail (status reg 0x814E, addr 0x%02X)", i, rt->addr7);
             }
             rt->last_poll_ms = now;
             continue;
@@ -718,11 +718,10 @@ void processTouchInput(void) {
         if (changed) {
 #if TOUCH_DEBUG
             if (n == 0) {
-                writeSerial("Touch[" + String(i) + "]: release (MSD low nibble 6, last xy kept)", true);
+                od_log_debug("Touch[%u]: release (MSD low nibble 6, last xy kept)", i);
             } else {
                 const char* src = irq_mode ? (from_irq ? "irq" : (line_low ? "line" : "poll")) : "poll";
-                writeSerial("Touch[" + String(i) + "]: n=" + String(n) + " id=" + String(tid) + " (" + String(x) + "," + String(y) + ") st=0x" +
-                                String(st, HEX) + " " + String(src), true);
+                od_log_debug("Touch[%u]: n=%u id=%u (%u,%u) st=0x%02X %s", i, n, tid, x, y, st, src);
             }
 #endif
             updatemsdata();
