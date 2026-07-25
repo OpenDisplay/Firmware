@@ -4,6 +4,7 @@
 #include "communication.h"
 #include "encryption.h"
 #include "structs.h"
+#include "od_log.h"
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
@@ -32,7 +33,6 @@ extern uint8_t tcpReceiveBuffer[8192];
 extern uint32_t tcpReceiveBufferPos;
 extern uint8_t msd_payload[16];
 
-void writeSerial(String message, bool newLine = true);
 String getChipIdHex();
 
 typedef void* BLEConnHandle;
@@ -73,50 +73,50 @@ void opendisplay_mdns_update_msd_txt(void) {
 static void restartLanService(void) {
     String deviceName = "OD" + getChipIdHex();
     if (!MDNS.begin(deviceName.c_str())) {
-        writeSerial("ERROR: mDNS responder failed");
+        od_log_error("ERROR: mDNS responder failed");
         return;
     }
-    writeSerial("mDNS: " + deviceName + ".local");
+    od_log_info("mDNS: %s.local", deviceName.c_str());
     MDNS.addService("opendisplay", "tcp", wifiServerPort);
-    writeSerial("mDNS: advertised _opendisplay._tcp port " + String(wifiServerPort));
+    od_log_info("mDNS: advertised _opendisplay._tcp port %u", wifiServerPort);
     opendisplay_mdns_update_msd_txt();
 }
 
 void initWiFi(bool waitForConnection) {
-    writeSerial("=== Initializing WiFi ===");
+    od_log_info("=== Initializing WiFi ===");
 
     if (!(globalConfig.system_config.communication_modes & COMM_MODE_WIFI)) {
-        writeSerial("WiFi not enabled in communication_modes, skipping");
+        od_log_info("WiFi not enabled in communication_modes, skipping");
         wifiInitialized = false;
         return;
     }
     if (!wifiConfigured) {
-        writeSerial("WiFi: system_config has WiFi mode on, but wifi_config TLV (0x26) is not in saved "
+        od_log_warn("WiFi: system_config has WiFi mode on, but wifi_config TLV (0x26) is not in saved "
                     "configuration (or failed to parse). Enable Wi-Fi in config, set SSID, and write full "
                     "config to the device.");
         wifiInitialized = false;
         return;
     }
     if (wifiSsid[0] == '\0' || strlen(wifiSsid) == 0) {
-        writeSerial("WiFi: wifi_config packet present but SSID field is empty.");
+        od_log_warn("WiFi: wifi_config packet present but SSID field is empty.");
         wifiInitialized = false;
         return;
     }
-    writeSerial("SSID: \"" + String(wifiSsid) + "\"");
+    od_log_info("SSID: \"%s\"", wifiSsid);
     WiFi.setAutoReconnect(true);
     WiFi.setTxPower(WIFI_POWER_15dBm);
     wifiSsid[32] = '\0';
     wifiPassword[32] = '\0';
-    writeSerial("Encryption type: 0x" + String(wifiEncryptionType, HEX));
+    od_log_info("Encryption type: 0x%02X", wifiEncryptionType);
     wifiConnected = false;
     wifiInitialized = true;
     WiFi.begin(wifiSsid, wifiPassword);
     WiFi.setTxPower(WIFI_POWER_15dBm);
     if (!waitForConnection) {
-        writeSerial("WiFi: STA started (non-blocking; LAN starts when associated)");
+        od_log_info("WiFi: STA started (non-blocking; LAN starts when associated)");
         return;
     }
-    writeSerial("Waiting for WiFi connection...");
+    od_log_info("Waiting for WiFi connection...");
     const int maxRetries = 3;
     const unsigned long timeoutPerRetry = 10000;
     bool connected = false;
@@ -126,9 +126,9 @@ void initWiFi(bool waitForConnection) {
         while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt < timeoutPerRetry)) {
             delay(500);
             wl_status_t status = WiFi.status();
-            writeSerial("WiFi status: " + String(status));
+            od_log_debug("WiFi status: %d", status);
             if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL) {
-                writeSerial("Connection failed immediately (Status: " + String(status) + ")");
+                od_log_warn("Connection failed immediately (Status: %d)", status);
                 abortCurrentRetry = true;
                 break;
             }
@@ -138,7 +138,7 @@ void initWiFi(bool waitForConnection) {
             break;
         }
         if (!abortCurrentRetry) {
-            writeSerial("WiFi attempt " + String(retry + 1) + " timed out");
+            od_log_warn("WiFi attempt %d timed out", retry + 1);
         }
         if (retry < maxRetries - 1) {
             delay(2000);
@@ -146,20 +146,21 @@ void initWiFi(bool waitForConnection) {
     }
     if (WiFi.status() == WL_CONNECTED) {
         wifiConnected = true;
-        writeSerial("=== WiFi connected ===");
-        writeSerial("IP: " + WiFi.localIP().toString());
+        od_log_info("=== WiFi connected ===");
+        String ip = WiFi.localIP().toString();
+        od_log_info("IP: %s", ip.c_str());
         wifiServer.begin(wifiServerPort);
-        writeSerial("TCP server listening on port " + String(wifiServerPort));
+        od_log_info("TCP server listening on port %u", wifiServerPort);
         restartLanService();
     } else {
         wifiConnected = false;
-        writeSerial("=== WiFi connection failed ===");
+        od_log_warn("=== WiFi connection failed ===");
     }
 }
 
 void disconnectWiFiServer() {
     if (wifiClient.connected()) {
-        writeSerial("Closing LAN client");
+        od_log_info("Closing LAN client");
         clearEncryptionSession();
         wifiClient.stop();
     }
@@ -170,15 +171,16 @@ void disconnectWiFiServer() {
 void handleWiFiServer() {
     if (wifiInitialized && WiFi.status() == WL_CONNECTED && !wifiConnected) {
         wifiConnected = true;
-        writeSerial("=== WiFi connected ===");
-        writeSerial("IP: " + WiFi.localIP().toString());
+        od_log_info("=== WiFi connected ===");
+        String ip = WiFi.localIP().toString();
+        od_log_info("IP: %s", ip.c_str());
         wifiServer.begin(wifiServerPort);
-        writeSerial("TCP server listening on port " + String(wifiServerPort));
+        od_log_info("TCP server listening on port %u", wifiServerPort);
         restartLanService();
     }
     if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
         if (wifiServerConnected || wifiClient.connected()) {
-            writeSerial("WiFi lost, closing LAN session");
+            od_log_warn("WiFi lost, closing LAN session");
             disconnectWiFiServer();
         }
         return;
@@ -187,7 +189,7 @@ void handleWiFiServer() {
     WiFiClient incoming = wifiServer.accept();
     if (incoming) {
         if (wifiClient.connected()) {
-            writeSerial("LAN: new client, replacing previous");
+            od_log_info("LAN: new client, replacing previous");
             clearEncryptionSession();
             wifiClient.stop();
         }
@@ -195,12 +197,13 @@ void handleWiFiServer() {
         wifiClient.setTimeout(30000);
         tcpReceiveBufferPos = 0;
         wifiServerConnected = true;
-        writeSerial("LAN client connected from " + wifiClient.remoteIP().toString());
+        String remoteIp = wifiClient.remoteIP().toString();
+        od_log_info("LAN client connected from %s", remoteIp.c_str());
     }
 
     if (!wifiServerConnected || !wifiClient.connected()) {
         if (wifiServerConnected) {
-            writeSerial("LAN client disconnected");
+            od_log_info("LAN client disconnected");
             clearEncryptionSession();
             wifiServerConnected = false;
             tcpReceiveBufferPos = 0;
@@ -217,7 +220,7 @@ void handleWiFiServer() {
         bytesToRead = (int)sizeof(tcpReceiveBuffer) - (int)tcpReceiveBufferPos;
     }
     if (bytesToRead <= 0) {
-        writeSerial("LAN RX buffer full, dropping connection");
+        od_log_warn("LAN RX buffer full, dropping connection");
         disconnectWiFiServer();
         return;
     }
@@ -229,7 +232,7 @@ void handleWiFiServer() {
     while (tcpReceiveBufferPos >= 2) {
         uint16_t flen = (uint16_t)(tcpReceiveBuffer[0] | (tcpReceiveBuffer[1] << 8));
         if (flen == 0 || flen > WIFI_LAN_MAX_PAYLOAD) {
-            writeSerial("LAN: invalid frame length, closing");
+            od_log_warn("LAN: invalid frame length, closing");
             disconnectWiFiServer();
             return;
         }
@@ -252,7 +255,7 @@ void restartWiFiLanAfterReconnect() {
     }
     disconnectWiFiServer();
     wifiServer.begin(wifiServerPort);
-    writeSerial("TCP server restarted on port " + String(wifiServerPort));
+    od_log_info("TCP server restarted on port %u", wifiServerPort);
     restartLanService();
 }
 

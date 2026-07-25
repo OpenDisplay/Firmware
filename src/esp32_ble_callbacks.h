@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <string.h>
 #include "ble_init.h"   // NimBLE-Arduino + BLE* aliases
+#include "od_log.h"
 
 // Defined in display_service.cpp. True for a mid-stream image-write data frame
 // (0x0071) whose per-frame receive/queue logging should be suppressed.
@@ -45,7 +46,7 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
         (void)pServer;
         (void)connInfo;
-        writeSerial("=== BLE CLIENT CONNECTED (ESP32) ===");
+        od_log_info("=== BLE CLIENT CONNECTED (ESP32) ===");
         rebootFlag = 0;
         esp32BleNotifySubscribed = false;
         // Flag-only: updatemsdata() polls I2C and mutates the shared advertisement
@@ -57,7 +58,7 @@ class MyBLEServerCallbacks : public BLEServerCallbacks {
         (void)pServer;
         (void)connInfo;
         (void)reason;
-        writeSerial("=== BLE CLIENT DISCONNECTED (ESP32) ===");
+        od_log_info("=== BLE CLIENT DISCONNECTED (ESP32) ===");
         esp32BleNotifySubscribed = false;
         // Flag-only: the session teardown below (EPD force-off with SPI.end()/rail
         // cut, partial + pipe cleanup) is heavyweight, state-mutating work that races
@@ -75,7 +76,7 @@ public:
         (void)pCharacteristic;
         (void)connInfo;
         esp32BleNotifySubscribed = (subValue & 0x0001) != 0;
-        writeSerial("BLE notify subscription: " + String(esp32BleNotifySubscribed ? "enabled" : "disabled"));
+        od_log_info("BLE notify subscription: %s", esp32BleNotifySubscribed ? "enabled" : "disabled");
     }
     void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
         (void)connInfo;
@@ -91,16 +92,24 @@ public:
             if (!quiet) {
                 // One-line RX log, mirroring the "BLE: TX ..." response log.
                 uint16_t cmd = (len >= 2) ? ((data[0] << 8) | data[1]) : data[0];
-                char head[32];
-                snprintf(head, sizeof(head), "BLE: RX 0x%04X (%u B):", cmd, (unsigned)len);
-                String line = head;
-                for (int i = 0; i < len && i < 32; i++) {
-                    char b[4];
-                    snprintf(b, sizeof(b), " %02X", data[i]);
-                    line += b;
+                char line[160] = {0};
+                int pos = snprintf(line, sizeof(line), "BLE: RX 0x%04X (%u B):", cmd, (unsigned)len);
+                if (pos < 0) {
+                    pos = 0;
+                    line[0] = '\0';
                 }
-                if (len > 32) line += " ...";
-                writeSerial(line);
+                int dumpLen = (len < 32) ? len : 32;
+                for (int i = 0; i < dumpLen && pos < (int)sizeof(line); i++) {
+                    int n = snprintf(line + pos, sizeof(line) - pos, " %02X", data[i]);
+                    if (n < 0) {
+                        break;
+                    }
+                    pos += n;
+                }
+                if (len > 32 && pos >= 0 && pos < (int)sizeof(line)) {
+                    snprintf(line + pos, sizeof(line) - pos, " ...");
+                }
+                od_log_debug("%s", line);
             }
             // SPSC ring: publish head with RELEASE after the payload is fully written
             // so the consumer (main loop) never observes a slot before its bytes land.
@@ -113,12 +122,12 @@ public:
                 commandQueue[head].pending = true;
                 __atomic_store_n(&commandQueueHead, nextHead, __ATOMIC_RELEASE);
             } else {
-                writeSerial("ERROR: Command queue full, dropping command");
+                od_log_error("ERROR: Command queue full, dropping command");
             }
         } else if (value.length() > MAX_COMMAND_SIZE) {
-            writeSerial("WARNING: Command too large, dropping");
+            od_log_warn("WARNING: Command too large, dropping");
         } else {
-            writeSerial("WARNING: Empty data received");
+            od_log_warn("WARNING: Empty data received");
         }
     }
 };

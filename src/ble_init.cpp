@@ -2,6 +2,7 @@
 #include "structs.h"
 #include "encryption.h"
 #include "display_service.h"
+#include "od_log.h"
 
 #ifdef TARGET_NRF
 #include <bluefruit.h>
@@ -16,13 +17,11 @@ void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 void imageDataWritten(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len);
 String getChipIdHex();
-void writeSerial(String message, bool newLine = true);
 #endif
 
 #ifdef TARGET_ESP32
 // NimBLE-Arduino + BLE* aliases arrive via ble_init.h (included above).
 String getChipIdHex();
-void writeSerial(String message, bool newLine = true);
 #include "esp32_ble_callbacks.h"
 
 extern struct GlobalConfig globalConfig;
@@ -84,7 +83,7 @@ void ble_nrf_advertising_tick(void) {
 void ble_nrf_log_link_params(uint16_t conn_handle, const char* phase) {
     BLEConnection* conn = Bluefruit.Connection(conn_handle);
     if (conn == nullptr) {
-        writeSerial(String("[LINK ") + phase + "] no connection (handle " + String(conn_handle) + ")");
+        od_log_debug("[LINK %s] no connection (handle %u)", phase, conn_handle);
         return;
     }
     uint8_t  phy = conn->getPHY();
@@ -93,10 +92,8 @@ void ble_nrf_log_link_params(uint16_t conn_handle, const char* phase) {
     uint16_t ci  = conn->getConnectionInterval(); // units of 1.25 ms
     const char* phyStr = (phy == BLE_GAP_PHY_2MBPS) ? "2M" :
                          (phy == BLE_GAP_PHY_1MBPS) ? "1M" : "?";
-    writeSerial(String("[LINK ") + phase + "] PHY=" + phyStr +
-                "  ATT_MTU=" + String(mtu) +
-                "  DLE=" + String(dle) + " octets" +
-                "  connInterval=" + String(ci * 1.25f, 2) + " ms");
+    od_log_debug("[LINK %s] PHY=%s  ATT_MTU=%u  DLE=%u octets  connInterval=%.2f ms",
+                 phase, phyStr, mtu, dle, ci * 1.25f);
 }
 
 // One-shot timer (armed only in connect_callback — no per-loop polling). Fires
@@ -129,11 +126,11 @@ void ble_nrf_request_fast_link(uint16_t conn_handle) {
     dl.max_rx_time_us = BLE_GAP_DATA_LENGTH_AUTO;
     ble_gap_data_length_limitation_t limit = { 0, 0, 0 };
     if (!conn->requestDataLengthUpdate(&dl, &limit)) {
-        writeSerial("DLE 251 request rejected (tx_lim=" + String(limit.tx_payload_limited_octets) +
-                    " rx_lim=" + String(limit.rx_payload_limited_octets) +
-                    " time_lim_us=" + String(limit.tx_rx_time_limited_us) + ")");
+        od_log_warn("DLE 251 request rejected (tx_lim=%u rx_lim=%u time_lim_us=%u)",
+                    limit.tx_payload_limited_octets, limit.rx_payload_limited_octets,
+                    limit.tx_rx_time_limited_us);
     }
-    writeSerial("Requested fast link: 2M PHY + 251-octet DLE");
+    od_log_debug("Requested fast link: 2M PHY + 251-octet DLE");
 }
 
 void ble_nrf_arm_link_diag(uint16_t conn_handle) {
@@ -153,14 +150,14 @@ void ble_nrf_stack_init() {
     Bluefruit.autoConnLed(false);
     Bluefruit.setTxPower(globalConfig.power_option.tx_power);
     Bluefruit.begin(1, 0);
-    writeSerial("BLE initialized successfully");
-    writeSerial("Setting up BLE service 0x2446...");
+    od_log_info("BLE initialized successfully");
+    od_log_info("Setting up BLE service 0x2446...");
     imageService.begin();
-    writeSerial("BLE service started");
+    od_log_info("BLE service started");
     imageCharacteristic.setWriteCallback(imageDataWritten);
-    writeSerial("BLE write callback set");
+    od_log_info("BLE write callback set");
     imageCharacteristic.begin();
-    writeSerial("BLE characteristic started");
+    od_log_info("BLE characteristic started");
     // Register the DFU service LAST so its presence/absence (it is only added when
     // encryption is disabled) never shifts the handles of imageCharacteristic and its
     // CCCD. GATT handles are assigned in begin() order; keeping the app characteristic
@@ -169,24 +166,24 @@ void ble_nrf_stack_init() {
     // with ATT "Invalid handle". Must stay after Bluefruit.begin() (SoftDevice up first).
     if (!isEncryptionEnabled()) {
         bledfu.begin();
-        writeSerial("BLE DFU initialized successfully (encryption disabled)");
+        od_log_info("BLE DFU initialized successfully (encryption disabled)");
     } else {
-        writeSerial("BLE DFU service NOT initialized (encryption enabled - use CMD_ENTER_DFU)");
+        od_log_info("BLE DFU service NOT initialized (encryption enabled - use CMD_ENTER_DFU)");
     }
     Bluefruit.Periph.setConnectCallback(connect_callback);
     Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
-    writeSerial("BLE callbacks registered");
+    od_log_info("BLE callbacks registered");
     String deviceName = "OD" + getChipIdHex();
     Bluefruit.setName(deviceName.c_str());
-    writeSerial("Device name set to: " + deviceName);
-    writeSerial("Configuring power management...");
+    od_log_info("Device name set to: %s", deviceName.c_str());
+    od_log_info("Configuring power management...");
     sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
     sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
-    writeSerial("Power management configured");
+    od_log_info("Power management configured");
 }
 
 void ble_nrf_advertising_start() {
-    writeSerial("Configuring BLE advertising...");
+    od_log_info("Configuring BLE advertising...");
     Bluefruit.Advertising.clearData();
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     Bluefruit.Advertising.addName();
@@ -194,7 +191,7 @@ void ble_nrf_advertising_start() {
     Bluefruit.Advertising.restartOnDisconnect(true);
     ble_nrf_apply_adv_interval();
     Bluefruit.Advertising.setFastTimeout(10);
-    writeSerial("Starting BLE advertising...");
+    od_log_info("Starting BLE advertising...");
     Bluefruit.Advertising.start(0);
 }
 #endif
@@ -244,33 +241,33 @@ void esp32_restart_ble_advertising(void) {
     delay(100);
     BLEDevice::startAdvertising();
     updatemsdata();
-    writeSerial("BLE advertising restarted");
+    od_log_info("BLE advertising restarted");
 }
 
 void ble_init_esp32(bool update_manufacturer_data) {
     esp32_ble_clear_handles();
-    writeSerial("=== Initializing ESP32 BLE ===");
+    od_log_info("=== Initializing ESP32 BLE ===");
     String deviceName = "OD" + getChipIdHex();
-    writeSerial("Device name will be: " + deviceName);
+    od_log_info("Device name will be: %s", deviceName.c_str());
     BLEDevice::init(deviceName.c_str());
-    writeSerial("Setting BLE MTU to 512...");
+    od_log_info("Setting BLE MTU to 512...");
     BLEDevice::setMTU(512);
     pServer = BLEDevice::createServer();
     if (pServer == nullptr) {
-        writeSerial("ERROR: Failed to create BLE server");
+        od_log_error("ERROR: Failed to create BLE server");
         return;
     }
     // deleteCallbacks=false: staticServerCallbacks is a static object; NimBLE must
     // not delete it on deinit()/replacement.
     pServer->setCallbacks(&staticServerCallbacks, false);
-    writeSerial("Server callbacks configured");
+    od_log_info("Server callbacks configured");
     BLEUUID serviceUUID("00002446-0000-1000-8000-00805F9B34FB");
     pService = pServer->createService(serviceUUID);
     if (pService == nullptr) {
-        writeSerial("ERROR: Failed to create BLE service");
+        od_log_error("ERROR: Failed to create BLE service");
         return;
     }
-    writeSerial("BLE service 0x2446 created successfully");
+    od_log_info("BLE service 0x2446 created successfully");
     BLEUUID charUUID("00002446-0000-1000-8000-00805F9B34FB");
     pTxCharacteristic = pService->createCharacteristic(
         charUUID,
@@ -280,10 +277,10 @@ void ble_init_esp32(bool update_manufacturer_data) {
         NIMBLE_PROPERTY::WRITE_NR
     );
     if (pTxCharacteristic == nullptr) {
-        writeSerial("ERROR: Failed to create BLE characteristic");
+        od_log_error("ERROR: Failed to create BLE characteristic");
         return;
     }
-    writeSerial("Characteristic created with properties: READ, NOTIFY, WRITE, WRITE_NR");
+    od_log_info("Characteristic created with properties: READ, NOTIFY, WRITE, WRITE_NR");
     // NimBLE auto-adds the 0x2902 CCCD for NOTIFY characteristics; no BLE2902 needed.
     pTxCharacteristic->setCallbacks(&staticCharCallbacks);
     pRxCharacteristic = pTxCharacteristic;
@@ -291,14 +288,14 @@ void ble_init_esp32(bool update_manufacturer_data) {
     // explicit pService->start() (deprecated no-op in NimBLE 2.x).
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
     if (pAdvertising == nullptr) {
-        writeSerial("ERROR: Failed to get advertising object");
+        od_log_error("ERROR: Failed to get advertising object");
         return;
     }
     pAdvertising->addServiceUUID(serviceUUID);
-    writeSerial("Service UUID added to advertising");
+    od_log_info("Service UUID added to advertising");
     advertisementData->setName(deviceName.c_str());
     advertisementData->setFlags(0x06);
-    writeSerial("Device name added to advertising");
+    od_log_info("Device name added to advertising");
     if (update_manufacturer_data) {
         updatemsdata();
     }
@@ -309,8 +306,8 @@ void ble_init_esp32(bool update_manufacturer_data) {
     // response is off by default in NimBLE 2.x, so no enableScanResponse() needed.
     pAdvertising->setAdvertisementData(*advertisementData);
     pServer->getAdvertising()->start();
-    writeSerial("=== BLE advertising started successfully ===");
-    writeSerial("Device ready: " + deviceName);
-    writeSerial("Waiting for BLE connections...");
+    od_log_info("=== BLE advertising started successfully ===");
+    od_log_info("Device ready: %s", deviceName.c_str());
+    od_log_info("Waiting for BLE connections...");
 }
 #endif

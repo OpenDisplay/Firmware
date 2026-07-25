@@ -180,8 +180,6 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
 void powerDownExternalFlashFromConfig(void);
 void xiaoinit();
 void ws_pp_init();
-void writeSerial(String message, bool newLine = true);
-void flushLog();
 void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 #ifdef TARGET_ESP32
@@ -250,6 +248,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len);
 int mapEpd(int id);
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
+uint32_t getDeepSleepCount();  // RTC-persisted wake cycle count on ESP32; always 0 on nRF52840
 float readBatteryVoltage();  // Returns battery voltage in volts, or -1.0 if not configured
 float readChipTemperature();  // Returns chip temperature in degrees Celsius
 int getplane();

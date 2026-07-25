@@ -3,6 +3,7 @@
 #include "touch_input.h"
 #include "power_latch.h"
 #include "buzzer_control.h"
+#include "od_log.h"
 #include <string.h>
 
 #ifdef TARGET_ESP32
@@ -39,7 +40,6 @@ void cleanupDirectWriteState(bool refreshDisplay);
 void cleanupPartialWriteOnDisconnect(void);
 void resetPipeWriteState(void);
 void sendResponse(uint8_t* response, uint16_t len);
-void writeSerial(String message, bool newLine = true);
 
 extern ButtonState buttonStates[MAX_BUTTONS];
 
@@ -128,18 +128,18 @@ static void registerAdcLadder(const struct BinaryInputs* input) {
     if (adcLadderCount >= MAX_ADC_LADDERS) return;
     uint8_t n = input->reserved[0];                        // num_buttons
     if (n == 0 || n > MAX_LADDER_BUTTONS) {
-        writeSerial("ADC ladder: count " + String(n) + " out of range 1.." +
-                    String(MAX_LADDER_BUTTONS) + " on pin " + String(input->input_pin_1) + ", skipping", true);
+        od_log_warn("ADC ladder: count %u out of range 1..%u on pin %u, skipping",
+                    n, MAX_LADDER_BUTTONS, input->input_pin_1);
         return;
     }
     if (input->button_data_byte_index > 10) {              // index into the 11-byte MSD block
-        writeSerial("ADC ladder: byte_index " + String(input->button_data_byte_index) +
-                    " out of range 0..10 on pin " + String(input->input_pin_1) + ", skipping", true);
+        od_log_warn("ADC ladder: byte_index %u out of range 0..10 on pin %u, skipping",
+                    input->button_data_byte_index, input->input_pin_1);
         return;
     }
     if ((int)input->reserved[1] + n > 8) {                 // 3-bit id field: id_base..id_base+n-1 must be <= 7
-        writeSerial("ADC ladder: id_base " + String(input->reserved[1]) + " + count " + String(n) +
-                    " exceeds 3-bit id space on pin " + String(input->input_pin_1) + ", skipping", true);
+        od_log_warn("ADC ladder: id_base %u + count %u exceeds 3-bit id space on pin %u, skipping",
+                    input->reserved[1], n, input->input_pin_1);
         return;
     }
     AdcLadder* l = &adcLadders[adcLadderCount];
@@ -153,8 +153,7 @@ static void registerAdcLadder(const struct BinaryInputs* input) {
     }
     for (uint8_t k = 0; k < n; k++) {                      // contract: thresholds strictly descending
         if (l->thresholds[k] <= l->thresholds[k + 1]) {    // reject malformed config from any host
-            writeSerial("ADC ladder: thresholds not strictly descending on pin " +
-                        String(input->input_pin_1) + ", skipping", true);
+            od_log_warn("ADC ladder: thresholds not strictly descending on pin %u, skipping", input->input_pin_1);
             return;
         }
     }
@@ -167,8 +166,7 @@ static void registerAdcLadder(const struct BinaryInputs* input) {
     pinMode(l->pin, INPUT);
     analogSetPinAttenuation(l->pin, ADC_11db);
     adcLadderCount++;
-    writeSerial("ADC ladder: pin " + String(l->pin) + " n " + String(n) +
-                " idBase " + String(l->id_base) + " byteIdx " + String(l->byte_index), true);
+    od_log_info("ADC ladder: pin %u n %u idBase %u byteIdx %u", l->pin, n, l->id_base, l->byte_index);
 }
 
 static void pollAdcButtons() {
@@ -205,9 +203,8 @@ static void pollAdcButtons() {
                                  ((state & 0x01) << 7));
         if (l->byte_index < 11) dynamicreturndata[l->byte_index] = data;
         updatemsdata();
-        writeSerial("ADC btn pin " + String(l->pin) + " adc=" + String(adc) + " idx=" + String(btn) +
-                    " id=" + String(l->last_button_id) + " cnt=" + String(l->press_count) +
-                    " state=" + String(state), true);
+        od_log_debug("ADC btn pin %u adc=%d idx=%d id=%u cnt=%u state=%u",
+                    l->pin, adc, btn, l->last_button_id, l->press_count, state);
     }
 }
 #else
@@ -216,7 +213,7 @@ static void pollAdcButtons() {}
 
 void connect_callback(uint16_t conn_handle) {
     (void)conn_handle;
-    writeSerial("=== BLE CLIENT CONNECTED ===", true);
+    od_log_info("=== BLE CLIENT CONNECTED ===");
     rebootFlag = 0;
     updatemsdata();
 #ifdef TARGET_NRF
@@ -229,8 +226,8 @@ void connect_callback(uint16_t conn_handle) {
 void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
     (void)conn_handle;
     (void)reason;
-    writeSerial("=== BLE CLIENT DISCONNECTED ===", true);
-    writeSerial("Disconnect reason: " + String(reason), true);
+    od_log_info("=== BLE CLIENT DISCONNECTED ===");
+    od_log_info("Disconnect reason: %u", reason);
     // Panel power on disconnect follows the ACTIVE-only-teardown invariant, so no
     // logic change is needed here: a WARM (post-successful-refresh) panel SURVIVES
     // disconnect and keeps its keep-alive window — a reconnect within the window
@@ -256,7 +253,7 @@ static void esp32_ble_deinit_before_restart() {
     BLEDevice::deinit(true);      // clearAll: disables + releases the BT controller
     esp32_ble_clear_handles();
     delay(100);
-    writeSerial("BLE deinitialized before restart", true);
+    od_log_info("BLE deinitialized before restart");
 }
 #endif
 
@@ -591,15 +588,15 @@ void processButtonEvents() {
         uint8_t changedButtonIndex = lastChangedButtonIndex;
         lastChangedButtonIndex = 0xFF;
         interrupts();
-        writeSerial("Button event pending: " + String(changedButtonIndex));
+        od_log_debug("Button event pending: %u", changedButtonIndex);
         if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
             ButtonState* btn = &buttonStates[changedButtonIndex];
             bool pinState = digitalRead(btn->pin);
             bool logicalPressed = btn->inverted ? !pinState : pinState;
-            writeSerial("Pin state: " + String(pinState) + ", Logical pressed: " + String(logicalPressed) + ",inverted: " + String(btn->inverted));
+            od_log_debug("Pin state: %d, Logical pressed: %d, inverted: %d", pinState, logicalPressed, btn->inverted);
             uint8_t logicalState = logicalPressed ? 1 : 0;
             btn->current_state = logicalState;
-            writeSerial("Button: " + String(btn->button_id) + ", Press count: " + String(btn->press_count) + ", Current state: " + String(btn->current_state));
+            od_log_debug("Button: %u, Press count: %u, Current state: %u", btn->button_id, btn->press_count, btn->current_state);
             uint8_t buttonData = (btn->button_id & 0x07) |
                                  ((btn->press_count & 0x0F) << 3) |
                                  ((btn->current_state & 0x01) << 7);
@@ -712,7 +709,7 @@ void buttonISRGeneric() {
 #endif
 
 void initButtons() {
-    writeSerial("=== Initializing Buttons ===");
+    od_log_info("=== Initializing Buttons ===");
     buttonStateCount = 0;
     for (uint8_t i = 0; i < MAX_BUTTONS; i++) {
         buttonStates[i].initialized = false;
@@ -751,7 +748,7 @@ void initButtons() {
             uint8_t pin = *instancePins[pinIdx];
             if (pin == 0xFF) continue;
             if (touch_input_gpio_is_touch_int(pin)) {
-                writeSerial("Button: skip pin " + String(pin) + " (reserved for GT911 INT)", true);
+                od_log_debug("Button: skip pin %u (reserved for GT911 INT)", pin);
                 continue;
             }
             if (buttonStateCount >= MAX_BUTTONS) break;
@@ -833,12 +830,12 @@ void enterDFUMode() {
     // Banner logged by the dispatcher (commandName() in communication.cpp).
 
 #ifdef TARGET_NRF
-    writeSerial("Preparing to enter DFU bootloader mode...", true);
+    od_log_info("Preparing to enter DFU bootloader mode...");
 
     Bluefruit.Advertising.restartOnDisconnect(false);
 
     if (Bluefruit.connected()) {
-        writeSerial("Disconnecting BLE...", true);
+        od_log_info("Disconnecting BLE...");
         Bluefruit.disconnect(Bluefruit.connHandle());
         delay(100);
     }
@@ -863,7 +860,7 @@ void enterDFUMode() {
 #endif
 
 #ifdef TARGET_ESP32
-    writeSerial("ESP32: Rebooting (OTA typically handled via WiFi)", true);
+    od_log_info("ESP32: Rebooting (OTA typically handled via WiFi)");
     delay(100);
     esp32_ble_deinit_before_restart();
     esp_restart();
@@ -880,7 +877,7 @@ void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
         overrideSeconds = ((uint16_t)payload[0] << 8) | payload[1];
         // Bytes beyond 2 ignored for forward compatibility.
     } else if (payloadLen == 1) {
-        writeSerial("WARNING: malformed 0x" + String(CMD_DEEP_SLEEP, HEX) + " payload length 1 - ignoring", true);
+        od_log_warn("WARNING: malformed 0x%04X payload length 1 - ignoring", CMD_DEEP_SLEEP);
     }
     // Enforce a 60 s floor on host overrides: a very short wake timer risks a rapid
     // sleep/wake churn that never stays awake long enough to service a client. This
@@ -888,18 +885,17 @@ void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
     // to the configured deep_sleep_time_seconds, which is not subject to this floor.
     constexpr uint16_t MIN_DEEP_SLEEP_OVERRIDE_SECONDS = 60;
     if (overrideSeconds != 0 && overrideSeconds < MIN_DEEP_SLEEP_OVERRIDE_SECONDS) {
-        writeSerial("Override " + String(overrideSeconds) + "s below " +
-                    String(MIN_DEEP_SLEEP_OVERRIDE_SECONDS) + "s floor - clamping", true);
+        od_log_warn("Override %us below %us floor - clamping", overrideSeconds, MIN_DEEP_SLEEP_OVERRIDE_SECONDS);
         overrideSeconds = MIN_DEEP_SLEEP_OVERRIDE_SECONDS;
     }
     if (globalConfig.power_option.power_mode != 1) {
-        writeSerial("Device not battery powered - 0x" + String(CMD_DEEP_SLEEP, HEX) + " rejected", true);
+        od_log_warn("Device not battery powered - 0x%04X rejected", CMD_DEEP_SLEEP);
         uint8_t errorResponse[] = {RESP_NACK, RESP_DEEP_SLEEP, OD_ERR_DEEP_SLEEP_NOT_BATTERY, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
-        writeSerial("Deep sleep disabled in config - 0x" + String(CMD_DEEP_SLEEP, HEX) + " rejected", true);
+        od_log_warn("Deep sleep disabled in config - 0x%04X rejected", CMD_DEEP_SLEEP);
         uint8_t errorResponse[] = {RESP_NACK, RESP_DEEP_SLEEP, OD_ERR_DEEP_SLEEP_DISABLED, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
@@ -912,7 +908,7 @@ void handleDeepSleepCommand(const uint8_t* payload, uint16_t payloadLen) {
     // silent to preserve existing behavior — leave as-is unless a caller needs the NACK.
     (void)payload;
     (void)payloadLen;
-    writeSerial("Deep sleep command not supported on this target", true);
+    od_log_warn("Deep sleep command not supported on this target");
 #endif
 }
 
@@ -948,7 +944,7 @@ void handlePowerOffCommand(const uint8_t* payload, uint16_t payloadLen) {
     //      sleep a device that cannot self-repower.
     // Until that lands: capability-gated NACK. Scope: OD_ERR_POWER_OFF_* only — do NOT
     // conflate with 0x53 deep sleep (a device that refuses 0x52 may still accept 0x53).
-    writeSerial("No power latch on this target - 0x" + String(CMD_POWER_OFF, HEX) + " rejected", true);
+    od_log_warn("No power latch on this target - 0x%04X rejected", CMD_POWER_OFF);
     uint8_t errorResponse[] = {RESP_NACK, RESP_POWER_OFF, OD_ERR_POWER_OFF_UNSUPPORTED, 0x00};
     sendResponse(errorResponse, sizeof(errorResponse));
 }
