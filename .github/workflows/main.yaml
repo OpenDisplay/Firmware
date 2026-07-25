@@ -1,10 +1,27 @@
 name: PlatformIO CI
 
-on: [push]
+on:
+  push:
+  pull_request:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - nrf52840custom
+          - esp32-s3-N16R8
+          - esp32-s3-N8R8
+          - esp32-s3-N32R8
+          - esp32-s3-N32R8-extuart
+          - esp32-s3-N16R8-extuart
+          - esp32-s3-E1004
+          - esp32-c3-N4
+          - esp32-c3-N16
+          - esp32-c6-N4
+          - esp32-N4
 
     steps:
       - uses: actions/checkout@v4
@@ -13,25 +30,15 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-          key: ${{ runner.os }}-pio
+          key: ${{ runner.os }}-pio-${{ matrix.environment }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-${{ matrix.environment }}-
+            ${{ runner.os }}-pio-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
 
-      - name: Build NRF firmware
-        run: |
-          platformio run --environment nrf52840custom 
-
-      - name: Build ESP32 firmware
-        run: |
-          platformio run --environment esp32-s3-N16R8
-
-      - name: Build esp32-s3-E1004 firmware
-        run: |
-          platformio run --environment esp32-s3-E1004
-
-      - name: Build esp32-c3-N16 firmware
-        run: |
-          platformio run --environment esp32-c3-N16
+      - name: Build ${{ matrix.environment }}
+        run: platformio run --environment ${{ matrix.environment }}
