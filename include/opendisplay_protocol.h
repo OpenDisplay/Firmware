@@ -9,8 +9,8 @@
  *   image PIPE. A new engineer or an AI agent should be able to implement a
  *   fully-correct client from THIS FILE ALONE, without reading firmware.
  *
- *   OD_PROTOCOL_VERSION 2.1   (MAJOR.MINOR; see VERSIONING POLICY below)
- *   LAST CHANGED        2026-07-19
+ *   OD_PROTOCOL_VERSION 2.2   (MAJOR.MINOR; see VERSIONING POLICY below)
+ *   LAST CHANGED        2026-07-22
  *
  * --------------------------------------------------------------------------
  * VERSIONING POLICY
@@ -52,9 +52,39 @@
  * CHANGELOG  (newest first; entries accrue under "Unreleased" and roll into a
  *            new version heading on each bump -- see AGENT INSTRUCTIONS below)
  * --------------------------------------------------------------------------
- *   Unreleased (since 2.1)
+ *   Unreleased (since 2.2)
+ *     - LAN framing: cap the WIRE frame ([len:2 LE] prefix + payload) at a new
+ *       constant OD_LAN_MAX_FRAME (4096); OD_LAN_MAX_PAYLOAD is now DERIVED as
+ *       OD_LAN_MAX_FRAME - 2 = 4094 (was a standalone 4096, which made the max
+ *       wire frame an awkward 4098). Senders MUST keep payloads <= 4094 and
+ *       receivers MUST reject len > 4094. Breaking only for senders that framed
+ *       4095/4096-byte payloads (none deployed); max DIRECT_WRITE chunk data on
+ *       LAN is now OD_LAN_MAX_PAYLOAD - 2 = 4092.
+ *     - BLE framing: add OD_BLE_MAX_FRAME (256) as the named BLE transport
+ *       ceiling -- the ATT MTU, counting opcode(1) + handle(2) + value, so the
+ *       usable single-write value is 253. This is the BLE peer of
+ *       OD_LAN_MAX_FRAME and codifies a limit the wire already had: PIPE_MAX_FRAME
+ *       (244) is the frame ceiling, and nRF peripherals are hard-capped at ATT MTU
+ *       247 (payload 244) by the SoftDevice. Peers SHOULD declare their GATT value
+ *       length and preferred MTU at OD_BLE_MAX_FRAME rather than the 512 ATT
+ *       maximum, so an oversize write draws ATT error 0x0D instead of being
+ *       silently dropped. Breaking only for peers that wrote >253 bytes in a
+ *       single GATT write (none deployed -- HA's GATT client caps at 244 and
+ *       rejects larger writes outright).
  *     - Add each further wire-spec change here as it lands. On the next version
  *       bump, move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
+ *
+ *   2.2  (2026-07-22)
+ *     - MINOR: new SECTION 9 -- NETWORK TRANSPORT (LAN). Documents the WiFi/LAN
+ *       transport as a first-class, implement-from-this-file-alone contract:
+ *       framed TCP ([len:2 LE][payload], payload 1..OD_LAN_MAX_PAYLOAD) over a
+ *       plaintext OR TLS-PSK channel selected by isEncryptionEnabled(). Adds the
+ *       OD_LAN_* constants (OD_LAN_TCP_PORT 2446u, OD_LAN_TLS_PORT 2447u,
+ *       OD_LAN_MAX_PAYLOAD 4096u, OD_LAN_MDNS_SERVICE "_opendisplay._tcp",
+ *       OD_LAN_READ_TIMEOUT_S 30u). No new opcodes, no struct change: the
+ *       plaintext port comes from WifiConfig.server_port (default OD_LAN_TCP_PORT)
+ *       and the TLS port is DERIVED as server_port + 1. Additive -- BLE peers on
+ *       2.1 are unaffected (no wire bytes on the existing BLE path change).
  *
  *   2.1  (2026-07-18)
  *     - MINOR: new CMD_POWER_OFF (0x0052) -- explicit hard rail-cut via the
@@ -228,8 +258,8 @@
  * when to bump which number. This marker describes the spec and is NOT sent on
  * the wire (the negotiated 0x0080 PIPE_VERSION is a separate field). */
 #define OD_PROTOCOL_VERSION_MAJOR      2u
-#define OD_PROTOCOL_VERSION_MINOR      1u
-#define OD_PROTOCOL_VERSION_STR        "2.1"
+#define OD_PROTOCOL_VERSION_MINOR      2u
+#define OD_PROTOCOL_VERSION_STR        "2.2"
 
 /* ==========================================================================
  * SECTION 1 -- COMMAND OPCODES (16-bit, big-endian on the wire)
@@ -843,6 +873,7 @@
 /* ==========================================================================
  * SECTION 7 -- CHUNK / SIZE BUDGETS
  * ========================================================================== */
+#define OD_BLE_MAX_FRAME               256u    /* max BLE ATT MTU: opcode(1) + handle(2) + value, inclusive; usable single-write value is OD_BLE_MAX_FRAME - 3 = 253 (BLE peer of OD_LAN_MAX_FRAME) */
 #define CONFIG_CHUNK_SIZE              200u    /* max config data bytes per chunk */
 #define CONFIG_CHUNK_SIZE_WITH_PREFIX  202u    /* first chunked CONFIG_WRITE payload: total(2) + 200 */
 #define MAX_CONFIG_CHUNKS              20u     /* upper bound on config chunks in a write */
@@ -853,9 +884,98 @@
  * ==========================================================================
  * Envelope: [cmd:2 BE][nonce:16][ciphertext][tag:12]; inner plaintext is
  * [len:1][payload]; AAD = the 2 opcode bytes; AEAD = AES-128-CCM.
+ * NOTE: this AES-CCM envelope applies to the BLE transport (and plaintext LAN).
+ * On the TLS-PSK LAN channel it MUST NOT be applied -- see SECTION 9 rule 4
+ * (origin-gated decrypt: the dispatcher decides by the frame's ORIGIN transport,
+ * not the global isEncryptionEnabled() flag).
  * ========================================================================== */
 #define BLE_CMD_HEADER_SIZE            2u      /* opcode bytes (also the AAD length) */
 #define ENCRYPTION_NONCE_SIZE          16u     /* envelope nonce (CCM nonce = bytes 3..15) */
 #define ENCRYPTION_TAG_SIZE            12u     /* CCM authentication tag length */
+
+/* ==========================================================================
+ * SECTION 9 -- NETWORK TRANSPORT (LAN)
+ * ==========================================================================
+ * The OpenDisplay command set can also ride a LAN (WiFi) TCP transport, in
+ * addition to BLE. This section is the implement-from-this-file-alone contract
+ * for that transport. It is ADDITIVE: it introduces no new opcodes and no
+ * struct fields -- the same SECTION 1 commands / SECTION 2 responses travel
+ * inside a framed TCP stream. BLE-only peers are unaffected.
+ *
+ * FRAME FORMAT
+ *   Each application message is length-prefixed on the TCP byte stream:
+ *       [len:2 LE][payload]
+ *     - len     : 16-bit LITTLE-ENDIAN byte count of the payload that follows.
+ *     - payload : one command/response frame, EXACTLY as on BLE but WITHOUT the
+ *                 GATT MTU segmentation -- i.e. [cmd_hi][cmd_lo][payload...] for
+ *                 a request, [status][cmd_echo][data...] for a response.
+ *     - The complete WIRE frame (2-byte prefix + payload) MUST NOT exceed
+ *       OD_LAN_MAX_FRAME (4096); equivalently, valid payload length is
+ *       1..OD_LAN_MAX_PAYLOAD (= OD_LAN_MAX_FRAME - 2 = 4094). len == 0 is
+ *       invalid; len > OD_LAN_MAX_PAYLOAD MUST be rejected and the connection
+ *       dropped. Capping the WIRE frame (not the payload) at a power of two is
+ *       deliberate: receiver buffers sized in wire bytes divide evenly.
+ *   A reader MUST handle partial and coalesced TCP reads: read exactly 2 bytes
+ *   for len, then exactly len bytes for the payload.
+ *
+ * NORMATIVE RULES
+ *   (1) MODE / PORT SELECTION -- one channel, chosen by the firmware predicate
+ *       isEncryptionEnabled() (SecurityConfig.encryption_enabled == 1 AND a
+ *       non-zero 16-byte master key):
+ *         - false -> PLAINTEXT framed TCP on the configured WifiConfig.server_port
+ *                    (default OD_LAN_TCP_PORT if server_port == 0) ONLY.
+ *         - true  -> TLS-PSK on the DERIVED port server_port + 1
+ *                    (default OD_LAN_TLS_PORT == OD_LAN_TCP_PORT + 1) ONLY.
+ *       A flag == 1 with a blank/all-zero key is NOT "encrypted" -- it falls back
+ *       to plaintext. The two modes are MUTUALLY EXCLUSIVE: exactly one port is
+ *       served at a time. Clients learn the live port from the mDNS SRV record
+ *       (see rule 6) or authoritatively via CONFIG_READ (0x26): read server_port,
+ *       add 1 for the TLS port.
+ *   (2) NO PIPE ON LAN -- the sliding-window image PIPE (0x0080 / 0x0081 / 0x0082,
+ *       SECTION 6) MUST NOT be used on this transport; TCP already provides
+ *       ordered, reliable, flow-controlled delivery. Stream image data via
+ *       DIRECT_WRITE with chunks of at most OD_LAN_MAX_PAYLOAD - 2 data bytes.
+ *   (3) ONE CLIENT AT A TIME -- the device serves a single network client; a new
+ *       connection EVICTS the prior one. Clients MAY stay persistently connected;
+ *       the server drops a client only after OD_LAN_READ_TIMEOUT_S with no
+ *       traffic. Any valid command resets the idle timer.
+ *   (4) TLS-PSK / NO DOUBLE ENCRYPTION -- on the encrypted channel the PSK is
+ *       DERIVED from the SecurityConfig master key via the existing CMAC KDF
+ *       (the same key derivation used elsewhere); prefer an ECDHE-PSK
+ *       ciphersuite. The TLS handshake IS the authentication: the app-layer
+ *       AUTHENTICATE (0x50) exchange is NOT used on this port. There is NO double
+ *       encryption -- INSIDE the TLS tunnel, frames are PLAINTEXT opcode frames
+ *       and the app-layer AES-CCM envelope (SECTION 8) MUST NOT be applied. The
+ *       dispatcher MUST gate app-layer decrypt/encrypt on the frame's ORIGIN
+ *       transport (TLS-origin bypasses the AEAD envelope; BLE-origin keeps it),
+ *       NOT on the global isEncryptionEnabled() flag.
+ *   (5) IDENTITY -- the BLE MAC is the cross-transport identity anchor. The BLE
+ *       manufacturer-specific data (MSD) is VOLATILE telemetry, NOT identity.
+ *       Correlate a discovered LAN device to its BLE identity via the `mac` mDNS
+ *       TXT key (rule 6); the IP address is only a locator, never an identity.
+ *   (6) DISCOVERY -- mDNS / DNS-SD. Service OD_LAN_MDNS_SERVICE
+ *       ("_opendisplay._tcp"; FQDN "_opendisplay._tcp.local."). TXT record keys:
+ *         mac : REQUIRED. The advertised BLE address, lowercase colon-separated
+ *               (e.g. "aa:bb:cc:dd:ee:ff") -- this is the ADVERTISED BLE address,
+ *               NOT the eFuse / WiFi MAC.
+ *         tls : REQUIRED. "0" or "1"; mirrors isEncryptionEnabled() (1 = the
+ *               served channel is TLS-PSK on server_port + 1).
+ *         fw  : RECOMMENDED. Firmware version "major.minor".
+ *         cm  : RECOMMENDED. communication_modes, 2 lowercase hex digits.
+ *         id  : OPTIONAL. device_id, 8 hex digits.
+ *         pv  : OPTIONAL. protocol version (e.g. "2.2").
+ *         msd : EXISTING. 28 lowercase hex digits of volatile telemetry; throttle
+ *               republish to >= 400 ms.
+ *       The SRV record port MUST equal the ACTIVE mode's port: server_port when
+ *       tls == 0, server_port + 1 when tls == 1. On a config change that flips
+ *       isEncryptionEnabled(), the device MUST re-register the service on the new
+ *       port (and update the `tls` TXT) so clients converge on the live channel.
+ * ========================================================================== */
+#define OD_LAN_TCP_PORT                2446u   /* DEFAULT plaintext port; live port = WifiConfig.server_port (this default if 0) */
+#define OD_LAN_TLS_PORT                2447u   /* DEFAULT TLS-PSK port; DERIVED live = server_port + 1 (== OD_LAN_TCP_PORT + 1) */
+#define OD_LAN_MAX_FRAME               4096u   /* max WIRE frame: [len:2 LE] prefix + payload, inclusive */
+#define OD_LAN_MAX_PAYLOAD             4094u   /* max payload bytes after the prefix; == OD_LAN_MAX_FRAME - 2 */
+#define OD_LAN_MDNS_SERVICE            "_opendisplay._tcp"  /* DNS-SD service; FQDN "_opendisplay._tcp.local." */
+#define OD_LAN_READ_TIMEOUT_S          30u     /* idle timeout: drop a client after this many seconds of no traffic */
 
 #endif /* OPENDISPLAY_PROTOCOL_H */

@@ -47,14 +47,8 @@ bool isEncryptionEnabled();
 void sendResponseUnencrypted(uint8_t* response, uint16_t len);
 void secureEraseConfig();
 extern struct SecurityConfig securityConfig;
-typedef struct {
-    bool active;
-    uint32_t totalSize;
-    uint32_t receivedSize;
-    uint8_t buffer[4096];
-    uint32_t expectedChunks;
-    uint32_t receivedChunks;
-} chunked_write_state_t;
+// chunked_write_state_t comes from config_parser.h; this file used to redefine it
+// with a hardcoded 4096 in place of MAX_CONFIG_SIZE.
 extern chunked_write_state_t chunkedWriteState;
 extern uint8_t configReadResponseBuffer[128];
 extern uint8_t msd_payload[16];
@@ -62,21 +56,18 @@ String getChipIdHex();
 float readBatteryVoltage();
 
 #ifdef TARGET_ESP32
-struct ResponseQueueItem {
-    uint8_t data[512];
-    uint16_t len;
-    bool pending;
-};
+// ResponseQueueItem / RESPONSE_QUEUE_SIZE / MAX_RESPONSE_SIZE come from structs.h.
+// This file previously redeclared the struct with a hardcoded 512 and kept private
+// *_LOCAL copies of both sizes, so the guard in esp32_queue_ble_notify_copy() and the
+// slot it protects were sized in two different files and had to be edited in lockstep.
 extern WiFiClient wifiClient;
 extern bool wifiServerConnected;
-extern ResponseQueueItem responseQueue[10];
+extern ResponseQueueItem responseQueue[RESPONSE_QUEUE_SIZE];
 extern uint8_t responseQueueHead;
 extern uint8_t responseQueueTail;
 // Drains the response ring to BLE (defined in main.cpp). handleReadConfig() calls
 // this between chunks so a multi-chunk config read never overflows the ring.
 extern void flushResponseQueueToBle();
-static constexpr uint8_t RESPONSE_QUEUE_SIZE_LOCAL = 10;
-static constexpr uint16_t MAX_RESPONSE_SIZE_LOCAL = 512;
 
 static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
     if (!wifiServerConnected || !wifiClient.connected() || len == 0) {
@@ -90,14 +81,14 @@ static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
 
 /** Mirror responses to BLE only when a central is connected; LAN already got send_wifi_lan_frame. */
 static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
-    if (len > MAX_RESPONSE_SIZE_LOCAL) {
-        od_log_error("ERROR: Response too large for queue (%u > %u)", len, MAX_RESPONSE_SIZE_LOCAL);
+    if (len > MAX_RESPONSE_SIZE) {
+        od_log_error("ERROR: Response too large for queue (" + String(len) + " > " + String(MAX_RESPONSE_SIZE) + ")", true);
         return;
     }
     if (pServer == nullptr || pServer->getConnectedCount() == 0) {
         return;
     }
-    uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE_LOCAL;
+    uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE;
     if (nextHead == responseQueueTail) {
         od_log_error("ERROR: Response queue full, dropping response");
         return;
@@ -106,10 +97,7 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
     responseQueue[responseQueueHead].len = len;
     responseQueue[responseQueueHead].pending = true;
     responseQueueHead = nextHead;
-    if (!quiet) {
-        uint8_t queueSize = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE_LOCAL) % RESPONSE_QUEUE_SIZE_LOCAL;
-        od_log_debug("ESP32: Response queued (queue size: %u)", queueSize);
-    }
+    if (!quiet) od_log_debug("ESP32: Response queued (queue size: " + String((responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE) + ")", true);
 }
 #endif
 
@@ -367,8 +355,11 @@ void handleFirmwareVersion() {
 }
 
 void handleReadConfig() {
-    uint8_t configData[4096];
-    uint32_t configLen = 4096;
+    // Shared scratch rather than a 4 KB stack array: this runs on the loop task,
+    // where a 4 KB frame is a real overflow risk. Nothing below re-enters a config
+    // path, so no other consumer can claim the scratch while we hold it.
+    uint8_t* configData = getConfigScratch();
+    uint32_t configLen = MAX_CONFIG_SIZE;
     if (loadConfig(configData, &configLen)) {
         uint32_t remaining = configLen;
         uint32_t offset = 0;
@@ -486,7 +477,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         }
         secureEraseConfig();
     }
-    if (len == 0 || len > CONFIG_CHUNK_SIZE || chunkedWriteState.receivedSize + len > 4096 || chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
+    if (len == 0 || len > CONFIG_CHUNK_SIZE || chunkedWriteState.receivedSize + len > MAX_CONFIG_SIZE || chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
         chunkedWriteState.active = false;
         uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
