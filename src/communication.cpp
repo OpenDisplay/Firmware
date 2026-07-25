@@ -24,6 +24,34 @@ extern BLEServer* pServer;
 bool isAuthenticated();
 extern struct GlobalConfig globalConfig;
 
+// F4 -- command origin marker. The shared dispatcher (imageDataWritten) and the
+// response senders read this to (a) BYPASS the app-layer AES-CCM envelope for
+// TLS-secured LAN frames (SECTION 9 rule 4: origin-gated decrypt) and (b) route
+// each response back over ONLY its origin transport (no BLE/LAN dual-delivery).
+// Everything runs on the single loop() task (BLE queue drain + handleWiFiServer),
+// so this plain global needs no locking: it is set immediately before each
+// imageDataWritten() call and restored to ORIGIN_BLE after. On non-LAN builds it
+// stays ORIGIN_BLE for the whole lifetime (LAN never sets it).
+// enum CommandOrigin lives in communication.h so display_service.cpp / main.cpp can
+// name the values instead of comparing against a bare 0.
+volatile uint8_t g_commandOrigin = ORIGIN_BLE;
+
+// Transport tag for the RX banner and TX dump. Three transports share this
+// dispatcher (nRF BLE, ESP32 BLE via commandQueue, ESP32 LAN), and without a tag
+// the log cannot show which one a frame took -- in particular whether a frame used
+// the TLS CCM-bypass path. Accurate at every call site below because the LAN
+// listener sets g_commandOrigin immediately around its dispatch. Always "BLE" on
+// nRF and on ESP32 builds without the LAN transport.
+uint8_t commandOrigin(void) { return g_commandOrigin; }
+
+static const char* originTag(void) {
+    switch (g_commandOrigin) {
+        case ORIGIN_LAN_TLS:   return "LAN-TLS";
+        case ORIGIN_LAN_PLAIN: return "LAN";
+        default:               return "BLE";
+    }
+}
+
 static void reloadConfigAfterSave(void) {
     if (!loadGlobalConfig()) {
         od_log_warn("WARNING: Config was saved but reload from storage failed (see errors above). "
@@ -37,8 +65,11 @@ static void reloadConfigAfterSave(void) {
         epdSessionForceOff();
     }
     clearEncryptionSession();
-#ifdef TARGET_ESP32
-    initWiFi();
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Non-blocking: a config write arrives over a live BLE link, and the blocking
+    // form stalls the loop task for up to 36 s of connect retries, freezing BLE
+    // command processing. handleWiFiServer() starts the LAN server on association.
+    initWiFi(false);
 #endif
 }
 bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* ciphertext,
@@ -69,17 +100,7 @@ extern uint8_t responseQueueTail;
 // this between chunks so a multi-chunk config read never overflows the ring.
 extern void flushResponseQueueToBle();
 
-static void send_wifi_lan_frame(const uint8_t* payload, uint16_t len) {
-    if (!wifiServerConnected || !wifiClient.connected() || len == 0) {
-        return;
-    }
-    uint8_t hdr[2] = { (uint8_t)(len & 0xFF), (uint8_t)((len >> 8) & 0xFF) };
-    if (wifiClient.write(hdr, 2) != 2 || wifiClient.write(payload, len) != len) {
-        od_log_error("ERROR: LAN response write incomplete");
-    }
-}
-
-/** Mirror responses to BLE only when a central is connected; LAN already got send_wifi_lan_frame. */
+/** Mirror responses to BLE only when a central is connected; LAN responses go via opendisplay_lan_send_frame. */
 static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
     if (len > MAX_RESPONSE_SIZE) {
         od_log_error("ERROR: Response too large for queue (%u > %u)", len, MAX_RESPONSE_SIZE);
@@ -97,10 +118,12 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
     responseQueue[responseQueueHead].len = len;
     responseQueue[responseQueueHead].pending = true;
     responseQueueHead = nextHead;
-    if (!quiet) {
-        uint8_t queueSize = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
-        od_log_debug("ESP32: Response queued (queue size: %u)", queueSize);
-    }
+    // The "[BLE][Q:n] TX ..." line above already reports every response and its
+    // queue depth, so the nominal enqueue (depth 1, drained next loop pass) is
+    // pure noise. Log only when a backlog is forming and the 10-slot ring is at
+    // risk of dropping responses.
+    const uint8_t depth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
+    if (!quiet && depth >= 2) od_log_debug("BLE: response queue backlog (queue size: %u)", depth);
 }
 #endif
 
@@ -191,8 +214,14 @@ void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
     buildHexDump(hexDump, sizeof(hexDump), "  Full command: ", response, len);
     od_log_debug("%s", hexDump);
 #ifdef TARGET_ESP32
-    send_wifi_lan_frame(response, len);
-    esp32_queue_ble_notify_copy(response, len);
+    // F4 de-fan-out: reply over the origin transport only.
+    if (g_commandOrigin == ORIGIN_BLE) {
+        esp32_queue_ble_notify_copy(response, len);
+    } else {
+#ifdef OPENDISPLAY_HAS_WIFI
+        opendisplay_lan_send_frame(response, len);
+#endif
+    }
 #endif
 #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
@@ -220,7 +249,9 @@ void sendResponse(uint8_t* response, uint16_t len) {
     // Length test uses the plaintext ACK (encryption happens after this check).
     const bool quietAck = (len == 2 && response[0] == 0x00 && response[1] == 0x71 && imageWriteLogQuietAck())
                        || (len == 7 && response[0] == 0x00 && response[1] == 0x81 && imageWriteLogQuietAck());
-    if (isAuthenticated() && len >= 2) {
+    // TLS-origin responses are already secured by the TLS record layer; never wrap
+    // them in the app-layer CCM envelope (no double-encrypt; SECTION 9 rule 4).
+    if (isAuthenticated() && len >= 2 && g_commandOrigin != ORIGIN_LAN_TLS) {
         uint16_t command = (response[0] << 8) | response[1];
         // The 7-byte PIPE data ACK {0x00,0x81,highest_seen,mask:4} carries a rolling
         // seq at byte[2]; a highest_seen of 0xFE/0xFF (any image >= 255 chunks) must
@@ -238,7 +269,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
             uint16_t encrypted_len = 0;
             if (encryptResponse(response, len, encrypted_response, &encrypted_len, nonce, auth_tag)) {
                 if (!quietAck) {
-                    od_log_debug("Sending encrypted response:");
+                    od_log_debug("[%s] Sending encrypted response:", originTag());
                     od_log_debug("  Original length: %u bytes", len);
                     od_log_debug("  Encrypted length: %u bytes", encrypted_len);
                 }
@@ -253,7 +284,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
                 len = sizeof(errorResponse);
             }
         } else if (!quietAck) {
-            od_log_debug("Sending unencrypted response (authentication/firmware version/error)");
+            od_log_debug("[%s] Sending unencrypted response (authentication/firmware version/error)", originTag());
         }
     }
 
@@ -262,7 +293,17 @@ void sendResponse(uint8_t* response, uint16_t len) {
         // is also the first two bytes of the dump). Replaces the old 4-line block.
         uint16_t cmd = (response[0] << 8) | response[1];
         char line[160];
-        int pos = snprintf(line, sizeof(line), "BLE: TX 0x%04X (%u B):", cmd, (unsigned)len);
+        int pos;
+#ifdef TARGET_ESP32
+        // Queue depth *before* this response is enqueued, so a healthy path reads
+        // [BLE][Q:0] and a rising Q flags the drain falling behind the producer.
+        if (g_commandOrigin == ORIGIN_BLE) {
+            const uint8_t qdepth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
+            pos = snprintf(line, sizeof(line), "[%s][Q:%u] TX 0x%04X (%u B):",
+                           originTag(), (unsigned)qdepth, cmd, (unsigned)len);
+        } else
+#endif
+        pos = snprintf(line, sizeof(line), "[%s] TX 0x%04X (%u B):", originTag(), cmd, (unsigned)len);
         if (pos < 0) {
             pos = 0;
             line[0] = '\0';
@@ -281,8 +322,14 @@ void sendResponse(uint8_t* response, uint16_t len) {
         od_log_debug("%s", line);
     }
 #ifdef TARGET_ESP32
-    send_wifi_lan_frame(response, len);
-    esp32_queue_ble_notify_copy(response, len, quietAck);
+    // F4 de-fan-out: reply over the origin transport only.
+    if (g_commandOrigin == ORIGIN_BLE) {
+        esp32_queue_ble_notify_copy(response, len, quietAck);
+    } else {
+#ifdef OPENDISPLAY_HAS_WIFI
+        opendisplay_lan_send_frame(response, len);
+#endif
+    }
 #endif
 #ifdef TARGET_NRF
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
@@ -593,7 +640,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     if (!quietCmd) {
         const char* name = commandName(command);
         if (name != nullptr) {
-            od_log_info("=== %s COMMAND (0x%04X) ===", name, command);
+            od_log_info("=== [%s] %s COMMAND (0x%04X) ===", originTag(), name, command);
         }
     }
 
@@ -609,16 +656,20 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         return;
     }
 
-    if (isEncryptionEnabled()) {
+    // SECTION 9 rule 4 (origin-gated decrypt): a frame arriving on the TLS-PSK LAN
+    // channel is already confidential + authenticated by TLS, so the app-layer
+    // AES-CCM envelope MUST NOT be required/applied — dispatch its plaintext
+    // command directly. BLE and plaintext-LAN frames still honor the CCM gate.
+    if (isEncryptionEnabled() && g_commandOrigin != ORIGIN_LAN_TLS) {
         if (!isAuthenticated()) {
-            od_log_error("ERROR: Command requires authentication (encryption enabled)");
+            od_log_error("ERROR: [%s] Command requires authentication (encryption enabled)", originTag());
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
 
         if (len < BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE) {
-            od_log_error("ERROR: Unencrypted command received when encryption is enabled");
+            od_log_error("ERROR: [%s] Unencrypted command received when encryption is enabled", originTag());
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;

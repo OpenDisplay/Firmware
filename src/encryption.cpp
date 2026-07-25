@@ -173,6 +173,19 @@ void incrementNonceCounter() {
     }
 }
 
+// Derive the LAN TLS-PSK from the master key with AES-CMAC over a fixed label.
+// Mirrors the KDF-label convention used by deriveSessionKey ("OpenDisplay
+// session"); here the label is "opendisplay-tls-psk". The 16-byte CMAC output is
+// the PSK; the PSK identity presented on the wire is the fixed string
+// "opendisplay" (must match the py-opendisplay TcpTransport client).
+bool deriveTlsPsk(uint8_t* psk_out16) {
+    if (psk_out16 == nullptr) return false;
+    if (!isEncryptionEnabled()) return false;
+    const char* label = "opendisplay-tls-psk";
+    return aes_cmac(securityConfig.encryption_key,
+                    reinterpret_cast<const uint8_t*>(label), strlen(label), psk_out16);
+}
+
 bool isEncryptionEnabled() {
     return (securityConfig.encryption_enabled == 1) &&
            (securityConfig.encryption_key[0] != 0 ||

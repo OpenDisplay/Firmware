@@ -5,6 +5,7 @@
 #include "encryption_state.h"
 #include "encryption.h"
 #include "power_latch.h"
+#include "wifi_service.h"  // OPENDISPLAY_HAS_WIFI + lanActivePort()/lanTlsEnabled()
 #include <Arduino.h>
 #include <string.h>
 
@@ -31,6 +32,10 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_PWR_LATCH_DFF (1 << 4)
 #endif
 
+// The parse-time dumps and printConfigSummary() are od_log_debug, which the
+// default OD_LOG_LEVEL (INFO) compiles out entirely -- so they no longer cost
+// serial time in the deep-sleep wake window and need no runtime quiet flag.
+
 extern struct GlobalConfig globalConfig;
 extern uint8_t activeLedInstance;
 extern char wifiSsid[33];
@@ -40,7 +45,7 @@ extern bool wifiConfigured;
 #ifdef TARGET_ESP32
 extern char wifiServerUrl[65];
 extern uint16_t wifiServerPort;
-extern bool wifiServerConfigured;
+// extern bool wifiServerConfigured;  // dead -- see the 0x26 wifi_config parse
 extern bool wifiConnected;
 extern bool wifiInitialized;
 #endif
@@ -545,29 +550,28 @@ bool loadGlobalConfig(){
                         wifiServerPort = 2446;
                     }
 
-                    wifiServerConfigured = (wifiServerUrl[0] != '\0' &&
-                                           strcmp(wifiServerUrl, "0.0.0.0") != 0);
-                    if (wifiServerConfigured) {
-                        od_log_debug("Server configured: YES");
-                        od_log_debug("Server URL: \"%s\"", wifiServerUrl);
-                        od_log_debug("Server Port: %u", wifiServerPort);
-                    } else {
-                        od_log_debug("Server configured: NO");
-                        if (wifiServerUrl[0] == '\0') {
-                            od_log_debug("Reason: URL is empty");
-                        } else if (strcmp(wifiServerUrl, "0.0.0.0") == 0) {
-                            od_log_debug("Reason: URL is \"0.0.0.0\"");
-                        }
-                    }
+                    // wifiServerConfigured is dead: it was only ever read by the log
+                    // lines that used to sit here. It described the old "tag pushes to
+                    // an upload server" model, but the LAN transport inverted that --
+                    // the device listens and the host connects to it, so server_host
+                    // gates nothing. server_host stays part of the 0x26 wire format.
+                    //
+                    // Report the endpoint the LAN listener will actually bind, not just
+                    // the raw config field: the TLS-PSK channel runs on server_port + 1
+                    // and there is no config entry for it.
+#ifdef OPENDISPLAY_HAS_WIFI
+                    od_log_debug("LAN: %s on port %u (server_port %u)",
+                                 lanTlsEnabled() ? "TLS-PSK" : "plaintext",
+                                 (unsigned)lanActivePort(), (unsigned)wifiServerPort);
+#else
+                    od_log_debug("LAN: transport not compiled in (server_port %u)", (unsigned)wifiServerPort);
+#endif
 #endif
                     wifiConfigured = true;
                     od_log_info("=== WiFi Configuration Loaded ===");
-                    od_log_debug("SSID: \"%s\"", wifiSsid);
-                    if (passwordLen > 0) {
-                        od_log_debug("Password: \"%s\"", wifiPassword);
-                    } else {
-                        od_log_debug("Password: (empty)");
-                    }
+                    // Do NOT log the SSID or password (credentials). Presence/length only.
+                    od_log_debug("SSID: (set, %u chars)", ssidLen);
+                    od_log_debug("Password: %s", passwordLen > 0 ? "(set)" : "(empty)");
                     const char* encTypeStr = "Unknown";
                     switch (wifiEncryptionType) {
                         case 0x00: encTypeStr = "None (Open)"; break;
@@ -664,7 +668,7 @@ void printConfigSummary(){
     #ifdef TARGET_ESP32
     if (globalConfig.system_config.communication_modes & COMM_MODE_WIFI) {
         if (wifiConfigured) {
-            od_log_debug("  WiFi SSID: \"%s\"", wifiSsid);
+            od_log_debug("  WiFi SSID: (configured)");  // credential; not logged verbatim
             if (wifiInitialized) {
                 if (wifiConnected) {
                     String localIp = WiFi.localIP().toString();

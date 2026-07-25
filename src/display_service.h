@@ -64,6 +64,10 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len);
 void resetPipeWriteState(void);
 // True while a PIPE_WRITE stream is active (mid-transfer log suppression, resets).
 bool pipeWriteActive(void);
+// True while ANY transfer (DIRECT / PIPE / PARTIAL) is streaming. Use this for
+// "is the device busy" gates; test an individual flag only when the logic is
+// genuinely specific to that one transfer type.
+bool transferActive(void);
 void handleDirectWriteEnd(uint8_t* data, uint16_t len);
 // True while an image push is mid-stream and the per-frame command/ack logging
 // should be suppressed (chunk 1 still logs in full; the meter covers the rest).
@@ -74,6 +78,9 @@ extern volatile bool epdRefreshInProgress;
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
 void checkPartialWriteTimeout(void);
 void cleanupPartialWriteOnDisconnect(void);
+// Origin (see commandOrigin()) of the transport that opened the in-flight transfer.
+// A disconnect must only tear down a session its own transport owns.
+uint8_t transferSessionOrigin(void);
 int getplane();
 int getBitsPerPixel();
 

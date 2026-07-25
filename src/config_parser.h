@@ -55,6 +55,8 @@ bool hasValidStoredConfig(void);
 uint32_t calculateConfigCRC(uint8_t* data, uint32_t len);
 bool loadGlobalConfig();
 void printConfigSummary();
+// Suppress the informational config dumps (parse-time detail + printConfigSummary)
+// without touching ERROR/WARNING output. Used to keep a deep-sleep wake quiet.
 void full_config_init();
 
 // The one 4 KB config staging buffer, shared by every consumer that needs a
