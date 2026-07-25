@@ -100,46 +100,6 @@ static mbedtls_entropy_context  tlsEntropy;
 
 static uint32_t lastLanActivityMs = 0;  // for the OD_LAN_READ_TIMEOUT_S idle drop
 
-// --------------------------------------------------- transfer power save ---
-// Sticky across the whole transfer, unlike g_commandOrigin (per-frame, restored to
-// ORIGIN_BLE right after each dispatch). A transfer can be torn down from a loop()
-// timeout, disconnect cleanup, or an error path -- none of which know the origin --
-// so suspend is origin-gated at START and restore is unconditional everywhere else.
-static bool lanPsSuspended = false;
-
-// INTENTIONAL NO-OP -- do NOT re-enable WIFI_PS_NONE here.
-//
-// This was meant to dodge a DTIM ack-ladder stall by dropping modem sleep for the
-// duration of a LAN transfer. On this hardware WiFi and BLE share ONE radio and
-// software coexistence is compiled in (CONFIG_SW_COEXIST_ENABLE). The coex arbiter
-// relies on WiFi's modem-sleep (WIFI_PS_MIN_MODEM) windows to time-share the antenna
-// with the always-on BLE advertiser. WIFI_PS_NONE tells the AP "I never sleep, send
-// anytime", which is a lie under coex: BLE still periodically steals the radio, so the
-// AP fires downlink into windows where the device is off-channel. Those frames are
-// dropped at the PHY -> TCP retransmit + backoff on nearly every packet -> throughput
-// collapses to a crawl (measured on hardware, 2026-07-23). It hits WiFi in BOTH
-// directions (inbound data AND outbound acks), even though the transfer never touches
-// BLE -- BLE only has to EXIST for coex to be active.
-//
-// The DTIM stall it was chasing was measured negligible, so there is nothing to trade
-// off: the radio stays at the default WIFI_PS_MIN_MODEM for the whole session. The
-// function and its restore/safety-net machinery are retained as harmless no-ops
-// (lanPsSuspended never flips true) so the call sites and hook stay in place.
-void lanPowerSaveSuspend(void) {
-    // Deliberately does not touch esp_wifi_set_ps(). See the note above.
-}
-
-void lanPowerSaveRestore(void) {
-    if (!lanPsSuspended) return;
-    lanPsSuspended = false;
-    // Only touch the radio if it is still associated: after a disconnect the
-    // reconnect path re-applies MIN_MODEM itself (and would fail here anyway).
-    if (wifiConnected) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    lanLog("LAN: power save restored (WIFI_PS_MIN_MODEM)");
-}
-
-bool lanPowerSaveSuspended(void) { return lanPsSuspended; }
-
 static uint16_t lanBasePort(void) {
     return (wifiServerPort != 0) ? wifiServerPort : (uint16_t)OD_LAN_TCP_PORT;
 }
@@ -758,8 +718,8 @@ void initWiFi(bool waitForConnection) {
     lanLog("=== Initializing WiFi ===");
 
     // WiFi is NOT gated on power_mode: if COMM_MODE_WIFI is enabled the radio comes
-    // up on battery too. Radio cost on battery is managed by WIFI_PS_MIN_MODEM
-    // (below) and by deep sleep, not by refusing to associate.
+    // up on battery too. Radio cost on battery is managed by the driver's default
+    // power-save mode and by deep sleep, not by refusing to associate.
     if (!(globalConfig.system_config.communication_modes & COMM_MODE_WIFI)) {
         lanLog("WiFi not enabled in communication_modes, skipping");
         wifiInitialized = false;
@@ -828,7 +788,6 @@ void initWiFi(bool waitForConnection) {
         wifiConnected = true;
         lanLog("=== WiFi connected ===");
         lanLog("IP: " + WiFi.localIP().toString());
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // F5: modem sleep between beacons
         startLanServer();
     } else {
         wifiConnected = false;
@@ -845,11 +804,6 @@ void disconnectWiFiServer() {
     }
     wifiServerConnected = false;
     tcpReceiveBufferPos = 0;
-    // The client is gone, so any transfer it owned is dead. Restore here rather than
-    // relying on the deferred cleanup below: serviceBleDisconnectCleanup() skips
-    // teardown while an EPD refresh is in flight or when the other transport still
-    // owns the session, either of which would leave the radio stuck at full power.
-    lanPowerSaveRestore();
     // F4: abort any in-flight direct-write / pipe / partial transfer + tear down a
     // mid-transfer panel session, DEFERRED to loop() (serviceBleDisconnectCleanup)
     // so cleanup never races an in-progress EPD refresh. Reuses the BLE path's flag.
@@ -905,11 +859,6 @@ void handleWiFiServer() {
         lanLog("IP: " + WiFi.localIP().toString() +
                     ", RSSI " + String(WiFi.RSSI()) + " dBm, ch " + String(WiFi.channel()) +
                     ", BSSID " + WiFi.BSSIDstr());
-        // Re-association: any transfer that suspended power save died with the old
-        // link, so clear the flag here rather than leaving it stuck across the
-        // reconnect (the teardown funnels may not run if the client vanished).
-        lanPowerSaveRestore();
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         startLanServer();
     }
     if (!wifiConnected || WiFi.status() != WL_CONNECTED) {

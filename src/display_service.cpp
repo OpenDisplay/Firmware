@@ -1914,10 +1914,10 @@ static void imageWriteLogFinish(uint32_t written, uint32_t total) {
     }
     if (elapsedMs > 0) {
         float rate = (float)written / 1.024f / (float)elapsedMs;  // bytes/ms /1.024 = KB/s
-        od_log_debug("DW complete: %u chunks, %u/%u bytes,%s, %.2f s, %.1f KB/s",
+        od_log_info("DW complete: %u chunks, %u/%u bytes,%s, %.2f s, %.1f KB/s",
                     (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, mode, elapsedMs / 1000.0f, rate);
     } else {
-        od_log_debug("DW complete: %u chunks, %u/%u bytes,%s, %.2f s, n/a KB/s",
+        od_log_info("DW complete: %u chunks, %u/%u bytes,%s, %.2f s, n/a KB/s",
                     (unsigned)imgLogChunks, (unsigned)written, (unsigned)total, mode, elapsedMs / 1000.0f);
     }
 }
@@ -2008,11 +2008,6 @@ static void directWriteSinkBytes(uint8_t* data, uint32_t len) {
 static bool directWriteTouchSuspended = false;
 
 void cleanupDirectWriteState(bool refreshDisplay) {
-#ifdef OPENDISPLAY_HAS_WIFI
-    // Sole clearer of directWriteActive, so this is the one place that reliably
-    // re-arms modem sleep after a full-frame transfer. No-op when nothing suspended it.
-    lanPowerSaveRestore();
-#endif
     directWriteActive = false;
     directWriteCompressed = false;
     directWriteBitplanes = false;
@@ -2156,15 +2151,6 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
             return;
         }
     }
-#ifdef OPENDISPLAY_HAS_WIFI
-    // Modem sleep only wakes the radio at each DTIM beacon, so the per-chunk 0x71 ack
-    // ladder that follows can stall up to DTIM x 102.4 ms on every inbound frame.
-    // Position is load-bearing: the prior-session cleanups at the head of this function
-    // each call lanPowerSaveRestore(), so a suspend above them is undone. Below them
-    // every exit funnels through cleanupDirectWriteState(), which re-arms modem sleep --
-    // including the zlib-failure return just after this call.
-    if (sessionOrigin != ORIGIN_BLE) lanPowerSaveSuspend();
-#endif
     directWriteActivatePanel();
     if (compressed && len > 4) {
         uint32_t compressedDataLen = len - 4;
@@ -2250,14 +2236,6 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
     memset(&partialCtx, 0, sizeof(partialCtx));
     partialCtx.active = true;
-#ifdef OPENDISPLAY_HAS_WIFI
-    // Same per-chunk 0x71 ack ladder as a full-frame write. Must go AFTER active=true,
-    // not earlier in this function: every validation return above passes
-    // cleanupState=false to send_direct_write_nack, so none reaches a restore and a
-    // malformed header would strand the radio at full power. From here on,
-    // cleanup_partial_write_state() covers every exit.
-    if (sessionOrigin != ORIGIN_BLE) lanPowerSaveSuspend();
-#endif
     partialCtx.compressed = (flags & PARTIAL_FLAG_COMPRESSED) != 0;
     partialCtx.flags = flags;
     partialCtx.new_etag = newEtag;
@@ -2991,11 +2969,6 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
 }
 
 static void cleanup_partial_write_state(void) {
-#ifdef OPENDISPLAY_HAS_WIFI
-    // Sole clearer of partialCtx.active, so this is the one place that reliably
-    // re-arms modem sleep for a partial transfer. No-op when nothing suspended it.
-    lanPowerSaveRestore();
-#endif
     // Tear the panel down only when a transfer/refresh is actually in flight
     // (PWR_ACTIVE) — i.e. on error / NACK / disconnect-mid-stream / watchdog. After
     // a successful refresh, epdSessionRelease already moved to PWR_WARM, so

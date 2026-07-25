@@ -442,24 +442,6 @@ void loop() {
     }
     checkPartialWriteTimeout();
     #ifdef OPENDISPLAY_HAS_WIFI
-    // Belt-and-braces for the transfer-scoped WIFI_PS_NONE. The suspend/restore pair is
-    // already closed by construction (restore lives in the sole clearer of each active
-    // flag), so this should never fire -- but a stuck WIFI_PS_NONE is a silent battery
-    // drain with no user-visible symptom, and a future fourth way to end a transfer
-    // would leak it. Re-arm only after the state has been quiet for a while, so a brief
-    // gap between two back-to-back pushes does not thrash the radio.
-    static uint32_t psIdleSinceMs = 0;
-    if (lanPowerSaveSuspended() && !directWriteActive && !partialWriteActive()) {
-        if (psIdleSinceMs == 0) {
-            psIdleSinceMs = millis();
-        } else if ((millis() - psIdleSinceMs) > 5000UL) {
-            od_log_warn("WARNING: WiFi power save left suspended with no transfer active - restoring");
-            lanPowerSaveRestore();
-            psIdleSinceMs = 0;
-        }
-    } else {
-        psIdleSinceMs = 0;
-    }
     // WiFi handling runs after BLE queue processing to avoid blocking
     // BLE command responses (moved from top of loop in v1.6 fix).
     handleWiFiServer();
