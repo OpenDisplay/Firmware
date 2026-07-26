@@ -4,24 +4,36 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  # The environment list lives in .github/firmware-targets.json, shared with
+  # release.yml. Keeping one list means CI can't build a target the release
+  # forgets to ship (which is how esp32-N4 went unreleased) or vice versa.
+  targets:
+    name: Load targets
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      environments: ${{ steps.load.outputs.environments }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: load
+        run: |
+          set -euo pipefail
+          envs=$(jq -c '[.targets[].env]' .github/firmware-targets.json)
+          echo "environments=${envs}" >> "${GITHUB_OUTPUT}"
+          echo "Building: $(echo "${envs}" | jq -r 'join(", ")')"
+
+  build:
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        environment:
-          - nrf52840custom
-          - esp32-s3-N16R8
-          - esp32-s3-N8R8
-          - esp32-s3-N32R8
-          - esp32-s3-N32R8-extuart
-          - esp32-s3-N16R8-extuart
-          - esp32-s3-E1004
-          - esp32-c3-N4
-          - esp32-c3-N16
-          - esp32-c6-N4
-          - esp32-N4
+        environment: ${{ fromJSON(needs.targets.outputs.environments) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -37,8 +49,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # Pinned to the same Core version release.yml uses. Unpinned here, CI can
+      # pass on a different Core than the one that builds the release — the
+      # exact split that broke the C3/C6 builds when the ESP platform was
+      # floating on `stable` (see the 55.03.39 pin in platformio.ini).
+      # Bump deliberately, together with release.yml.
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: pip install platformio==6.1.19
 
       - name: Build ${{ matrix.environment }}
         run: platformio run --environment ${{ matrix.environment }}

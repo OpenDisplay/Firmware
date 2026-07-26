@@ -1,0 +1,115 @@
+{
+  "$comment": [
+    "Single source of truth for the firmware build targets.",
+    "Consumed by both .github/workflows/main.yaml (CI) and .github/workflows/release.yml",
+    "(release artifacts) via fromJSON, so the two can never disagree about which targets",
+    "exist or how they are packaged.",
+    "",
+    "Adding a board = adding an entry here. Nothing else needs to change.",
+    "",
+    "Fields (esp32 family):",
+    "  chip              - esptool --chip value. NOT derivable from the env name.",
+    "  flash_size        - esptool --flash_size; matches board_upload.flash_size in platformio.ini.",
+    "  flash_mode/freq   - baked into the merged image header by esptool merge_bin.",
+    "  bootloader_offset - 0x0000 on S3/C3/C6; 0x1000 on the classic ESP32.",
+    "",
+    "Debug-only envs in platformio.ini (e.g. esp32-s3-N16R8-extuart-debug) are deliberately",
+    "absent: this file lists what ships."
+  ],
+  "targets": [
+    {
+      "env": "nrf52840custom",
+      "family": "nrf52"
+    },
+    {
+      "env": "esp32-s3-N16R8",
+      "family": "esp32",
+      "chip": "esp32-s3",
+      "flash_size": "16MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-s3-N16R8-extuart",
+      "family": "esp32",
+      "chip": "esp32-s3",
+      "flash_size": "16MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-s3-N8R8",
+      "family": "esp32",
+      "chip": "esp32-s3",
+      "flash_size": "8MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-s3-N32R8",
+      "family": "esp32",
+      "chip": "esp32-s3",
+      "flash_size": "32MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-s3-N32R8-extuart",
+      "family": "esp32",
+      "chip": "esp32-s3",
+      "flash_size": "32MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-s3-E1004",
+      "family": "esp32",
+      "chip": "esp32-s3",
+      "flash_size": "32MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-c6-N4",
+      "family": "esp32",
+      "chip": "esp32-c6",
+      "flash_size": "4MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-c3-N4",
+      "family": "esp32",
+      "chip": "esp32-c3",
+      "flash_size": "4MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-c3-N16",
+      "family": "esp32",
+      "chip": "esp32-c3",
+      "flash_size": "16MB",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "bootloader_offset": "0x0000"
+    },
+    {
+      "env": "esp32-N4",
+      "family": "esp32",
+      "chip": "esp32",
+      "flash_size": "4MB",
+      "flash_mode": "dio",
+      "flash_freq": "40m",
+      "bootloader_offset": "0x1000"
+    }
+  ]
+}
