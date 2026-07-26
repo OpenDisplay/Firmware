@@ -52,6 +52,124 @@ static const char* originTag(void) {
     }
 }
 
+// ------------------------------------------- unauthenticated-command guard ---
+// The encryption gate answers every gated frame sent without a usable session
+// with RESP_AUTH_REQUIRED and has no counter of its own, so a client that
+// ignores 0xFE can drive one response + one unrate-limited error line per frame
+// indefinitely. Observed in the field: a client that got 00 70 FE and streamed
+// its 0x0071 image data anyway, ~100 ms apart, until it ran out of image.
+//
+// Count consecutive 0xFE answers; at the threshold, drop the link. That forces
+// the client through a fresh connect + CMD_AUTHENTICATE (0x0050) handshake
+// instead of letting it spin.
+//
+// TEN, not three. Two reasons it cannot be tighter:
+//   - A legitimate client may probe several gated commands before it
+//     authenticates. The field trace shows 0x0040, 0x0044, 0x0070 and then data
+//     frames -- a threshold of 3 disconnects that client mid-connect, before it
+//     ever gets a chance to run the handshake.
+//   - It matches the only other auth-abuse limit in the firmware, the
+//     10-attempts-per-60s cap on CMD_AUTHENTICATE (encryption.cpp), which exists
+//     for the same "confused client, not attacker" case.
+// It is a count, not a rate: 10 rejections spread over an hour still drop the
+// link, because nothing in between cleared the counter.
+//
+// CONSECUTIVE. Any frame that clears the gate resets it (see the reset below the
+// decrypt), as does a successful authentication (encryption.cpp calls
+// resetAuthGateRejects when it sets authenticated = true). A client that gets one
+// command wrong and then authenticates never trips it.
+//
+// BLE ONLY. encryptionSession is a single global shared by BLE and LAN, so
+// counting a LAN peer's rejections here would let it cost an unrelated BLE
+// client its link -- the same cross-transport bleed auth_attempts already has.
+// LAN-TLS frames bypass the gate entirely; LAN-plaintext ones are answered 0xFE
+// as before, just not counted.
+#define AUTH_GATE_MAX_CONSECUTIVE_REJECTS 10
+
+// 0xFFFF is BLE_CONN_HANDLE_INVALID on the nRF SoftDevice and is never a valid
+// NimBLE handle either, so it means "no link" on both stacks.
+#define AUTH_GUARD_NO_CONN_HANDLE 0xFFFFu
+
+static uint8_t authGateRejects = 0;
+static uint16_t authGateLastHandle = AUTH_GUARD_NO_CONN_HANDLE;
+static volatile bool authAbuseDisconnectPending = false;
+static volatile uint16_t authAbuseDisconnectHandle = AUTH_GUARD_NO_CONN_HANDLE;
+
+void resetAuthGateRejects(void) { authGateRejects = 0; }
+
+// The live central's handle, asked of the stack rather than cached from the
+// connect callbacks: both stacks already track it, and mirroring it here would
+// mean a second copy to keep in sync across every connect/disconnect path
+// (including the ones that fire on reconnect during a refresh).
+static uint16_t authGuardLiveConnHandle(void) {
+#ifdef TARGET_NRF
+    return Bluefruit.connHandle();   // BLE_CONN_HANDLE_INVALID when idle
+#endif
+#ifdef TARGET_ESP32
+    if (pServer == nullptr || pServer->getConnectedCount() == 0) return AUTH_GUARD_NO_CONN_HANDLE;
+    return pServer->getPeerInfo(0).getConnHandle();
+#endif
+}
+
+void rejectUnauthenticated(uint16_t command) {
+    uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
+    sendResponseUnencrypted(response, sizeof(response));
+
+    if (g_commandOrigin != ORIGIN_BLE) return;
+
+    // A different central than the one that accrued the count gets a clean slate:
+    // a client must never inherit its predecessor's rejections and be dropped
+    // early for them.
+    const uint16_t handle = authGuardLiveConnHandle();
+    if (handle != authGateLastHandle) {
+        authGateLastHandle = handle;
+        authGateRejects = 0;
+    }
+
+    if (authGateRejects < 0xFF) authGateRejects++;
+    if (authGateRejects < AUTH_GATE_MAX_CONSECUTIVE_REJECTS) return;
+
+    od_log_error("ERROR: %u consecutive unauthenticated commands (last 0x%04X) -- BLE link drop pending",
+                 (unsigned)authGateRejects, (unsigned)command);
+    authGateRejects = 0;
+    // Flag-only: this runs on the BLE host task (NimBLE) or in a SoftDevice
+    // callback (nRF), and tearing a link down from inside the stack's own write
+    // callback is how you get a use-after-free. loop() does the work, after the
+    // response queue drains, so the client still receives this last 0xFE. Same
+    // deferral bleDisconnectCleanupPending already uses.
+    //
+    // The offender's handle rides along with the request so the deferred drop
+    // can verify it is still dropping the same link.
+    authAbuseDisconnectHandle = handle;
+    authAbuseDisconnectPending = true;
+}
+
+void serviceBleAuthAbuseDisconnect(void) {
+    if (!authAbuseDisconnectPending) return;
+    const uint16_t handle = authAbuseDisconnectHandle;
+    // Clear before disconnecting: the nRF disconnect callback runs synchronously
+    // from Bluefruit.disconnect(), and would otherwise leave a stale request
+    // armed against whatever link comes next.
+    authAbuseDisconnectPending = false;
+    if (handle == AUTH_GUARD_NO_CONN_HANDLE) return;   // peer already left
+    // Between the rejection and this pass the offender may have disconnected and
+    // another central taken its place. Drop only the link that actually earned
+    // it -- never the innocent client that replaced it.
+    if (handle != authGuardLiveConnHandle()) {
+        od_log_info("Auth-abuse drop skipped: offending link %u is already gone", (unsigned)handle);
+        return;
+    }
+
+    od_log_error("ERROR: Dropping BLE link (handle %u) after repeated unauthenticated commands",
+                 (unsigned)handle);
+#ifdef TARGET_NRF
+    Bluefruit.disconnect(handle);
+#endif
+#ifdef TARGET_ESP32
+    if (pServer != nullptr) pServer->disconnect(handle);
+#endif
+}
+
 static void reloadConfigAfterSave(void) {
     if (!loadGlobalConfig()) {
         od_log_warn("WARNING: Config was saved but reload from storage failed (see errors above). "
@@ -663,15 +781,13 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     if (isEncryptionEnabled() && g_commandOrigin != ORIGIN_LAN_TLS) {
         if (!isAuthenticated()) {
             od_log_error("ERROR: [%s] Command requires authentication (encryption enabled)", originTag());
-            uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
-            sendResponseUnencrypted(response, sizeof(response));
+            rejectUnauthenticated(command);
             return;
         }
 
         if (len < BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE) {
             od_log_error("ERROR: [%s] Unencrypted command received when encryption is enabled", originTag());
-            uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
-            sendResponseUnencrypted(response, sizeof(response));
+            rejectUnauthenticated(command);
             return;
         }
 
@@ -746,8 +862,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             if (decrypt_reason == NONCE_BAD_SESSION) {
                 od_log_warn("Nonce session_id mismatch on 0x%04X - answering AUTH_REQUIRED so the client re-authenticates",
                             (unsigned)command);
-                uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
-                sendResponseUnencrypted(response, sizeof(response));
+                rejectUnauthenticated(command);
                 return;
             }
 
@@ -756,6 +871,10 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             sendResponseUnencrypted(response, sizeof(response));
             return;
         }
+
+        // Cleared the gate: the peer is holding a live session and talking to it
+        // correctly, so the consecutive-rejection count starts over.
+        resetAuthGateRejects();
 
         static uint8_t decrypted_data[512];
         decrypted_data[0] = data[0];
