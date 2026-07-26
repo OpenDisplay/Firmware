@@ -142,6 +142,27 @@ void rejectUnauthenticated(uint16_t command) {
     // can verify it is still dropping the same link.
     authAbuseDisconnectHandle = handle;
     authAbuseDisconnectPending = true;
+
+#ifdef TARGET_NRF
+    // ...except on nRF, where deferring does not work during a transfer. This
+    // dispatch IS the Bluefruit event-task write callback, and that task runs at a
+    // higher priority than the Arduino loop task. Measured: while a client floods
+    // gated frames inside a direct/pipe write, loop() is not scheduled at all --
+    // neither the drop nor its skip diagnostic printed until the flood stopped,
+    // which is precisely the window the guard exists to close.
+    //
+    // Safe inline here, unlike on ESP32:
+    //   - The 0xFE above has already gone out. nRF notifies from
+    //     sendResponseUnencrypted directly (imageCharacteristic.notify), with no
+    //     response ring to drain first, so there is nothing left to strand.
+    //   - Bluefruit.disconnect() only asks the SoftDevice to tear the link down.
+    //     The BLE_GAP_EVT_DISCONNECTED event arrives afterwards on this same event
+    //     task rather than unwinding the callback we are currently inside.
+    // This consumes the flag set above (the service clears it on every path), so
+    // loop()'s own call becomes a no-op -- it stays as the ESP32 path and as the
+    // fallback for anything that arms the guard from outside a write callback.
+    serviceBleAuthAbuseDisconnect();
+#endif
 }
 
 void serviceBleAuthAbuseDisconnect(void) {
@@ -151,7 +172,17 @@ void serviceBleAuthAbuseDisconnect(void) {
     // from Bluefruit.disconnect(), and would otherwise leave a stale request
     // armed against whatever link comes next.
     authAbuseDisconnectPending = false;
-    if (handle == AUTH_GUARD_NO_CONN_HANDLE) return;   // peer already left
+    if (handle == AUTH_GUARD_NO_CONN_HANDLE) {
+        // Normally means the offender left before this pass -- benign. But it is
+        // also what a stack that fails to report a live link looks like, and that
+        // case is NOT benign: the guard arms against 0xFFFF and then quietly
+        // declines to drop anything, which reads exactly like the guard not
+        // running at all. Log both the armed handle and what the stack says right
+        // now, so the two are distinguishable without a rebuild.
+        od_log_warn("Auth-abuse drop skipped: no live link (armed handle 0x%04X, stack now 0x%04X)",
+                    (unsigned)handle, (unsigned)authGuardLiveConnHandle());
+        return;
+    }
     // Between the rejection and this pass the offender may have disconnected and
     // another central taken its place. Drop only the link that actually earned
     // it -- never the innocent client that replaced it.
