@@ -165,6 +165,7 @@ static void registerAdcLadder(const struct BinaryInputs* input) {
     l->last_button_id = (uint8_t)(l->id_base & 0x07);
     l->last_press_time = 0;
     pinMode(l->pin, INPUT);
+    (void)analogRead(l->pin);
     analogSetPinAttenuation(l->pin, ADC_11db);
     adcLadderCount++;
     od_log_info("ADC ladder: pin %u n %u idBase %u byteIdx %u", l->pin, n, l->id_base, l->byte_index);
