@@ -29,6 +29,35 @@ Field failures: during PIPE_WRITE uploads from Home Assistant, lost ACKs / blind
 
 ---
 
+## Hard constraint — NO wire protocol changes
+
+**Nothing in this plan may change the BLE/LAN wire protocol.** This is a firmware-internal robustness effort; every fix must be observably compatible with today's clients (`py-opendisplay`, the HA integration, the web configurator) and with the other three firmware repos.
+
+Concretely, the following are **out of bounds** for every phase:
+- Editing `include/opendisplay_protocol.h` — it is a byte-for-byte vendored copy of `../opendisplay-protocol/src/opendisplay_protocol.h`. No local edit, and no change pushed through the canonical repo either.
+- Adding, removing, or renumbering any `CMD_*` opcode or `RESP_*` code; changing the meaning of an existing one.
+- Changing frame layout, framing, header/field sizes, nonce or CCM parameters, or the auth handshake sequence.
+- Changing the config-packet layout in `include/opendisplay_structs.h` (field add/remove/resize/reorder), which is the same contract by another name.
+- Changing any value the protocol header specifies — notably the **30 s auth-challenge window** (already recorded under *Deliberately NOT changed*) and the **LAN 30 s idle timeout** (`opendisplay_protocol.h:984`).
+- Changing client-observable behaviour documented in `docs/pipe-write-protocol.md` (SACK semantics, discard rules, NACK meaning).
+
+What **is** in bounds, and why each stays inside the constraint:
+- Firmware-local constants that no client reads: `OD_NONCE_WINDOW`, `OD_BLE_IDLE_DISCONNECT_MS`, the pipe error-release deadline, supervisor/backstop timeouts, `COMMAND_QUEUE_SIZE`. None appear on the wire; a client cannot observe their value, only the (already-legal) behaviour they produce.
+- Widening the replay window and fixing the `counter_diff == 0` hole — accepting *more* legitimate frames and rejecting a replay are both already-permitted outcomes of the existing nonce rules.
+- Disabling `session_timeout_seconds` expiry — the field's own spec already defines `0 = no timeout (persists until disconnect)` ([opendisplay_structs.h:916](../include/opendisplay_structs.h)); the firmware simply behaves as if the field is always 0. The struct field stays, unchanged in size and position, and becomes advisory-only.
+- Dropping a link (idle timeout, supervisor abort, connection-exclusivity refusal) — disconnect is always a legal outcome; clients already handle it and reconnect.
+- Sending an existing NACK/`RESP_*` code in a new situation, as long as the code's documented meaning is unchanged.
+
+If any phase appears to require a protocol change to work, **stop and escalate** — do not push a header change through `../opendisplay-protocol` as part of this work. Documentation-only additions (a note in `docs/pipe-write-protocol.md` §5.1, field notes in `tools/od-device-cli.py`) are permitted and expected, provided they describe behaviour the current spec already allows.
+
+Verification of the constraint itself, run before any phase is called done:
+```bash
+cd ../opendisplay-protocol && tools/sync_protocol_header.py --check --only Firmware   # must pass, unchanged
+cd ../Firmware && git diff main --stat -- include/opendisplay_protocol.h include/opendisplay_structs.h   # must be empty
+```
+
+---
+
 ## Phase order
 
 Reordered per review: **root cause first, owner token before anything depends on it, supervisor before the escalations that rely on its accounting.**
