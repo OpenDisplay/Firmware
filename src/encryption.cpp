@@ -29,6 +29,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #endif
 
 void sendResponse(uint8_t* response, uint16_t len);
+void resetAuthGateRejects(void);   // communication.cpp: unauthenticated-command guard
 bool aes_cmac(const uint8_t* key, const uint8_t* message, size_t message_len, uint8_t* mac);
 bool aes_ecb_encrypt(const uint8_t* key, const uint8_t* input, uint8_t* output);
 bool aes_ccm_encrypt(const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
@@ -685,6 +686,9 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
             return false;
         }
         encryptionSession.authenticated = true;
+        // The client just proved it holds the key: whatever gated commands it got
+        // wrong before this point must not count toward the link drop.
+        resetAuthGateRejects();
         resetNonceState();
         encryptionSession.session_start_time = currentTime;
         encryptionSession.last_activity = currentTime;

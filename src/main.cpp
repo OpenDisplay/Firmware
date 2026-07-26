@@ -422,6 +422,10 @@ void loop() {
         }
     }
     flushResponseQueueToBle();
+    // Deliberately AFTER the flush: the guard's final 00 xx FE is already in the
+    // response ring when the drop is requested, and dropping the link first would
+    // strand it — leaving the client with no idea why it was disconnected.
+    serviceBleAuthAbuseDisconnect();
     // Service the flag-only BLE callbacks on this (single) task. Cleanup runs
     // before the advertising restart so a disconnected session is fully torn down
     // before the radio re-arms.
@@ -523,6 +527,9 @@ void loop() {
     else{
         idleDelay(500);
     }
+    // nRF notifies responses inline from the command callback, so the guard's
+    // 00 xx FE is already on the air by the time this runs.
+    serviceBleAuthAbuseDisconnect();
     ble_nrf_advertising_tick();
     processButtonEvents();
     processTouchInput();
