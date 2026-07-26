@@ -719,6 +719,38 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             if (nonce_loss && command == CMD_PIPE_WRITE_DATA) {
                 return;
             }
+
+            // NONCE_BAD_SESSION is NOT loss and NOT tampering — it means the two
+            // sides disagree about which session is live, and no amount of client
+            // retrying can resolve that. Only a re-authentication can. Answer
+            // RESP_AUTH_REQUIRED, which says exactly that; the client raises
+            // AuthenticationRequiredError and re-authenticates, and the mismatch
+            // clears in one round trip.
+            //
+            // This restores a recovery path Phase 1 removed. Before Phase 1 a
+            // session-id mismatch counted toward integrity_failures, so three of
+            // them cleared the session and every later command answered 0xFE —
+            // which is what actually made the client re-authenticate. Routing
+            // BAD_SESSION to "does not count" ([L7]) was correct in refusing to
+            // treat it as tamper evidence, but it left the device answering a
+            // fatal 0xFF forever to a client that had lost its session and fallen
+            // back to plaintext uploads (observable as len=232 = 2 + CHUNK_SIZE
+            // 230, the *unencrypted* chunk budget; an encrypted 0x0071 frame
+            // cannot exceed 185 B). The device must tell the client to
+            // re-authenticate instead of NACKing it forever.
+            //
+            // In bounds under the parent plan's wire constraint: RESP_AUTH_REQUIRED
+            // is an existing response code used in its documented meaning ("this
+            // command requires a live authenticated session"), which is precisely
+            // the condition here.
+            if (decrypt_reason == NONCE_BAD_SESSION) {
+                od_log_warn("Nonce session_id mismatch on 0x%04X - answering AUTH_REQUIRED so the client re-authenticates",
+                            (unsigned)command);
+                uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
+                sendResponseUnencrypted(response, sizeof(response));
+                return;
+            }
+
             od_log_error("ERROR: Decryption failed");
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_NACK};
             sendResponseUnencrypted(response, sizeof(response));
