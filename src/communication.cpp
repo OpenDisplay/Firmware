@@ -763,7 +763,30 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         // screen. It moves to the failure path below, where it is the only thing that
         // separates a replay-window jump from nonce reuse from a wrong session key,
         // and where nRF (which has no RX hex line at all) would otherwise be blind.
-        if (!decryptCommand(data + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
+        NonceResult decrypt_reason = NONCE_OK;
+        if (!decryptCommand(data + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command, &decrypt_reason)) {
+            // Step 4b / [H1]: a pipe DATA frame rejected because its nonce fell
+            // outside the window IS ordinary packet loss - it is the direct
+            // consequence of frames having been dropped. pipe-write-protocol.md
+            // §5.2 already reserves NACKs for unrecoverable conditions, "not
+            // ordinary packet loss", and §5.1 makes a 0x81 NACK unconditionally
+            // fatal, so answering one here violates the spec as written. Send
+            // NOTHING: silence is a first-class signal on the pipe path. The seq
+            // is absent from the next SACK mask, the client retransmits it, and
+            // the transfer continues. Answering with the 3-byte NACK instead
+            // makes the client raise IntegrityCheckError, which its pipe send
+            // loop does not catch, killing the whole upload on the first
+            // rejected frame.
+            //
+            // Deliberately narrow:
+            //  - TAG failures keep the NACK. They are tamper evidence, not loss.
+            //  - 0x0071 (legacy DIRECT_WRITE_DATA) is left alone on purpose: it
+            //    has a different ACK discipline that has not been analysed, and
+            //    the field failure lives on the pipe path. Not an oversight.
+            const bool nonce_loss = (decrypt_reason == NONCE_OUT_OF_WINDOW || decrypt_reason == NONCE_REPLAY);
+            if (nonce_loss && command == CMD_PIPE_WRITE_DATA) {
+                return;
+            }
             // 16 bytes render as 47 chars + NUL, an exact fit in 48; sized past that
             // so a future ENCRYPTION_NONCE_SIZE bump truncates nothing.
             char nonceHex[64];
@@ -846,10 +869,25 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             handlePipeWriteStart(data + 2, len - 2);
             break;
         case CMD_PIPE_WRITE_DATA:     // 0x0081
-            // The replay counter (verifyNonceReplay) already advanced at decrypt time,
-            // above this switch, for every 0x0081 frame — including ones the handler
-            // then queues or discards — so drops/dupes never desync it and the counter
-            // delta stays within in-flight <= W <= 32 <= the +-32 replay window.
+            // Replay state is committed at decrypt time (nonceCommit, first
+            // statement of decryptCommand's success arm) for every 0x0081 frame
+            // that authenticates — including ones this handler then queues or
+            // discards — so drops/dupes never desync it.
+            //
+            // What bounds the forward gap is NOT a firmware constant. The client
+            // burns a nonce counter per *transmission*, landed or not, and its
+            // three transmit sites are new sends (window-credit-limited), PTO
+            // probes, and selective repair — and selective repair spends no
+            // window credit at all. The only ceiling is the client's retransmit
+            // budget max_retx = max(3*W, n/2), scaled by blocks_per_ack, which
+            // is a user-facing Home Assistant option (1..32) in another repo.
+            // OD_NONCE_FORWARD_CAP (src/nonce_window.h) is therefore a HEURISTIC
+            // with headroom over the realistic worst case, not an invariant this
+            // firmware can prove; a client-side blocks_per_ack change would
+            // silently falsify any specific number written here. A gap beyond
+            // the cap is no longer fatal: the frame is dropped silently (Step 4b
+            // above) and repaired by the normal SACK path. See Decision A / [C1]
+            // in docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
             handlePipeWriteData(data + 2, len - 2);
             break;
         case CMD_PIPE_WRITE_END:      // 0x0082
