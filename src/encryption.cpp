@@ -112,48 +112,70 @@ void deriveSessionId(const uint8_t* session_key, const uint8_t* client_nonce,
     }
 }
 
-bool verifyNonceReplay(uint8_t* nonce) {
-    if (!encryptionSession.authenticated) return false;
+// Reset ONLY the four nonce/replay fields. Named explicitly rather than
+// described loosely ([M3]): clearEncryptionSession() and handleAuthenticate()'s
+// fresh-session block share exactly these four and are *opposite* on everything
+// else (authenticated false vs true, timestamps zeroed vs stamped, keys wiped vs
+// populated). In particular nonce_counter — the device's OWN outbound counter —
+// must keep being zeroed here: a device that carried it across a re-auth while
+// the client restarts at 0 would reproduce the [H2] keystream reuse against
+// itself. See docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md Step 1.
+static void resetNonceState(void) {
+    encryptionSession.nonce_counter      = 0;   /* device's OWN outbound counter */
+    encryptionSession.last_seen_counter  = 0;
+    encryptionSession.integrity_failures = 0;
+    memset(encryptionSession.replay_bitmap, 0, sizeof(encryptionSession.replay_bitmap));
+}
+
+// Rate limiter for the two nonce-rejection logs. Once nonce failures stop
+// counting toward integrity_failures ([L7]) nothing else throttles a peer that
+// drives these lines, and out-of-window now fires routinely on a lossy link.
+static uint32_t nonce_log_last_ms = 0;
+static bool nonceLogAllowed(void) {
+    uint32_t now = millis();
+    if (nonce_log_last_ms != 0 && (uint32_t)(now - nonce_log_last_ms) < 5000u) return false;
+    nonce_log_last_ms = now;
+    return true;
+}
+
+// PURE. Parses the counter out of the 16-byte nonce and decides whether the
+// frame may be accepted. Writes NOTHING to encryptionSession on any path — that
+// is the property the host test asserts by memcmp, and it is what "only a
+// CCM-verified frame may advance replay state" (D2) rests on.
+//
+// File-static by design (Decision C): nothing outside decryptCommand should be
+// able to reach the commit side. The pure logic lives in src/nonce_window.h.
+static NonceResult nonceCheck(const uint8_t* nonce, uint64_t* counter_out) {
     uint8_t nonce_session_id[8];
     uint64_t nonce_counter = 0;
     memcpy(nonce_session_id, nonce, 8);
     for (int i = 0; i < 8; i++) {
         nonce_counter = (nonce_counter << 8) | nonce[8 + i];
     }
+    if (counter_out != nullptr) *counter_out = nonce_counter;
+
     if (!constantTimeCompare(nonce_session_id, encryptionSession.session_id, 8)) {
-        od_log_error("ERROR: Nonce session_id mismatch\n  Nonce ID: %02X%02X%02X%02X%02X%02X%02X%02X\n  Expected: %02X%02X%02X%02X%02X%02X%02X%02X",
-                     nonce_session_id[0], nonce_session_id[1], nonce_session_id[2], nonce_session_id[3],
-                     nonce_session_id[4], nonce_session_id[5], nonce_session_id[6], nonce_session_id[7],
-                     encryptionSession.session_id[0], encryptionSession.session_id[1], encryptionSession.session_id[2], encryptionSession.session_id[3],
-                     encryptionSession.session_id[4], encryptionSession.session_id[5], encryptionSession.session_id[6], encryptionSession.session_id[7]);
-        return false;
-    }
-    int64_t counter_diff = (int64_t)nonce_counter - (int64_t)encryptionSession.last_seen_counter;
-    if (counter_diff < -32 || counter_diff > 32) {
-        od_log_error("ERROR: Nonce counter outside replay window (counter=%llu, last_seen=%llu, diff=%lld)",
-                     (unsigned long long)nonce_counter, (unsigned long long)encryptionSession.last_seen_counter, (long long)counter_diff);
-        return false;
-    }
-    if (nonce_counter <= encryptionSession.last_seen_counter && counter_diff != 0) {
-        bool already_seen = false;
-        for (int i = 0; i < 64; i++) {
-            if (encryptionSession.replay_window[i] == nonce_counter) {
-                already_seen = true;
-                break;
-            }
+        // [L7] Demoted from ERROR + rate-limited, and the full session-id dump
+        // is gone: a mismatched session id is usually a stale client talking to
+        // a device that re-authenticated, i.e. confusion rather than attack.
+        // The CCM tag remains the only tamper oracle.
+        if (nonceLogAllowed()) {
+            od_log_warn("Nonce session_id mismatch (%02X%02X.. vs %02X%02X..) - frame dropped, session kept",
+                        nonce_session_id[0], nonce_session_id[1],
+                        encryptionSession.session_id[0], encryptionSession.session_id[1]);
         }
-        if (already_seen) {
-            od_log_error("ERROR: Nonce counter already seen (replay detected)");
-            return false;
-        }
+        return NONCE_BAD_SESSION;
     }
-    if (nonce_counter > encryptionSession.last_seen_counter) {
-        encryptionSession.last_seen_counter = nonce_counter;
-    }
-    static uint8_t replay_window_index = 0;
-    encryptionSession.replay_window[replay_window_index] = nonce_counter;
-    replay_window_index = (replay_window_index + 1) % 64;
-    return true;
+    return od_nonce_check(encryptionSession.replay_bitmap,
+                          encryptionSession.last_seen_counter, nonce_counter);
+}
+
+// Records a counter as consumed. Called from exactly one place: as the FIRST
+// statement of decryptCommand's success arm, i.e. only after aes_ccm_decrypt
+// has verified the tag (the D2 fix).
+static void nonceCommit(uint64_t counter) {
+    od_nonce_commit(encryptionSession.replay_bitmap,
+                    &encryptionSession.last_seen_counter, counter);
 }
 
 void getCurrentNonce(uint8_t* nonce) {
@@ -208,14 +230,11 @@ void clearEncryptionSession() {
     memset(encryptionSession.server_nonce, 0, 16);
     memset(encryptionSession.pending_server_nonce, 0, 16);
     encryptionSession.authenticated = false;
-    encryptionSession.nonce_counter = 0;
-    encryptionSession.last_seen_counter = 0;
-    encryptionSession.integrity_failures = 0;
+    resetNonceState();
     encryptionSession.session_start_time = 0;
     encryptionSession.last_activity = 0;
     encryptionSession.auth_attempts = 0;
     encryptionSession.server_nonce_time = 0;
-    memset(encryptionSession.replay_window, 0, sizeof(encryptionSession.replay_window));
     od_log_info("Encryption session cleared");
 }
 
@@ -660,12 +679,9 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
         // good handshake followed by one more rejection would drop a client that
         // had just authenticated.
         resetAuthAbuseCounter();
-        encryptionSession.nonce_counter = 0;
-        encryptionSession.last_seen_counter = 0;
-        encryptionSession.integrity_failures = 0;
+        resetNonceState();
         encryptionSession.session_start_time = currentTime;
         encryptionSession.last_activity = currentTime;
-        memset(encryptionSession.replay_window, 0, sizeof(encryptionSession.replay_window));
         memset(encryptionSession.pending_server_nonce, 0, 16);
         encryptionSession.server_nonce_time = 0;
         uint8_t server_response[16];
@@ -694,13 +710,30 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
 }
 
 bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plaintext,
-                    uint16_t* plaintext_len, uint8_t* nonce_full, uint8_t* auth_tag, uint16_t command_header) {
+                    uint16_t* plaintext_len, uint8_t* nonce_full, uint8_t* auth_tag, uint16_t command_header,
+                    NonceResult* reason_out) {
+    // reason_out reports WHY the frame was rejected so the caller can tell a
+    // nonce rejection (ordinary packet loss) from a CCM tag failure (tamper
+    // evidence). NONCE_OK means "not rejected for a nonce reason" — every
+    // non-nonce failure path below leaves it at NONCE_OK. See Step 4b.
+    if (reason_out != nullptr) *reason_out = NONCE_OK;
     if (!isAuthenticated()) return false;
-    if (!verifyNonceReplay(nonce_full)) {
-        encryptionSession.integrity_failures++;
-        if (encryptionSession.integrity_failures >= 3) {
-            od_log_warn("Too many integrity failures, clearing session");
-            clearEncryptionSession();
+
+    // Nonce failures are evidence of a LOSSY LINK, not of tampering, so they do
+    // NOT touch integrity_failures (the D1 fix). Only the CCM tag is a tamper
+    // oracle. [L7]: routing NONCE_BAD_SESSION here too is a deliberate policy
+    // change — a session-id mismatch is what a stale client sends after the
+    // device re-authenticated. See Step 4.
+    uint64_t nonce_counter = 0;
+    NonceResult nr = nonceCheck(nonce_full, &nonce_counter);
+    if (nr != NONCE_OK) {
+        if (reason_out != nullptr) *reason_out = nr;
+        if (nr != NONCE_BAD_SESSION && nonceLogAllowed()) {
+            od_log_warn("Nonce %s (counter=%llu last_seen=%llu fwd=%llu) - frame dropped, session kept",
+                        (nr == NONCE_REPLAY) ? "replay" : "out-of-window",
+                        (unsigned long long)nonce_counter,
+                        (unsigned long long)encryptionSession.last_seen_counter,
+                        (unsigned long long)(nonce_counter - encryptionSession.last_seen_counter));
         }
         return false;
     }
@@ -723,6 +756,12 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
                                    ad, 2, ciphertext, encrypted_len,
                                    decrypted_with_length, auth_tag, ENCRYPTION_TAG_SIZE);
     if (success) {
+        // [L2] FIRST statement of the success arm — deliberately ahead of the
+        // early return for a malformed payload_length below. That frame is
+        // *authentic* (it passed the CCM tag) and today's unconditional commit
+        // does record it; committing after the early return would silently
+        // leave an authentic frame replayable.
+        nonceCommit(nonce_counter);
         uint8_t payload_length = decrypted_with_length[0];
         if (payload_length > encrypted_len - 1) {
             od_log_error("ERROR: Invalid payload length in decrypted data");
