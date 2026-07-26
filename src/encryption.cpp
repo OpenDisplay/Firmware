@@ -127,14 +127,19 @@ static void resetNonceState(void) {
     memset(encryptionSession.replay_bitmap, 0, sizeof(encryptionSession.replay_bitmap));
 }
 
-// Rate limiter for the two nonce-rejection logs. Once nonce failures stop
+// Rate limiters for the two nonce-rejection logs. Once nonce failures stop
 // counting toward integrity_failures ([L7]) nothing else throttles a peer that
 // drives these lines, and out-of-window now fires routinely on a lossy link.
-static uint32_t nonce_log_last_ms = 0;
-static bool nonceLogAllowed(void) {
+//
+// One budget PER SITE, deliberately, not one shared budget: a stale client
+// spamming session-id mismatches must not be able to silence the out-of-window
+// line, which is the condition Step 5's hardware tests 0-2 exist to observe.
+static uint32_t nonce_log_badsession_ms = 0;
+static uint32_t nonce_log_window_ms = 0;
+static bool nonceLogAllowed(uint32_t* last_ms) {
     uint32_t now = millis();
-    if (nonce_log_last_ms != 0 && (uint32_t)(now - nonce_log_last_ms) < 5000u) return false;
-    nonce_log_last_ms = now;
+    if (*last_ms != 0 && (uint32_t)(now - *last_ms) < 5000u) return false;
+    *last_ms = now;
     return true;
 }
 
@@ -145,6 +150,15 @@ static bool nonceLogAllowed(void) {
 //
 // File-static by design (Decision C): nothing outside decryptCommand should be
 // able to reach the commit side. The pure logic lives in src/nonce_window.h.
+//
+// Caveat on how strong that is. Decision C says linkage enforces the rule, and
+// for nonceCheck/nonceCommit it does. But encryption_state.h must include
+// nonce_window.h for OD_NONCE_BITMAP_WORDS, and main.h includes
+// encryption_state.h — so od_nonce_commit(), a static-inline header primitive,
+// is visible in every TU alongside the extern encryptionSession. Nothing stops
+// a determined caller from committing state directly. That is unavoidable while
+// the struct needs the width macro; the rule is enforced by linkage for the
+// session-aware wrappers and by convention for the raw primitive.
 static NonceResult nonceCheck(const uint8_t* nonce, uint64_t* counter_out) {
     uint8_t nonce_session_id[8];
     uint64_t nonce_counter = 0;
@@ -159,7 +173,7 @@ static NonceResult nonceCheck(const uint8_t* nonce, uint64_t* counter_out) {
         // is gone: a mismatched session id is usually a stale client talking to
         // a device that re-authenticated, i.e. confusion rather than attack.
         // The CCM tag remains the only tamper oracle.
-        if (nonceLogAllowed()) {
+        if (nonceLogAllowed(&nonce_log_badsession_ms)) {
             od_log_warn("Nonce session_id mismatch (%02X%02X.. vs %02X%02X..) - frame dropped, session kept",
                         nonce_session_id[0], nonce_session_id[1],
                         encryptionSession.session_id[0], encryptionSession.session_id[1]);
@@ -728,12 +742,20 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
     NonceResult nr = nonceCheck(nonce_full, &nonce_counter);
     if (nr != NONCE_OK) {
         if (reason_out != nullptr) *reason_out = nr;
-        if (nr != NONCE_BAD_SESSION && nonceLogAllowed()) {
-            od_log_warn("Nonce %s (counter=%llu last_seen=%llu fwd=%llu) - frame dropped, session kept",
-                        (nr == NONCE_REPLAY) ? "replay" : "out-of-window",
+        if (nr != NONCE_BAD_SESSION && nonceLogAllowed(&nonce_log_window_ms)) {
+            // A replayed counter is normally BEHIND last_seen, where the wrapping
+            // fwd delta prints as a 20-digit number. Report the distance in the
+            // direction that is actually small, so the line is readable in the
+            // case it fires in.
+            const bool behind = (nr == NONCE_REPLAY);
+            od_log_warn("Nonce %s (counter=%llu last_seen=%llu %s=%llu) - frame dropped, session kept",
+                        behind ? "replay" : "out-of-window",
                         (unsigned long long)nonce_counter,
                         (unsigned long long)encryptionSession.last_seen_counter,
-                        (unsigned long long)(nonce_counter - encryptionSession.last_seen_counter));
+                        behind ? "back" : "fwd",
+                        (unsigned long long)(behind
+                            ? (encryptionSession.last_seen_counter - nonce_counter)
+                            : (nonce_counter - encryptionSession.last_seen_counter)));
         }
         return false;
     }

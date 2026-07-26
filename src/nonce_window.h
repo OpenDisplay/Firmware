@@ -22,6 +22,7 @@
 // fresh session (last_seen = 0, all-zero bitmap) accepts counter 0 exactly once
 // with no has_seen_counter flag.
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -106,12 +107,22 @@ static inline void od_nonce_bitmap_shift_left(uint64_t* bm, uint64_t shift) {
 // Records `counter` as consumed. MUST only be called after the frame carrying
 // it has been authenticated (CCM tag verified) — that is the D2 fix.
 //
-// Total for every input, including inputs od_nonce_check() would have rejected:
-// the host test calls it directly, and a future OD_NONCE_FORWARD_CAP increase
-// must not be able to produce an over-wide shift. The wholesale-clear path is
-// unreachable through od_nonce_check() today (cap 128 < 256 bits) but is still
-// correct when it fires: every counter it discards is then >= 256 behind and is
-// rejected on width, never mis-reported as unseen.
+// Defined (never UB) for every input, including inputs od_nonce_check() would
+// have rejected: the host test calls it directly, and a future
+// OD_NONCE_FORWARD_CAP increase must not be able to produce an over-wide shift.
+// The wholesale-clear path is unreachable through od_nonce_check() today (cap
+// 128 < 256 bits) but is still correct when it fires on a FORWARD jump: every
+// counter it discards is then >= 256 behind and is rejected on width, never
+// mis-reported as unseen.
+//
+// Sharp edge, stated rather than hidden: a counter more than
+// OD_NONCE_BACKWARD_BITS *behind* last_seen also lands in the forward branch
+// (fwd and back are complements, so its fwd is enormous), clearing the bitmap
+// and RE-WINDING last_seen to that counter — un-seeing everything. That is
+// unreachable through od_nonce_check(), which returns NONCE_OUT_OF_WINDOW for
+// such a counter so it is never committed, and the contract above is that
+// commit runs only for frames that both checked OK and authenticated. It is the
+// edge to watch if a future caller ever commits without checking first.
 static inline void od_nonce_commit(uint64_t* bm, uint64_t* last_seen, uint64_t counter) {
     const uint64_t fwd = counter - *last_seen;
     const uint64_t back = *last_seen - counter;
