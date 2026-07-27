@@ -10,15 +10,12 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "ble_transport.h"
+#include "command_queue.h"
+
 #ifdef TARGET_ESP32
-#include "ble_init.h"   // NimBLE-Arduino + BLE* aliases
 #include <WiFi.h>
 #include "wifi_service.h"
-extern BLEServer* pServer;
-#endif
-
-#ifdef TARGET_NRF
-#include <bluefruit.h>
 #endif
 
 bool isAuthenticated();
@@ -87,15 +84,13 @@ String getChipIdHex();
 float readBatteryVoltage();
 
 #ifdef TARGET_ESP32
-// ResponseQueueItem / RESPONSE_QUEUE_SIZE / MAX_RESPONSE_SIZE come from structs.h.
-// This file previously redeclared the struct with a hardcoded 512 and kept private
-// *_LOCAL copies of both sizes, so the guard in esp32_queue_ble_notify_copy() and the
-// slot it protects were sized in two different files and had to be edited in lockstep.
+// ResponseQueueItem / RESPONSE_QUEUE_SIZE / MAX_RESPONSE_SIZE and the ring itself
+// come from command_queue.h. This file previously redeclared the struct with a
+// hardcoded 512 and kept private *_LOCAL copies of both sizes, so the guard in
+// esp32_queue_ble_notify_copy() and the slot it protects were sized in two
+// different files and had to be edited in lockstep.
 extern WiFiClient wifiClient;
 extern bool wifiServerConnected;
-extern ResponseQueueItem responseQueue[RESPONSE_QUEUE_SIZE];
-extern uint8_t responseQueueHead;
-extern uint8_t responseQueueTail;
 // Drains the response ring to BLE (defined in main.cpp). handleReadConfig() calls
 // this between chunks so a multi-chunk config read never overflows the ring.
 extern void flushResponseQueueToBle();
@@ -106,7 +101,7 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
         od_log_error("ERROR: Response too large for queue (%u > %u)", len, MAX_RESPONSE_SIZE);
         return;
     }
-    if (pServer == nullptr || pServer->getConnectedCount() == 0) {
+    if (!ble.isConnected()) {
         return;
     }
     uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE;
@@ -125,10 +120,6 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
     const uint8_t depth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
     if (!quiet && depth >= 2) od_log_debug("BLE: response queue backlog (queue size: %u)", depth);
 }
-#endif
-
-#ifdef TARGET_NRF
-extern BLECharacteristic imageCharacteristic;
 #endif
 
 #ifndef BUILD_VERSION
@@ -224,16 +215,15 @@ void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
     }
 #endif
 #ifdef TARGET_NRF
-    if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
+    if (ble.notifyReady()) {
         char nrfHexDump[160] = {0};
         buildHexDump(nrfHexDump, sizeof(nrfHexDump), "NRF: Sending unencrypted response: ", response, len);
         od_log_debug("%s", nrfHexDump);
         od_log_debug("NRF: BLE notification sent (%u bytes)", len);
-        imageCharacteristic.notify(response, len);
+        ble.notify(response, len);
     } else {
         od_log_error("ERROR: Cannot send BLE response - not connected or notifications not enabled");
-        od_log_error("  Connected: %s", Bluefruit.connected() ? "yes" : "no");
-        od_log_error("  Notify enabled: %s", imageCharacteristic.notifyEnabled() ? "yes" : "no");
+        od_log_error("  Connected: %s", ble.isConnected() ? "yes" : "no");
     }
 #endif
 }
@@ -332,7 +322,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
     }
 #endif
 #ifdef TARGET_NRF
-    if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
+    if (ble.notifyReady()) {
         if (!quietAck) {
             char nrfHexDump[160] = {0};
             buildHexDump(nrfHexDump, sizeof(nrfHexDump), "NRF: Sending response: ", response, len);
@@ -342,15 +332,18 @@ void sendResponse(uint8_t* response, uint16_t len) {
         // Bounded retry only when the SoftDevice TX queue is full (notify()==false).
         // Replaces an unconditional delay(20): pays latency only on backpressure and
         // speeds the legacy per-chunk path ~20 ms/chunk.
-        bool notified = imageCharacteristic.notify(response, len);
+        //
+        // Phase 3 deletes this loop: once nRF dispatches from loop() it inherits
+        // the ESP32 policy (leave the entry queued, retry next pass), which never
+        // blocks the caller. Kept verbatim here because Phase 1 changes no threading.
+        bool notified = ble.notify(response, len);
         for (uint8_t attempt = 0; !notified && attempt < 4; ++attempt) {
             delay(5);
-            notified = imageCharacteristic.notify(response, len);
+            notified = ble.notify(response, len);
         }
     } else {
         od_log_error("ERROR: Cannot send BLE response - not connected or notifications not enabled");
-        od_log_error("  Connected: %s", Bluefruit.connected() ? "yes" : "no");
-        od_log_error("  Notify enabled: %s", imageCharacteristic.notifyEnabled() ? "yes" : "no");
+        od_log_error("  Connected: %s", ble.isConnected() ? "yes" : "no");
     }
 #endif
 }
@@ -580,13 +573,8 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
     }
 }
 
-#ifdef TARGET_NRF
-typedef uint16_t BLEConnHandle;
-typedef BLECharacteristic* BLECharPtr;
-#else
-typedef void* BLEConnHandle;
-typedef void* BLECharPtr;
-#endif
+// BLEConnHandle / BLECharPtr and the imageDataWritten declaration come from
+// communication.h -- one declaration shared by all three callers.
 
 // Human-readable name for a command opcode, used for the single dispatch banner
 // emitted by imageDataWritten() (the shared command handler for nRF, ESP32 BLE,

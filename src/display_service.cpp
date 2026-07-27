@@ -44,16 +44,15 @@
 extern "C" {
 #include "nrf_soc.h"
 }
-#include <bluefruit.h>
-#include "ble_init.h"
 #include "nrf.h"
 #endif
 
 #ifdef TARGET_ESP32
-#include "ble_init.h"   // NimBLE-Arduino + BLE* aliases
 #include "wifi_service.h"
 #include <SPI.h>
 #endif
+
+#include "ble_transport.h"
 
 extern BBEPDISP bbep;
 extern struct GlobalConfig globalConfig;
@@ -119,12 +118,6 @@ struct PartialStreamContext {
     uint8_t current_plane;
     uint32_t start_time;
 };
-
-#ifdef TARGET_ESP32
-extern BLEAdvertisementData* advertisementData;
-extern BLEServer* pServer;
-extern BLEService* pService;
-#endif
 
 void pwrmgm(bool onoff);
 String getChipIdHex();
@@ -1764,57 +1757,22 @@ void updatemsdata(){
     m.battery_voltage_low = batteryVoltageLowByte;
     m.status = statusByte;
     memcpy(msd_payload, &m, sizeof m);
-#ifdef TARGET_NRF
-    static uint8_t prev_msd_payload_nrf[16] = {0xFF};
-    if (memcmp(prev_msd_payload_nrf, msd_payload, 16) == 0) {
+    // Skip the (relatively expensive) advertisement rebuild when nothing changed;
+    // the loop counter still advances so successive advertisements stay
+    // distinguishable. Both targets used to keep their own copy of this check
+    // inside their own #ifdef -- it is transport-independent, so it lives once
+    // here and only the push below is platform-specific.
+    static uint8_t prev_msd_payload[16] = {0xFF};
+    if (memcmp(prev_msd_payload, msd_payload, 16) == 0) {
         mloopcounter++;
         mloopcounter &= 0x0F;
         return;
     }
-    memcpy(prev_msd_payload_nrf, msd_payload, 16);
-    Bluefruit.Advertising.clearData();
-    Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-    Bluefruit.Advertising.addName();
-    Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, msd_payload, 16);
-    ble_nrf_apply_adv_interval();
-    Bluefruit.Advertising.setFastTimeout(1);
-    Bluefruit.Advertising.stop();
-    Bluefruit.Advertising.start(0);
-#endif
-#ifdef TARGET_ESP32
-    if (advertisementData != nullptr) {
-        static uint8_t prev_msd_payload[16] = {0xFF};
-        if (memcmp(prev_msd_payload, msd_payload, 16) == 0) {
-            mloopcounter++;
-            mloopcounter &= 0x0F;
-            return;
-        }
-        memcpy(prev_msd_payload, msd_payload, 16);
-        advertisementData->setManufacturerData(msd_payload, 16);
-        BLEAdvertising *pAdvertising = (pServer != nullptr) ? pServer->getAdvertising() : BLEDevice::getAdvertising();
-        // Only rebuild+restart advertising while disconnected. The former connected
-        // branch rebuilt *advertisementData but never pushed it via
-        // setAdvertisementData(), so it was dead work — dropped.
-        if (pAdvertising != nullptr && !(pServer != nullptr && pServer->getConnectedCount() > 0)) {
-            pAdvertising->stop();
-            BLEAdvertisementData freshAdvertisementData;
-            static String savedDeviceName = "";
-            if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
-            freshAdvertisementData.setName(savedDeviceName.c_str());
-            freshAdvertisementData.setFlags(0x06);
-            freshAdvertisementData.setManufacturerData(msd_payload, 16);
-            *advertisementData = freshAdvertisementData;
-            // setAdvertisementData() must be the last data call before start():
-            // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
-            // flag and would make start() drop this manufacturer-data payload.
-            pAdvertising->setAdvertisementData(freshAdvertisementData);
-            delay(50);
-            pAdvertising->start();
-        }
-    }
+    memcpy(prev_msd_payload, msd_payload, 16);
+    ble.setManufacturerData(msd_payload, 16);
 #ifdef OPENDISPLAY_HAS_WIFI
+    // (Implies TARGET_ESP32; the enclosing target guard is gone with the split.)
     opendisplay_mdns_update_msd_txt();
-#endif
 #endif
     mloopcounter++;
     mloopcounter &= 0x0F;
@@ -2436,7 +2394,11 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     epdRefreshInProgress = false;
     cleanupDirectWriteState(false);
 #ifdef TARGET_ESP32
-    esp32_restart_ble_advertising();
+    // Raise the flag rather than re-arming inline: serviceBleAdvertisingRestart()
+    // in main.cpp is the single place that owns the deferral policy, and it runs
+    // later in this same loop() pass (the refresh above is reached from the
+    // command drain), so the radio comes back up on the same pass as before.
+    bleRestartAdvertisingPending = true;
 #endif
     if (refreshSuccess) {
         // A successful refresh changed the panel image. Commit the new etag

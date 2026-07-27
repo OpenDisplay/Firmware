@@ -11,8 +11,7 @@ void enterDeepSleep(bool force = false, uint16_t overrideSleepSeconds = 0);
 #endif
 
 #ifdef TARGET_NRF
-#include <bluefruit.h>
-#include "ble_init.h"
+#include <bluefruit.h>   // enterDFUMode() drives the SoftDevice teardown directly
 extern "C" {
 #include "nrf_soc.h"
 }
@@ -22,10 +21,10 @@ extern "C" void bootloader_util_app_start(uint32_t start_addr);
 #include <esp_system.h>
 #include "driver/gpio.h"
 #include "esp32-hal-gpio.h"
-#include "ble_init.h"          // BLEDevice/BLEServer/BLEAdvertising aliases + esp32_ble_clear_handles()
 #include "wifi_service.h"      // OPENDISPLAY_HAS_WIFI + opendisplay_lan_teardown()
-extern BLEServer* pServer;     // defined in main.cpp
 #endif
+
+#include "ble_transport.h"
 
 extern uint8_t rebootFlag;
 extern struct GlobalConfig globalConfig;
@@ -213,20 +212,19 @@ static void pollAdcButtons() {
 static void pollAdcButtons() {}
 #endif
 
-void connect_callback(uint16_t conn_handle) {
-    (void)conn_handle;
+// Application response to a BLE connect. Invoked by BleTransport; the link
+// diagnostics and PHY/DLE tuning that used to sit here are transport-internal
+// now and run inside ble_transport_nrf.cpp. On nRF this still executes on the
+// SoftDevice callback task (Phase 1 changes no threading); on ESP32 the
+// transport records an event and loop() does the equivalent work instead, which
+// is why this hook has no ESP32 caller.
+void bleAppOnConnect() {
     od_log_info("=== BLE CLIENT CONNECTED ===");
     rebootFlag = 0;
     updatemsdata();
-#ifdef TARGET_NRF
-    ble_nrf_log_link_params(conn_handle, "at connect");  // baseline (pre-negotiation)
-    ble_nrf_request_fast_link(conn_handle);              // request 2M PHY + 251-octet DLE
-    ble_nrf_arm_link_diag(conn_handle);                  // re-log once negotiation settles
-#endif
 }
 
-void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
-    (void)conn_handle;
+void bleAppOnDisconnect(uint8_t reason) {
     (void)reason;
     od_log_info("=== BLE CLIENT DISCONNECTED ===");
     od_log_info("Disconnect reason: %u", reason);
@@ -253,13 +251,9 @@ static void esp32_ble_deinit_before_restart() {
     // the next boot re-inits WiFi cleanly (mirrors the BLE deinit below).
     opendisplay_lan_teardown();
 #endif
-    if (pServer != nullptr) {
-        BLEAdvertising* pAdvertising = pServer->getAdvertising();
-        if (pAdvertising != nullptr) pAdvertising->stop();
-    }
+    ble.stopAdvertising();
     delay(200);
-    BLEDevice::deinit(true);      // clearAll: disables + releases the BT controller
-    esp32_ble_clear_handles();
+    ble.end();                    // clearAll: disables + releases the BT controller
     delay(100);
     od_log_info("BLE deinitialized before restart");
 }
@@ -613,9 +607,7 @@ void processButtonEvents() {
             }
         }
         updatemsdata();
-#ifdef TARGET_NRF
-        ble_nrf_boost_advertising();
-#endif
+        ble.boostAdvertising();   // no-op where the stack has no fast-adv window
     }
 }
 

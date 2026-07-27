@@ -8,7 +8,7 @@
 #include "wake_button.h"
 #include "touch_input.h"
 #include "encryption.h"
-#include "ble_init.h"
+#include "ble_transport.h"
 #include "od_log.h"
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
@@ -106,7 +106,7 @@ void setup() {
     full_config_init();
 #ifdef OPENDISPLAY_HAS_WIFI
     // Reserve mbedTLS's two ~16.7 KB record buffers HERE and nowhere else: config is
-    // loaded (so we know whether TLS is even used) but ble_init() and initWiFi() have not
+    // loaded (so we know whether TLS is even used) but ble.begin() and initWiFi() have not
     // yet taken their ~100 KB, so internal DRAM is still contiguous. mbedtls_ssl_setup()
     // needs both buffers contiguous and cannot be satisfied later on a churned heap --
     // observed failing with -0x7f00 at 51 KB free / 31.7 KB largest block. No-op when
@@ -117,7 +117,12 @@ void setup() {
     initio();
 #ifdef TARGET_NRF
     // SoftDevice must start before display/SPI; advertising starts after boot screen.
-    ble_nrf_stack_init();
+    {
+        // Named local, not a temporary: the name outlives the call regardless of
+        // whether the stack copies it.
+        String bleDeviceName = "OD" + getChipIdHex();
+        ble.begin(bleDeviceName.c_str());
+    }
 #endif
     if (!is_deep_sleep_wake) {
         // Arm here rather than at declaration: this branch is the boot screen
@@ -132,11 +137,22 @@ void setup() {
     }
 #ifdef TARGET_ESP32
     // Full BLE after display: ESP32 queues commands for loop() until setup returns.
-    if (is_deep_sleep_wake) { od_log_info("[wake] >> ble_init"); od_log_flush(); }
-    ble_init();
-    if (is_deep_sleep_wake) { od_log_info("[wake] << ble_init"); od_log_flush(); }
+    if (is_deep_sleep_wake) { od_log_info("[wake] >> ble_begin"); od_log_flush(); }
+    {
+        String bleDeviceName = "OD" + getChipIdHex();
+        if (ble.begin(bleDeviceName.c_str())) {
+            // Historical order: build the manufacturer data into the advertisement
+            // BEFORE the first start(), since setAdvertisementData() must be the
+            // last data call before start() (see ble_transport_esp32.cpp).
+            updatemsdata();
+            ble.startAdvertising();
+            od_log_info("Device ready: %s", bleDeviceName.c_str());
+            od_log_info("Waiting for BLE connections...");
+        }
+    }
+    if (is_deep_sleep_wake) { od_log_info("[wake] << ble_begin"); od_log_flush(); }
 #elif defined(TARGET_NRF)
-    ble_nrf_advertising_start();
+    ble.startAdvertising();
 #endif
     #ifdef OPENDISPLAY_HAS_WIFI
     if (!is_deep_sleep_wake) {
@@ -231,7 +247,7 @@ static void pollActivity() {
     const uint8_t responseHead = responseQueueHead;
     // Covers connect and disconnect. The disconnect edge is what re-arms the
     // window so a dropped client gets a full reconnect opportunity.
-    const uint8_t connCount = (pServer != nullptr) ? (uint8_t)pServer->getConnectedCount() : 0;
+    const uint8_t connCount = ble.connectedCount();
 #ifdef OPENDISPLAY_HAS_WIFI
     const bool lanSession = wifiInitialized && wifiServerConnected && wifiClient.connected();
 #else
@@ -274,18 +290,15 @@ static void pollActivity() {
 // mirroring how the loop() command drain flushes between commands.
 void flushResponseQueueToBle() {
     if (responseQueueTail == responseQueueHead) return;
-    if (esp32_ble_notify_enabled()) {
+    if (ble.notifyReady()) {
         uint8_t bleDrain = 0;
         while (responseQueueTail != responseQueueHead && bleDrain < 16) {
             const bool quietAck = imageWriteLogQuietFrame(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
-            // notify(data,len) copies the payload into an mbuf immediately, so a
-            // concurrent client WRITE_NR on this shared RX/TX characteristic cannot
-            // corrupt the outgoing ACK (as setValue()+notify() could, since no-arg
-            // notify sends whatever value is currently stored). On mbuf exhaustion
-            // notify() returns false: stop draining and leave the entry queued to
-            // retry next pass rather than advancing past a dropped ACK (which stalls
-            // the pipe window).
-            if (!pTxCharacteristic->notify(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len)) {
+            // false means backpressure (NimBLE mbuf exhaustion): stop draining and
+            // leave the entry queued to retry next pass rather than advancing past
+            // a dropped ACK, which would stall the pipe window. See
+            // BleTransport::notify().
+            if (!ble.notify(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len)) {
                 break;
             }
             responseQueue[responseQueueTail].pending = false;
@@ -302,7 +315,7 @@ void flushResponseQueueToBle() {
             }
             bleDrain++;
         }
-    } else if (pServer && pServer->getConnectedCount() > 0) {
+    } else if (ble.isConnected()) {
         // Connected but CCCD not enabled yet — keep responses queued
     } else {
         while (responseQueueTail != responseQueueHead) {
@@ -313,7 +326,7 @@ void flushResponseQueueToBle() {
 }
 
 // Services the deferred BLE-disconnect session teardown flagged by
-// MyBLEServerCallbacks::onDisconnect. Runs on the loop() task so the heavyweight
+// the BLE transport's disconnect event. Runs on the loop() task so the heavyweight
 // EPD force-off (bbepSleep/delay/SPI.end/rail cut) and partial/pipe cleanup never
 // race SPI streaming or pipe-frame processing on the NimBLE host task. Deferred
 // while a refresh is mid-flight — the same epdRefreshInProgress gate the callback
@@ -327,9 +340,7 @@ static void serviceBleDisconnectCleanup() {
     // purely because the other link dropped. Owner is recorded at START.
 #ifdef OPENDISPLAY_HAS_WIFI
     const bool lanOwnsSession = (transferSessionOrigin() != 0);   // != ORIGIN_BLE
-    const bool ownerStillUp = lanOwnsSession
-                                  ? wifiLanClientConnected()
-                                  : (pServer != nullptr && pServer->getConnectedCount() > 0);
+    const bool ownerStillUp = lanOwnsSession ? wifiLanClientConnected() : ble.isConnected();
     if (ownerStillUp) {
         od_log_info("Disconnect cleanup skipped: transfer still owned by a live %s session",
                     lanOwnsSession ? "LAN" : "BLE");
@@ -346,9 +357,46 @@ static void serviceBleDisconnectCleanup() {
     cleanupPartialWriteOnDisconnect();
     resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect
 }
+
+// Deferral policy for re-arming the radio, formerly buried inside
+// esp32_restart_ble_advertising(). BleTransport::restartAdvertising() is
+// unconditional by contract; deciding *when* to call it is an application
+// concern (mid-refresh, already reconnected, stack not up), so it lives here
+// alongside the other loop()-serviced BLE helpers. The flag stays raised on the
+// "not yet" paths so a later pass retries.
+static void serviceBleAdvertisingRestart() {
+    if (!bleRestartAdvertisingPending) return;
+    if (!ble.isReady()) return;                              // stack down; retry later
+    if (ble.isConnected()) {                                 // a client beat us to it
+        bleRestartAdvertisingPending = false;
+        return;
+    }
+    if (epdRefreshInProgress) return;                        // never mid-refresh
+    bleRestartAdvertisingPending = false;
+    ble.restartAdvertising();
+    updatemsdata();
+}
+
+// Translate the transport's consume-once connect/disconnect events into the
+// application's deferred-work flags. Must run before anything that reads those
+// flags -- including pollActivity(), which uses bleRestartAdvertisingPending as
+// its only trace of a connect+drop landing entirely between two passes.
+static void serviceBleEvents() {
+    if (ble.takeConnectedEvent()) {
+        rebootFlag = 0;
+        msdUpdatePending = true;
+    }
+    if (ble.takeDisconnectedEvent()) {
+        bleDisconnectCleanupPending = true;
+        bleRestartAdvertisingPending = true;
+    }
+}
 #endif
 
 void loop() {
+    #ifdef TARGET_ESP32
+    serviceBleEvents();
+    #endif
     processLedFlash();
     epdSessionTick();   // millis()-poll: power the panel down screen_timeout_seconds after last release
     buzzerService();
@@ -358,7 +406,7 @@ void loop() {
     #ifdef TARGET_ESP32
     // THIS IS THE MAIN (FIRST) LOOP FOR A DEEP SLEEP ENABLED ESP32
     if (woke_from_deep_sleep && advertising_timeout_active) {
-        if (pServer && pServer->getConnectedCount() > 0) {
+        if (ble.isConnected()) {
             od_log_info("BLE connection established - switching to full mode");
             advertising_timeout_active = false;
             fullSetupAfterConnection();
@@ -368,9 +416,7 @@ void loop() {
         // A connect+drop entirely inside one poll gap leaves the radio dark for the
         // rest of the window; the flags are otherwise only serviced past this return.
         serviceBleDisconnectCleanup();   // tear down before re-advertising
-        if (bleRestartAdvertisingPending) {
-            esp32_restart_ble_advertising();
-        }
+        serviceBleAdvertisingRestart();
         uint32_t advertising_timeout_ms = globalConfig.power_option.sleep_timeout_ms;
         if (advertising_timeout_ms == 0) {
             advertising_timeout_ms = DEFAULT_IDLE_HOLD_MS;
@@ -430,9 +476,7 @@ void loop() {
         msdUpdatePending = false;
         updatemsdata();
     }
-    if (bleRestartAdvertisingPending) {
-        esp32_restart_ble_advertising();
-    }
+    serviceBleAdvertisingRestart();
     if (directWriteActive && directWriteStartTime > 0) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
         if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
@@ -473,7 +517,7 @@ void loop() {
     // gate on deep sleep — lastActivityMs supplies the quiet window.
     bool workInFlight = (commandQueueTail != commandQueueHead) ||
                         (responseQueueTail != responseQueueHead) ||
-                        (pServer && pServer->getConnectedCount() > 0) ||
+                        ble.isConnected() ||
                         bleRestartAdvertisingPending ||
                         epdRefreshInProgress ||
                         wifiLanSession;
@@ -523,7 +567,7 @@ void loop() {
     else{
         idleDelay(500);
     }
-    ble_nrf_advertising_tick();
+    ble.tick();
     processButtonEvents();
     processTouchInput();
     buzzerService();
@@ -537,7 +581,7 @@ void idleDelay(uint32_t delayMs) {
     uint32_t remainingDelay = delayMs;
     while (remainingDelay > 0) {
 #ifdef TARGET_NRF
-        ble_nrf_advertising_tick();
+        ble.tick();
 #endif
         processButtonEvents();
         processTouchInput();
@@ -585,7 +629,7 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     }
     // Callers sample their idle state before getting here; a central can connect in
     // that gap. Re-check so we never tear down the stack on a live link.
-    if (!force && pServer != nullptr && pServer->getConnectedCount() > 0) {
+    if (!force && ble.isConnected()) {
         od_log_debug("Skipping deep sleep - BLE client connected");
         lastActivityMs = millis();
         return;
@@ -608,16 +652,9 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     // min(configured window, idle-hold).
     epdSessionForceOff();
     woke_from_deep_sleep = true; // Will be true on next boot
-    if (pServer != nullptr) {
-        BLEAdvertising *pAdvertising = pServer->getAdvertising();
-        if (pAdvertising != nullptr) {
-            pAdvertising->stop();
-            od_log_info("BLE advertising stopped");
-        }
-    }
+    ble.stopAdvertising();
     delay(200);
-    BLEDevice::deinit(true);
-    esp32_ble_clear_handles();
+    ble.end();
     delay(100);
     od_log_info("BLE deinitialized");
     // Host override (0x0053 payload) applies to this one cycle only: it is a

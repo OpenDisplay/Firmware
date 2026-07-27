@@ -19,7 +19,7 @@
 // Reserve mbedTLS's two ~16.7 KB record buffers while the heap is still contiguous, and
 // route mbedTLS allocations through them. MUST be called early in setup() -- after
 // full_config_init() (it needs securityConfig to know whether TLS is used) and before
-// ble_init()/initWiFi() take their ~100 KB. No-op when encryption is disabled, and
+// BleTransport::begin()/initWiFi() take their ~100 KB. No-op when encryption is disabled, and
 // idempotent. Without it, ssl_setup() intermittently fails with -0x7f00 even with ~50 KB
 // free, because the two buffers need contiguous internal DRAM.
 void od_tls_reserve_records(void);
