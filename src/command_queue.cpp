@@ -11,6 +11,7 @@
 
 #include "command_queue.h"
 #include "ble_transport.h"
+#include "encryption.h"   // isEncryptionEnabled(), for the ERX/URX token
 #include "od_log.h"
 
 // Defined in display_service.cpp. True for a mid-stream image-write data frame
@@ -66,9 +67,18 @@ bool bleRxQueuePush(const uint8_t* data, uint16_t len) {
     if (!imageWriteLogQuietFrame(data, len)) {
         const uint16_t cmd = (len >= 2) ? (uint16_t)((data[0] << 8) | data[1]) : data[0];
         const uint8_t depth = (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
+        // ERX / URX: does this frame carry the app-layer CCM envelope? Mirrors the
+        // gate in imageDataWritten() -- the two handshake opcodes are dispatched
+        // before it, and a frame too short to hold nonce+tag cannot be wrapped. The
+        // ORIGIN_LAN_TLS term of that gate is omitted deliberately: this ring is BLE
+        // only, LAN frames never reach it. Anything URX while encryption is on is
+        // rejected by the dispatcher, so the token is the frame's form, not intent.
+        const bool encrypted = isEncryptionEnabled() &&
+                               cmd != CMD_AUTHENTICATE && cmd != CMD_FIRMWARE_VERSION &&
+                               len >= BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE;
         char label[48];
-        snprintf(label, sizeof(label), "[BLE][Q:%u] RX 0x%04X (%u B): ",
-                 (unsigned)depth, cmd, (unsigned)len);
+        snprintf(label, sizeof(label), "[BLE][Q:%u] %s 0x%04X (%u B): ",
+                 (unsigned)depth, encrypted ? "ERX" : "URX", cmd, (unsigned)len);
         char line[192];
         od_log_hex_line(line, sizeof(line), label, data, len);
         od_log_debug("%s", line);

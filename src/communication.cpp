@@ -170,20 +170,23 @@ static uint8_t parseFirmwareVersionComponent(unsigned index) {
 // this ring since Phase 3 (see the de-fan-out comment in sendResponse). nRF needs
 // the number more than ESP32 does -- loop() runs there at TASK_PRIO_LOW and is
 // starved by the Bluefruit tasks, which is exactly when the drain falls behind.
-// `encrypted` renders as an "enc" / "plain" token, replacing the former three-line
-// "Sending encrypted response: / Original length: / Encrypted length:" block --
-// on the line that already names the opcode, the length and the bytes. Both states
-// are spelled out rather than letting absence mean plaintext, so a frame that should
-// have been wrapped and was not is visible instead of merely unremarked.
+// `encrypted` selects ETX vs UTX, replacing the former three-line "Sending encrypted
+// response: / Original length: / Encrypted length:" block -- on the line that already
+// names the opcode, the length and the bytes. Both states are spelled out rather than
+// letting absence mean plaintext, so a frame that should have been wrapped and was
+// not is visible instead of merely unremarked. Mirrors ERX/URX on the receive side.
 static void logTxFrame(const uint8_t* frame, uint16_t len, bool encrypted = false) {
     const uint16_t cmd = (len >= 2) ? (uint16_t)((frame[0] << 8) | frame[1]) : frame[0];
     char label[64];
-    const char* enc = encrypted ? "enc" : "plain";
+    // Folded into the direction token rather than trailing after the length: ETX/UTX
+    // is fixed-width and sits up front where a capture is scanned, whereas a token
+    // after a variable-width byte count never lands in the same column twice.
+    const char* dir = encrypted ? "ETX" : "UTX";
     if (g_commandOrigin == ORIGIN_BLE) {
-        snprintf(label, sizeof(label), "[%s][Q:%u] TX 0x%04X (%u B, %s): ",
-                 originTag(), (unsigned)bleTxQueueDepth(), cmd, (unsigned)len, enc);
+        snprintf(label, sizeof(label), "[%s][Q:%u] %s 0x%04X (%u B): ",
+                 originTag(), (unsigned)bleTxQueueDepth(), dir, cmd, (unsigned)len);
     } else {
-        snprintf(label, sizeof(label), "[%s] TX 0x%04X (%u B, %s): ", originTag(), cmd, (unsigned)len, enc);
+        snprintf(label, sizeof(label), "[%s] %s 0x%04X (%u B): ", originTag(), dir, cmd, (unsigned)len);
     }
     // Label (~50 B) plus 32 bytes of hex (96 B) plus the truncation marker; the old
     // 160-byte buffer here was close enough to truncating to be worth the margin.
@@ -547,24 +550,15 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     // Silence the per-frame command spam for image-write data (0x0071) once the
     // stream is past its first chunk; the display handler's 5% meter reports it.
     const bool quietCmd = (command == CMD_DIRECT_WRITE_DATA || command == CMD_PIPE_WRITE_DATA) && imageWriteLogQuietCmd();
-    // Whether this frame arrived inside the app-layer CCM envelope -- the RX
-    // counterpart of the enc/plain token on the TX line. Mirrors the gate below
-    // exactly: the two handshake opcodes are dispatched before it, an ORIGIN_LAN_TLS
-    // frame is secured by the TLS record layer and is never wrapped (SECTION 9 rule
-    // 4), and a frame too short to hold nonce+tag cannot be one. Anything this calls
-    // "plain" while encryption is on is rejected by that gate a few lines down, so
-    // the token reports the frame's real form rather than the policy's intent.
-    const bool rxEncrypted = isEncryptionEnabled() && g_commandOrigin != ORIGIN_LAN_TLS &&
-                             command != CMD_AUTHENTICATE && command != CMD_FIRMWARE_VERSION &&
-                             len >= BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE;
     // Single per-command banner for the whole dispatch. Named via commandName();
     // unknown opcodes (nullptr) get no banner here and fall to the switch default's
     // "Unknown command" error. Cases and handlers must not log their own banner.
+    // Carries no encryption token: the ERX/URX line from bleRxQueuePush() already
+    // reports it for this frame, and stating it twice is how the two spellings drift.
     if (!quietCmd) {
         const char* name = commandName(command);
         if (name != nullptr) {
-            od_log_info("=== [%s] %s COMMAND (0x%04X, %s) ===", originTag(), name, command,
-                        rxEncrypted ? "enc" : "plain");
+            od_log_info("=== [%s] %s COMMAND (0x%04X) ===", originTag(), name, command);
         }
     }
 
