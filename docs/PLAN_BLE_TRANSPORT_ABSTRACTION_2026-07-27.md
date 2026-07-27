@@ -292,7 +292,7 @@ the plan as written, each deliberate:
 | 3 | The app hooks were deleted rather than converted. Routing all teardown through `serviceBleDisconnectCleanup()` was necessary: keeping `bleAppOnDisconnect()` alongside the flag ran the teardown twice, the first time without the `epdRefreshInProgress` guard. That also closed a pre-existing nRF bug — its old disconnect callback ran the teardown with neither the mid-refresh nor the LAN-ownership guard. |
 | 3 | `restartsAdvertisingOnDisconnect()` was added so the one genuine capability difference reads as a query instead of a target `#ifdef` at the call site. |
 | 4 | nRF **gains** the two session watchdogs (15-minute direct-write timeout, `checkPartialWriteTimeout()`). Both are transport-agnostic and were ESP32-only only because they lived in the ESP32 loop arm. |
-| 5 | Audit **L4** is not closed by this work and is now worse on nRF — see the correction in `PLAN_UNIFY_NRF_ESP32_LOOP_BLE_2026-07-27.md` §5. |
+| 5 | Audit **L4** does not belong in the "callback-stack class" claim (it is a busy-wait), but it is moot: it was already fixed before this work. See the correction in `PLAN_UNIFY_NRF_ESP32_LOOP_BLE_2026-07-27.md` §5. |
 
 Still outstanding: the entire §7 bench matrix, and the two nRF baselines, which
 were never captured — so the idle-current and throughput regressions Phase 3

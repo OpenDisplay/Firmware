@@ -242,10 +242,11 @@ ESP32 got from real overflow incidents, and a whole class of
 "runs-on-the-BLE-callback-stack" bugs (audit M1) becomes structurally
 impossible.
 
-> **Correction 2026-07-27.** This sentence originally cited "audit M1, L4". That
-> was wrong about L4, which is a busy-wait, not a callback-context bug. Moving
-> dispatch to `loop()` does not fix it and in fact makes it worse on nRF: the
-> buzzer tone now blocks the loop task, so nRF loses the keep-alive/touch/button
-> servicing that used to continue while the callback task was stalled. See L4 in
-> `docs/AUDIT_FIRMWARE_2026-07-13.md`. That is a real payoff — it is just not free, and the cost lands
+> **Correction 2026-07-27.** This sentence originally cited "audit M1, L4". L4
+> does not belong in the claim: it is a busy-wait, not a callback-context bug, so
+> moving dispatch to `loop()` neither fixes it nor is required to. It is moot in
+> any case — L4 was already fixed before this work (hardware PWM plus a
+> millis()-poll state machine, `src/buzzer_hw.cpp` and `buzzer_control.cpp`), and
+> is marked RESOLVED in `docs/AUDIT_FIRMWARE_2026-07-13.md`. Only M1 belongs to
+> the class this phase eliminates. That is a real payoff — it is just not free, and the cost lands
 entirely on the most constrained target.

@@ -219,16 +219,21 @@ before `bbepWriteData`, and fail if the stream still has more to emit.
 
 ## L4 — Buzzer playback busy-waits up to ~5 s, starving the main loop
 
-- **STATUS: STILL OPEN, and now WORSE on nRF.** Phase 3 of
-  `docs/PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md` moved nRF command dispatch
-  onto `loop()`. That plan claimed Phase 3 made "audit M1, L4" structurally
-  impossible; that is true of M1 but **not** of L4, which is a busy-wait rather
-  than a callback-context bug. Before Phase 3 an nRF buzzer tone blocked the
-  Bluefruit callback task while `loop()` kept ticking, so keep-alive, touch and
-  buttons still ran. Now it blocks `loop()` on both targets, so nRF inherits the
-  full ESP32 failure mode described below: no command drain, no response flush,
-  no `epdSessionTick`, no touch/button poll for up to ~5 s. The fix is unchanged
-  and is now the same fix for both targets — yield inside the tone loop.
+- **STATUS: RESOLVED**, independently of the BLE transport work and before it.
+  The software square-wave busy-loop is gone: `buzzer_drive_tone_sw` no longer
+  exists. Tone generation is now hardware PWM (`buzzer_hw_tone_start` in
+  `src/buzzer_hw.cpp` — nRF PWM peripheral, ESP32 LEDC), and playback is a
+  millis()-poll state machine (`buzzer_run` / `buzzerService` over `s_buzzer`,
+  `buzzer_control.cpp`) driven from `loop()` and `idleDelay()`. Nothing blocks:
+  `buzzerService()` returns immediately while a step is still timing out. The
+  5 s cap survives as `kBuzzerMaxTotalMs`, now enforced across polls rather than
+  inside a spin.
+
+  Note for anyone tracing this finding's history: a Phase 5 note briefly claimed
+  L4 was still open and made worse by moving nRF dispatch to `loop()`. That was
+  wrong — it reasoned from this document's original text without checking the
+  code, which had already been rewritten. The reasoning would have been correct
+  had the busy-wait still existed.
 - **Severity:** LOW (bounded; degrades BLE latency / keep-alive during a tone)
 - **Location:** `src/buzzer_control.cpp:71-78` (`buzzer_drive_tone_sw`), driven by
   `handleBuzzerActivate` (buzzer_control.cpp:148-175).
