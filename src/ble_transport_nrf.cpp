@@ -36,6 +36,11 @@ static uint16_t s_connHandle = BLE_CONN_HANDLE_INVALID;
 static volatile bool s_connectedEvent = false;
 static volatile bool s_disconnectedEvent = false;
 static volatile uint8_t s_disconnectReason = 0;
+// RX ring head at the instant the link dropped: the boundary between the departed
+// client's queued frames and anything the next client pushes. Captured in the
+// disconnect callback because that is the only moment it is knowable -- by the time
+// loop() services the event, a reconnect may already have queued frames of its own.
+static volatile uint8_t s_rxBoundaryAtDisconnect = 0;
 
 // --- advertising interval policy --------------------------------------------
 static uint32_t s_advBoostUntil = 0;
@@ -128,6 +133,11 @@ static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
     od_log_info("=== BLE CLIENT DISCONNECTED (nRF) ===");
     s_connHandle = BLE_CONN_HANDLE_INVALID;
     s_disconnectReason = reason;
+    // Producer-task read of the producer-owned head: no synchronisation needed, and
+    // within the copy-and-flag contract. Nothing this client can still send exists
+    // past this point -- the link is gone -- so this is exactly the last frame of
+    // the departed session.
+    s_rxBoundaryAtDisconnect = bleRxQueueHead();
     s_disconnectedEvent = true;
 }
 
@@ -312,10 +322,11 @@ bool BleTransport::takeConnectedEvent() {
     return true;
 }
 
-bool BleTransport::takeDisconnectedEvent(uint8_t* reason) {
+bool BleTransport::takeDisconnectedEvent(uint8_t* reason, uint8_t* rxBoundary) {
     if (!s_disconnectedEvent) return false;
     s_disconnectedEvent = false;
     if (reason != nullptr) *reason = s_disconnectReason;
+    if (rxBoundary != nullptr) *rxBoundary = s_rxBoundaryAtDisconnect;
     return true;
 }
 

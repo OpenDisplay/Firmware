@@ -98,10 +98,18 @@ uint8_t bleRxQueueHead(void);                             // producer-side, for 
 uint8_t bleRxQueueDepth(void);                            // unconsumed frame count
 bool bleRxQueuePending(void);                             // unconsumed frames waiting
 
-// Discard every unconsumed frame. Consumer-side: call only from the loop task,
-// and only when the frames are known to be worthless -- i.e. the client that sent
-// them is gone. Returns how many were dropped, for the log.
-uint8_t bleRxQueueDiscardAll(void);
+// Discard unconsumed frames up to `boundary`, a head value captured at the instant
+// the departed client's link went down (BleTransport::takeDisconnectedEvent hands it
+// out). Consumer-side: call only from the loop task. Returns how many were dropped.
+//
+// The boundary is what makes this safe, and it is not optional. loop() can be blocked
+// for tens of seconds inside an EPD refresh -- long enough for the old client's
+// disconnect, the next client's connect, and that client's first command to all land
+// before the disconnect is serviced. A "discard everything present now" flush then
+// eats the NEW client's frames; observed on nRF as a dropped 0x0080 immediately after
+// a reconnect. Frames pushed after the boundary belong to whoever connected next and
+// must survive.
+uint8_t bleRxQueueDiscardTo(uint8_t boundary);
 
 // --- TX: command handlers (producer) -> loop() flush (consumer) --------------
 // One definition of the struct, in one place: communication.cpp used to carry

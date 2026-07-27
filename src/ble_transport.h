@@ -62,7 +62,12 @@ public:
     bool takeConnectedEvent();
     // Optionally reports the stack's disconnect reason code, which is otherwise
     // lost now that the callback no longer runs application code inline.
-    bool takeDisconnectedEvent(uint8_t* reason = nullptr);
+    // rxBoundary, when requested, is the RX ring head at the instant the link went
+    // down -- the dividing line between the departed client's queued frames and any
+    // pushed by whoever connected afterwards. Pass it to bleRxQueueDiscardTo(); a
+    // flush without it drops the next client's frames whenever loop() was blocked
+    // long enough for a reconnect to land before this event was serviced.
+    bool takeDisconnectedEvent(uint8_t* reason = nullptr, uint8_t* rxBoundary = nullptr);
 
     // --- identity ---
     const char* addressString();   // advertised BLE address, lowercase "aa:bb:.."

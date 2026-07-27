@@ -320,15 +320,25 @@ static void serviceBleDisconnectCleanup() {
     // OWNS the in-flight transfer is the one that went away. Otherwise a BLE
     // disconnect kills a live LAN push (and a LAN disconnect kills a BLE push)
     // purely because the other link dropped. Owner is recorded at START.
+    //
+    // The guard is NOT inside OPENDISPLAY_HAS_WIFI, though it used to be. Only the
+    // LAN half is WiFi-specific; ble.isConnected() is meaningful on every target, and
+    // gating the whole test left nRF with no guard at all. That mattered: this flag
+    // can be serviced tens of seconds late (loop() blocked in an EPD refresh), by
+    // which time a NEW client may be connected and mid-transfer -- and the
+    // resetPipeWriteState() below would destroy its session, not the departed one's.
 #ifdef OPENDISPLAY_HAS_WIFI
     const bool lanOwnsSession = (transferSessionOrigin() != 0);   // != ORIGIN_BLE
     const bool ownerStillUp = lanOwnsSession ? wifiLanClientConnected() : ble.isConnected();
+#else
+    const bool lanOwnsSession = false;
+    const bool ownerStillUp = ble.isConnected();
+#endif
     if (ownerStillUp) {
         od_log_info("Disconnect cleanup skipped: transfer still owned by a live %s session",
                     lanOwnsSession ? "LAN" : "BLE");
         return;
     }
-#endif
     // ACTIVE-only-teardown invariant: a WARM (post-successful-refresh) panel
     // SURVIVES disconnect and keeps its keep-alive window, so the cleanups below
     // no-op on power when WARM and only tear down a mid-transfer (PWR_ACTIVE)
@@ -385,7 +395,8 @@ static void serviceBleEvents() {
         ble.requestFastLink();
     }
     uint8_t disconnectReason = 0;
-    if (ble.takeDisconnectedEvent(&disconnectReason)) {
+    uint8_t rxBoundary = 0;
+    if (ble.takeDisconnectedEvent(&disconnectReason, &rxBoundary)) {
         od_log_info("Disconnect reason: %u", disconnectReason);
         // Drop anything the departed client left in the RX ring. Without this,
         // serviceBleRx() runs BEFORE serviceBleDisconnectCleanup() in the pass, so
@@ -394,10 +405,16 @@ static void serviceBleEvents() {
         // discard anyway, and emitting responses that queueBleNotifyCopy() then
         // drops for want of a connection.
         //
+        // Bounded by rxBoundary, the ring head captured when that link went down.
+        // "Discard everything present now" was wrong: loop() can sit inside a ~16 s
+        // EPD refresh, and a disconnect, a reconnect, and the NEW client's first
+        // command all land before this event is serviced -- so the flush ate a frame
+        // from a session that had never disconnected.
+        //
         // Deliberately here and NOT in serviceBleDisconnectCleanup(): that flag is
         // raised by the LAN transport too, and a LAN drop must not discard queued
         // BLE frames. Only a real BLE disconnect event invalidates this ring.
-        const uint8_t droppedRx = bleRxQueueDiscardAll();
+        const uint8_t droppedRx = bleRxQueueDiscardTo(rxBoundary);
         if (droppedRx > 0) {
             od_log_warn("Dropped %u queued command(s) from the disconnected client", droppedRx);
         }

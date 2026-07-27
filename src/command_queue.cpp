@@ -105,20 +105,31 @@ void bleRxQueueConsume(void) {
     __atomic_store_n(&s_rxTail, (uint8_t)((tail + 1) % COMMAND_QUEUE_SIZE), __ATOMIC_RELEASE);
 }
 
-uint8_t bleRxQueueDiscardAll(void) {
-    // ACQUIRE the head for the same reason peek does, then jump the tail to it in
-    // one RELEASE store. Safe against a concurrent producer: it only ever advances
-    // the head, so a frame pushed after this load simply survives to the next pass
-    // rather than being lost or double-counted.
+uint8_t bleRxQueueDiscardTo(uint8_t boundary) {
+    // Discard up to `boundary` -- a head value captured when the departed client's
+    // link went down -- NOT up to the current head. Discarding to the current head
+    // is what broke: loop() can be blocked for tens of seconds inside an EPD refresh,
+    // during which the old client's disconnect, the next client's connect, and that
+    // client's first command all land. Servicing the stale disconnect then threw away
+    // a frame that had never belonged to the departed session.
+    //
+    // ACQUIRE the head for the same reason peek does. Safe against a concurrent
+    // producer: it only ever advances the head, so frames pushed after this load
+    // survive to the next pass rather than being lost or double-counted.
     uint8_t tail = __atomic_load_n(&s_rxTail, __ATOMIC_RELAXED);
     uint8_t head = __atomic_load_n(&s_rxHead, __ATOMIC_ACQUIRE);
     if (tail == head) return 0;
-    const uint8_t dropped = (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
-    for (uint8_t i = tail; i != head; i = (uint8_t)((i + 1) % COMMAND_QUEUE_SIZE)) {
+    const uint8_t occupied = (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
+    const uint8_t wanted   = (uint8_t)((boundary - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
+    // The consumer already drained past the boundary: nothing of the old session is
+    // left. Without this test the modular subtraction above would read as a nearly
+    // full ring and discard the live client's frames -- the very bug being fixed.
+    if (wanted > occupied) return 0;
+    for (uint8_t i = tail; i != boundary; i = (uint8_t)((i + 1) % COMMAND_QUEUE_SIZE)) {
         s_rx[i].pending = false;
     }
-    __atomic_store_n(&s_rxTail, head, __ATOMIC_RELEASE);
-    return dropped;
+    __atomic_store_n(&s_rxTail, boundary, __ATOMIC_RELEASE);
+    return wanted;
 }
 
 uint8_t bleRxQueueHead(void) {
