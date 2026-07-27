@@ -53,7 +53,37 @@ void setup() {
     delay(100);
     #elif !defined(DISABLE_USB_SERIAL)
     Serial.begin(115200);
+    #if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
+    // Full-firmware boot diagnostic. Reaching this LED proves that reset,
+    // application handoff, C/C++ runtime initialization, global constructors,
+    // FreeRTOS startup, and entry into setup() all completed.
+    pinMode(LED_GREEN, OUTPUT);
+    pinMode(LED_BLUE, OUTPUT);
+    digitalWrite(LED_GREEN, LED_STATE_ON);
+    digitalWrite(LED_BLUE, !LED_STATE_ON);
+
+    // Do not let later initialization hide the CDC port by faulting first.
+    // The full application remains linked; execution continues only after a
+    // host actually opens native USB serial.
+    bool blueOn = false;
+    uint32_t lastBlueToggleMs = millis();
+    while (!Serial) {
+        if (millis() - lastBlueToggleMs >= 250u) {
+            lastBlueToggleMs = millis();
+            blueOn = !blueOn;
+            digitalWrite(LED_BLUE, blueOn ? LED_STATE_ON : !LED_STATE_ON);
+        }
+        delay(10);
+    }
+    digitalWrite(LED_BLUE, !LED_STATE_ON);
+    Serial.println();
+    Serial.println("[BOOTDIAG] ENTERED setup(); USB CDC connected");
+    Serial.println("[BOOTDIAG] continuing normal boot in 5 seconds");
+    Serial.flush();
+    delay(5000);
+    #else
     delay(100);
+    #endif
     #endif
     #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
     od_log_init(&LogSerialPort);
@@ -103,7 +133,15 @@ void setup() {
     #endif
     od_log_info("Starting setup...");
     if (is_deep_sleep_wake) { od_log_info("[wake] >> full_config_init"); od_log_flush(); }
+#if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
+    Serial.println("[BOOTDIAG] before full_config_init()");
+    Serial.flush();
+#endif
     full_config_init();
+#if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
+    Serial.println("[BOOTDIAG] after full_config_init()");
+    Serial.flush();
+#endif
 #ifdef OPENDISPLAY_HAS_WIFI
     // Reserve mbedTLS's two ~16.7 KB record buffers HERE and nowhere else: config is
     // loaded (so we know whether TLS is even used) but ble.begin() and initWiFi() have not
@@ -114,14 +152,30 @@ void setup() {
     od_tls_reserve_records();
 #endif
     if (is_deep_sleep_wake) { od_log_info("[wake] << full_config_init >> initio"); od_log_flush(); }
+#if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
+    Serial.println("[BOOTDIAG] before initio()");
+    Serial.flush();
+#endif
     initio();
+#if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
+    Serial.println("[BOOTDIAG] after initio()");
+    Serial.flush();
+#endif
 #ifdef TARGET_NRF
     // SoftDevice must start before display/SPI; advertising starts after boot screen.
     {
         // Named local, not a temporary: the name outlives the call regardless of
         // whether the stack copies it.
         String bleDeviceName = "OD" + getChipIdHex();
+#ifdef OPENDISPLAY_BOOT_DIAG
+        Serial.println("[BOOTDIAG] before ble.begin() / SoftDevice enable");
+        Serial.flush();
+#endif
         ble.begin(bleDeviceName.c_str());
+#ifdef OPENDISPLAY_BOOT_DIAG
+        Serial.println("[BOOTDIAG] after ble.begin() / SoftDevice enable");
+        Serial.flush();
+#endif
     }
 #endif
     if (!is_deep_sleep_wake) {
