@@ -154,26 +154,6 @@ static uint8_t parseFirmwareVersionComponent(unsigned index) {
     return (uint8_t)n;
 }
 
-// Builds "<label><space-separated %02X bytes, up to 32><' ...' if truncated>" into buf.
-static void buildHexDump(char* buf, size_t bufSize, const char* label, const uint8_t* data, uint16_t len) {
-    int pos = snprintf(buf, bufSize, "%s", label);
-    if (pos < 0) {
-        pos = 0;
-        buf[0] = '\0';
-    }
-    int dumpLen = (len < 32) ? len : 32;
-    for (int i = 0; i < dumpLen && pos < (int)bufSize; i++) {
-        int n = snprintf(buf + pos, bufSize - pos, i > 0 ? " %02X" : "%02X", data[i]);
-        if (n < 0) {
-            break;
-        }
-        pos += n;
-    }
-    if (len > 32 && pos >= 0 && pos < (int)bufSize) {
-        snprintf(buf + pos, bufSize - pos, " ...");
-    }
-}
-
 // The single TX log line. Every response leaving this file goes through here, so a
 // response can never reach the drain side without having been logged at its source
 // -- sendResponseUnencrypted() previously had no TX line at all, which is why its
@@ -190,19 +170,25 @@ static void buildHexDump(char* buf, size_t bufSize, const char* label, const uin
 // this ring since Phase 3 (see the de-fan-out comment in sendResponse). nRF needs
 // the number more than ESP32 does -- loop() runs there at TASK_PRIO_LOW and is
 // starved by the Bluefruit tasks, which is exactly when the drain falls behind.
-static void logTxFrame(const uint8_t* frame, uint16_t len) {
+// `encrypted` renders as an "enc" / "plain" token, replacing the former three-line
+// "Sending encrypted response: / Original length: / Encrypted length:" block --
+// on the line that already names the opcode, the length and the bytes. Both states
+// are spelled out rather than letting absence mean plaintext, so a frame that should
+// have been wrapped and was not is visible instead of merely unremarked.
+static void logTxFrame(const uint8_t* frame, uint16_t len, bool encrypted = false) {
     const uint16_t cmd = (len >= 2) ? (uint16_t)((frame[0] << 8) | frame[1]) : frame[0];
-    char label[48];
+    char label[64];
+    const char* enc = encrypted ? "enc" : "plain";
     if (g_commandOrigin == ORIGIN_BLE) {
-        snprintf(label, sizeof(label), "[%s][Q:%u] TX 0x%04X (%u B): ",
-                 originTag(), (unsigned)bleTxQueueDepth(), cmd, (unsigned)len);
+        snprintf(label, sizeof(label), "[%s][Q:%u] TX 0x%04X (%u B, %s): ",
+                 originTag(), (unsigned)bleTxQueueDepth(), cmd, (unsigned)len, enc);
     } else {
-        snprintf(label, sizeof(label), "[%s] TX 0x%04X (%u B): ", originTag(), cmd, (unsigned)len);
+        snprintf(label, sizeof(label), "[%s] TX 0x%04X (%u B, %s): ", originTag(), cmd, (unsigned)len, enc);
     }
-    // Label (~40 B) plus 32 bytes of hex (96 B) plus the truncation marker; the old
+    // Label (~50 B) plus 32 bytes of hex (96 B) plus the truncation marker; the old
     // 160-byte buffer here was close enough to truncating to be worth the margin.
     char line[192];
-    buildHexDump(line, sizeof(line), label, frame, len);
+    od_log_hex_line(line, sizeof(line), label, frame, len);
     od_log_debug("%s", line);
 }
 
@@ -230,6 +216,11 @@ void sendResponse(uint8_t* response, uint16_t len) {
     // Length test uses the plaintext ACK (encryption happens after this check).
     const bool quietAck = (len == 2 && response[0] == 0x00 && response[1] == 0x71 && imageWriteLogQuietAck())
                        || (len == 7 && response[0] == 0x00 && response[1] == 0x81 && imageWriteLogQuietAck());
+    // Set only where the CCM envelope is actually applied below, so the log reports
+    // what left the device rather than what policy intended. Every skip path -- TLS
+    // origin, unauthenticated, handshake opcode, FE/FF status, and encryptResponse()
+    // itself failing -- leaves it false and the frame is reported "plain".
+    bool wasEncrypted = false;
     // TLS-origin responses are already secured by the TLS record layer; never wrap
     // them in the app-layer CCM envelope (no double-encrypt; SECTION 9 rule 4).
     if (isAuthenticated() && len >= 2 && g_commandOrigin != ORIGIN_LAN_TLS) {
@@ -249,13 +240,9 @@ void sendResponse(uint8_t* response, uint16_t len) {
             uint8_t auth_tag[ENCRYPTION_TAG_SIZE];
             uint16_t encrypted_len = 0;
             if (encryptResponse(response, len, encrypted_response, &encrypted_len, nonce, auth_tag)) {
-                if (!quietAck) {
-                    od_log_debug("[%s] Sending encrypted response:", originTag());
-                    od_log_debug("  Original length: %u bytes", len);
-                    od_log_debug("  Encrypted length: %u bytes", encrypted_len);
-                }
                 response = encrypted_response;
                 len = encrypted_len;
+                wasEncrypted = true;
             } else {
                 od_log_warn("WARNING: Failed to encrypt response, sending unencrypted error response");
                 errorResponse[0] = RESP_NACK;
@@ -264,14 +251,13 @@ void sendResponse(uint8_t* response, uint16_t len) {
                 response = errorResponse;
                 len = sizeof(errorResponse);
             }
-        } else if (!quietAck) {
-            od_log_debug("[%s] Sending unencrypted response (authentication/firmware version/error)", originTag());
         }
     }
 
-    // Logged here, after the encryption swap, so the dump is the bytes actually sent
-    // and the depth is the pre-enqueue one.
-    if (!quietAck) logTxFrame(response, len);
+    // Logged here, after the encryption swap, so the dump is the bytes actually sent,
+    // the depth is the pre-enqueue one, and the enc/plain token is the outcome rather
+    // than the intent.
+    if (!quietAck) logTxFrame(response, len, wasEncrypted);
     // F4 de-fan-out: reply over the origin transport only. One path for both
     // targets as of Phase 3: nRF used to notify() inline here with a blocking
     // delay(5) x 4 retry, which was only safe because it ran on the same task as
@@ -561,13 +547,24 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     // Silence the per-frame command spam for image-write data (0x0071) once the
     // stream is past its first chunk; the display handler's 5% meter reports it.
     const bool quietCmd = (command == CMD_DIRECT_WRITE_DATA || command == CMD_PIPE_WRITE_DATA) && imageWriteLogQuietCmd();
+    // Whether this frame arrived inside the app-layer CCM envelope -- the RX
+    // counterpart of the enc/plain token on the TX line. Mirrors the gate below
+    // exactly: the two handshake opcodes are dispatched before it, an ORIGIN_LAN_TLS
+    // frame is secured by the TLS record layer and is never wrapped (SECTION 9 rule
+    // 4), and a frame too short to hold nonce+tag cannot be one. Anything this calls
+    // "plain" while encryption is on is rejected by that gate a few lines down, so
+    // the token reports the frame's real form rather than the policy's intent.
+    const bool rxEncrypted = isEncryptionEnabled() && g_commandOrigin != ORIGIN_LAN_TLS &&
+                             command != CMD_AUTHENTICATE && command != CMD_FIRMWARE_VERSION &&
+                             len >= BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE;
     // Single per-command banner for the whole dispatch. Named via commandName();
     // unknown opcodes (nullptr) get no banner here and fall to the switch default's
     // "Unknown command" error. Cases and handlers must not log their own banner.
     if (!quietCmd) {
         const char* name = commandName(command);
         if (name != nullptr) {
-            od_log_info("=== [%s] %s COMMAND (0x%04X) ===", originTag(), name, command);
+            od_log_info("=== [%s] %s COMMAND (0x%04X, %s) ===", originTag(), name, command,
+                        rxEncrypted ? "enc" : "plain");
         }
     }
 
@@ -612,18 +609,19 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
 
         uint16_t encrypted_data_len = len - BLE_CMD_HEADER_SIZE - ENCRYPTION_NONCE_SIZE - ENCRYPTION_TAG_SIZE;
 
-        if (!quietCmd) {
-            od_log_debug("Encrypted command: len=%u, command=0x%04X, encrypted_data_len=%u",
-                         (unsigned int)len, (unsigned int)command, (unsigned int)encrypted_data_len);
-            od_log_debug("Full nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
-                         nonce_full[0], nonce_full[1], nonce_full[2], nonce_full[3],
-                         nonce_full[4], nonce_full[5], nonce_full[6], nonce_full[7],
-                         nonce_full[8], nonce_full[9], nonce_full[10], nonce_full[11],
-                         nonce_full[12], nonce_full[13], nonce_full[14], nonce_full[15]);
-        }
-
+        // The nonce is no longer dumped per frame: the banner above already reports
+        // this frame as "enc", and on ESP32 the transport's RX line dumps the first
+        // 32 bytes -- of which 2..17 ARE the nonce -- so it restated bytes already on
+        // screen. It moves to the failure path below, where it is the only thing that
+        // separates a replay-window jump from nonce reuse from a wrong session key,
+        // and where nRF (which has no RX hex line at all) would otherwise be blind.
         if (!decryptCommand(data + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
-            od_log_error("ERROR: Decryption failed");
+            // 16 bytes render as 47 chars + NUL, an exact fit in 48; sized past that
+            // so a future ENCRYPTION_NONCE_SIZE bump truncates nothing.
+            char nonceHex[64];
+            od_log_hex_line(nonceHex, sizeof(nonceHex), "", nonce_full, ENCRYPTION_NONCE_SIZE);
+            od_log_error("ERROR: Decryption failed (0x%04X, %u B payload, nonce %s)",
+                         (unsigned)command, (unsigned)encrypted_data_len, nonceHex);
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_NACK};
             sendResponseUnencrypted(response, sizeof(response));
             return;
