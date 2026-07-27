@@ -43,7 +43,11 @@ void sendResponse(uint8_t* response, uint16_t len);
 
 extern ButtonState buttonStates[MAX_BUTTONS];
 
-#ifdef TARGET_ESP32
+// No target guard: every line below is portable Arduino GPIO, and the two
+// powerLatch*Configured() predicates return false unless the board actually declares
+// a latch (DEVICE_FLAG_BATTERY_LATCH / DEVICE_FLAG_PWR_LATCH_DFF plus the pins). The
+// old #ifdef TARGET_ESP32 was inherited from power_latch.cpp being ESP32-gated as a
+// whole; that gate is gone, because the latch is a board feature, not a SoC feature.
 static bool s_pwrOffReleased[MAX_BUTTONS];
 static bool s_pwrOffPressing[MAX_BUTTONS];
 static bool s_pwrOffDone[MAX_BUTTONS];
@@ -90,6 +94,13 @@ static void pollConfiguredPowerOffButtons() {
 // Several buttons share one ADC pin via a resistor ladder, distinguished by
 // voltage. They have no edge interrupt, so they are polled. Reported through
 // the same MSD button byte as digital buttons for a uniform host contract.
+//
+// This guard used to open far above, wrapping the power-off button poll as well;
+// that poll is portable and now sits outside it. The ladder itself stays ESP32-only
+// for now -- see the parity audit: nRF has a SAADC, so this is portable in
+// principle, but registerAdcLadder()'s omission there also makes a ladder input fall
+// through to the digital-button path instead of being rejected.
+#ifdef TARGET_ESP32
 #define MAX_ADC_LADDERS     4
 #define MAX_LADDER_BUTTONS  4    // reserved[] holds at most N+1 = 5 LE uint16 thresholds
 #define ADC_LADDER_POLL_MS  5
@@ -562,10 +573,8 @@ void handleLedStop(uint8_t* data, uint16_t len) {
 
 void processButtonEvents() {
     powerButtonPoll();
-#ifdef TARGET_ESP32
-    pollConfiguredPowerOffButtons();
-#endif
-    pollAdcButtons();
+    pollConfiguredPowerOffButtons();   // no-op unless the board declares a latch
+    pollAdcButtons();                  // no-op off ESP32 (see the ADC ladder guard)
     if (buttonEventPending) {
         noInterrupts();
         buttonEventPending = false;
