@@ -215,11 +215,10 @@ void flashLed(uint8_t color, uint8_t brightness);  // Flash LED with color and b
 void processLedFlash();  // Advance async LED flash state machine
 void handleLedActivate(uint8_t* data, uint16_t len);  // Handle LED activation command
 void handleLedStop(uint8_t* data, uint16_t len);  // Stop running LED flash sequence
-#ifdef TARGET_ESP32
-void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler (IRAM_ATTR in implementation)
-#else
-void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler
-#endif
+// Shared ISR handler. No target guard: both arms of the former #ifdef declared this
+// identically -- IRAM_ATTR belongs on the DEFINITION (device_control.cpp), not here,
+// and a declaration that differs only in its trailing comment is not a difference.
+void handleButtonISR(uint8_t buttonIndex);
 void scanI2CDevices();
 void initSensors();
 void initAXP2101(uint8_t busId);
