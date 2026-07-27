@@ -244,6 +244,13 @@ A second, independent cluster of findings is in the **encryption/session layer**
 - **Confidence:** High that the length byte is unused; Med on real-world triggerability (*verify against the wire format the toolbox emits*).
 
 ### #20 — Config reload mutates `globalConfig` in the BLE callback task while `loop()` reads it (nRF only)
+- **STATUS: RESOLVED 2026-07-27** by Phase 3 of
+  `docs/PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md`, which applied this
+  finding's own first proposed solution: nRF now marshals command processing to
+  the main loop as ESP32 does. The nRF write callback pushes onto the shared RX
+  ring and `serviceBleRx()` dispatches from `loop()`, so `loadGlobalConfig()` and
+  every `globalConfig` reader run on one task. No critical section or
+  double-buffer swap was needed. `src/ble_init.cpp` no longer exists.
 - **Location:** `src/config_parser.cpp:263-264` (`memset`/repopulate in `loadGlobalConfig`), reached via `handleWriteConfig`/`reloadConfigAfterSave`; nRF dispatch at `src/ble_init.cpp:160`
 - **Category:** race
 - **Provenance:** Pre-existing (Bluefruit path), **not** the NimBLE port — but in-scope for the callback-vs-loop concern.

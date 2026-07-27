@@ -277,6 +277,30 @@ revertable.
 
 Phases 1–2 are safe to land without Phase 3. **Phase 3 must not be split.**
 
+### Implementation record (2026-07-27)
+
+All five phases are implemented on `feat/unify-nrf-esp-phase3`. Deviations from
+the plan as written, each deliberate:
+
+| Phase | Deviation |
+|---|---|
+| 1 | The `sendResponse()` `#ifdef` tails were **not** fully removed here. The stack-API half went (both arms call `ble.notify()`), but the queue-vs-inline split is a *threading* difference and only dissolved in Phase 3. The plan overstated what Phase 1 could deliver. |
+| 1 | `requestFastLink()` keeps no parameter, but the nRF impl latches the connection handle from its own connect callback rather than being handed one. |
+| 2 | Accessors are `peek`/`consume`, not the sketched copying `bleRxQueuePop(out, outLen)`: the consumer owns the slot until it advances the tail, so a pointer is safe and avoids a 256-byte stack buffer plus a memcpy per frame. |
+| 2 | Does **not** land the ~11 KB on nRF as implied — `--gc-sections` drops the rings while nothing references them. The `.bss` first appears in Phase 3 (measured: +11 184 B, against the predicted ≈11 KB). |
+| 3 | `idleDelay()` drains TX but deliberately does **not** drain RX, contrary to §7's mitigation. Dispatching there would make command handlers reentrant the moment anything calls `idleDelay()` from a handler. It returns early on RX instead, which also caps command latency at one 100 ms check interval rather than the caller's full delay — a stronger mitigation than the one specified. |
+| 3 | The app hooks were deleted rather than converted. Routing all teardown through `serviceBleDisconnectCleanup()` was necessary: keeping `bleAppOnDisconnect()` alongside the flag ran the teardown twice, the first time without the `epdRefreshInProgress` guard. That also closed a pre-existing nRF bug — its old disconnect callback ran the teardown with neither the mid-refresh nor the LAN-ownership guard. |
+| 3 | `restartsAdvertisingOnDisconnect()` was added so the one genuine capability difference reads as a query instead of a target `#ifdef` at the call site. |
+| 4 | nRF **gains** the two session watchdogs (15-minute direct-write timeout, `checkPartialWriteTimeout()`). Both are transport-agnostic and were ESP32-only only because they lived in the ESP32 loop arm. |
+| 5 | Audit **L4** is not closed by this work and is now worse on nRF — see the correction in `PLAN_UNIFY_NRF_ESP32_LOOP_BLE_2026-07-27.md` §5. |
+
+Still outstanding: the entire §7 bench matrix, and the two nRF baselines, which
+were never captured — so the idle-current and throughput regressions Phase 3
+could cause remain unmeasured. The three §8 open questions are also unanswered:
+`Bluefruit.connected()`'s exact return semantics, a NimBLE `requestFastLink()`,
+and whether the `SoftwareTimer` link-diagnostic one-shot should fold into
+`tick()`.
+
 ---
 
 ## 7. Risks and gates

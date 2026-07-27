@@ -239,6 +239,13 @@ regression is detectable rather than gate-keeping.
 The payoff for Level 2, stated plainly, is: one loop to reason about, one place
 to fix a queue/backpressure bug, nRF gains the response-ring flow control that
 ESP32 got from real overflow incidents, and a whole class of
-"runs-on-the-BLE-callback-stack" bugs (audit M1, L4) becomes structurally
-impossible. That is a real payoff — it is just not free, and the cost lands
+"runs-on-the-BLE-callback-stack" bugs (audit M1) becomes structurally
+impossible.
+
+> **Correction 2026-07-27.** This sentence originally cited "audit M1, L4". That
+> was wrong about L4, which is a busy-wait, not a callback-context bug. Moving
+> dispatch to `loop()` does not fix it and in fact makes it worse on nRF: the
+> buzzer tone now blocks the loop task, so nRF loses the keep-alive/touch/button
+> servicing that used to continue while the callback task was stalled. See L4 in
+> `docs/AUDIT_FIRMWARE_2026-07-13.md`. That is a real payoff — it is just not free, and the cost lands
 entirely on the most constrained target.

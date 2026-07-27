@@ -388,16 +388,24 @@ static uint32_t epdKeepAliveWindowMs(void) {
     return (uint32_t)s * 1000;
 }
 
-// Cross-task try-lock. On nRF the Bluefruit write-callback task and the loop()
-// task can both touch the session (a transfer begins Acquire on one while the
-// keep-alive tick fires ForceOff on the other). Acquire/Release/ForceOff take it;
-// the tick TRY-locks and skips its pass if held, so it can never rail-cut mid-init.
+// Session try-lock, now UNCONTENDED on both targets and kept as defence in depth.
+//
+// It existed because nRF dispatched commands on the Bluefruit write-callback
+// task while the keep-alive tick ran on loop(): a transfer could Acquire on one
+// task while ForceOff rail-cut on the other. Phase 3 moved nRF dispatch to
+// loop(), so every Acquire/Release/ForceOff/tick caller is now that single task
+// (see docs/PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md).
+//
+// Kept rather than deleted: it is nearly free, it still guards against a future
+// caller arriving from an ISR or another task, and the try-lock in the tick is
+// what keeps a rail-cut from landing mid-init regardless of who calls it.
 static void pwrmgmLockTake(void) {
-    // MUST yield while waiting: on nRF this runs on the Bluefruit callback task,
-    // which outranks the loop task holding the lock during the tick's ForceOff
-    // (SPI ops + delay(50)). A bare busy-spin starves the lower-priority holder
-    // forever on the single core (priority-inversion livelock); delay(1) is
-    // vTaskDelay, which blocks the spinner so the holder can finish and release.
+    // The yield here is now belt-and-braces. It was load-bearing under the old
+    // model: this ran on the Bluefruit callback task, which outranks the loop
+    // task holding the lock during the tick's ForceOff (SPI ops + delay(50)), so
+    // a bare busy-spin starved the lower-priority holder forever on the single
+    // core (priority-inversion livelock). With one task there is nothing to spin
+    // against, but delay(1) is vTaskDelay and stays correct if that ever changes.
     while (__atomic_exchange_n(&pwrmgmLock, 1, __ATOMIC_ACQUIRE)) { delay(1); }
 }
 static bool pwrmgmLockTryTake(void) {
