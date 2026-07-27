@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "opendisplay_protocol.h"   // OD_BLE_MAX_FRAME
+#include "structs.h"                // PIPE_MAX_W (shrunk by PIPE_SMALL_DRAM_WINDOW)
 
 // The two BLE command rings, declared together because they are two halves of
 // one thing: frames in from the stack callback, responses out to it.
@@ -21,22 +22,52 @@
 // state.
 
 // --- RX: BLE stack callback (producer) -> loop() (consumer) ------------------
-// PIPE_WRITE ingest sizing: 33 slots hold a full W=32 in-flight window + END
-// across a 60 s Spectra SPI stall (loop blocked in bbepWriteData).
+// DEPTH IS DERIVED FROM THE PIPE WINDOW, not hardcoded. The worst case this ring
+// must absorb is a 60 s Spectra SPI stall (loop blocked inside bbepWriteData)
+// while a client streams a PIPE_WRITE transfer:
+//
+//   * up to PIPE_MAX_W unacknowledged DATA (0x0081) frames -- the sender's
+//     window rule bounds these, and
+//   * the END (0x0082) that closes the transfer. END carries no seq, so it sits
+//     OUTSIDE the sliding window's sequence space and the window rule does not
+//     bound it: a sender that pipelines its tail can have END in flight on top
+//     of a full window.
+//
+//   => frames in flight  <=  PIPE_MAX_W + 1
+//
+// The ring reserves one slot to tell full from empty (see bleRxQueuePush), so
+// usable capacity is SLOTS - 1. Hence SLOTS = PIPE_MAX_W + 2.
+//
+// This previously read 33, which gave 32 usable and was one short of its own
+// stated design point ("a full W=32 window plus END") -- the END would be
+// rejected at exactly the stall the number was chosen for. 33 is correct for
+// PIPE_REORDER_SLOTS, where W + 1 makes seq % SLOTS collision-free; that is
+// modular-indexing arithmetic, not queue capacity, and the value looks to have
+// been carried across.
+//
+// Deriving it also right-sizes env:esp32-N4, which sets PIPE_SMALL_DRAM_WINDOW
+// (PIPE_MAX_W 16) yet carried a ring sized for a 32-frame window it can never
+// receive.
+//
 // OD_BLE_MAX_FRAME (256) covers pipe <=244, legacy <=232, HA <=244; the GATT
 // layer rejects anything larger with ATT 0x0D rather than the app dropping it
 // silently.
 //
-// BLE_RX_QUEUE_SLOTS is an escape hatch, not an expected fallback: nRF RAM
-// headroom was confirmed sufficient for the full depth (2026-07-27), so no env
-// overrides it today. Mirrors the PIPE_SMALL_DRAM_WINDOW precedent in structs.h.
-// Shrinking it below PIPE_MAX_W + 1 caps the PIPE_WRITE window and costs
-// throughput -- a deliberate trade, never a link-time discovery.
+// BLE_RX_QUEUE_SLOTS remains overridable as an escape hatch, not an expected
+// fallback: nRF RAM headroom was confirmed sufficient (2026-07-27) and no env
+// overrides it. Overriding it BELOW the derived value caps the effective
+// PIPE_WRITE window and costs throughput -- a deliberate trade, never a
+// link-time discovery. The assert below makes that trade explicit rather than
+// silent.
 #ifndef BLE_RX_QUEUE_SLOTS
-#define BLE_RX_QUEUE_SLOTS 33
+#define BLE_RX_QUEUE_SLOTS (PIPE_MAX_W + 2)
 #endif
 #define COMMAND_QUEUE_SIZE BLE_RX_QUEUE_SLOTS
 #define MAX_COMMAND_SIZE   OD_BLE_MAX_FRAME
+
+static_assert(COMMAND_QUEUE_SIZE - 1 >= PIPE_MAX_W + 1,
+              "RX ring too small for a full PIPE_WRITE window plus END "
+              "(usable capacity is COMMAND_QUEUE_SIZE - 1)");
 
 struct CommandQueueItem {
     uint8_t data[MAX_COMMAND_SIZE];
