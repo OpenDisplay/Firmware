@@ -1,0 +1,47 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          # Passed explicitly: the action's config-file default is
+          # `release-please-config.json` (no leading dot), so relying on the
+          # default would silently ignore this repo's dotted config.
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # A release created with GITHUB_TOKEN does not emit `release: published`, so
+  # the build has to be called directly rather than left to trigger itself.
+  build:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # A called workflow cannot hold more permissions than its caller, and this
+    # one attaches release assets. Without this the whole run fails at startup,
+    # because the top-level `permissions: {}` would cap it at nothing.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit

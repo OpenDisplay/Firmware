@@ -1,8 +1,18 @@
 name: Release Firmware
 
 on:
+  # Called by release-please.yml once it has created a release. Needed because a
+  # release created with GITHUB_TOKEN does not emit `release: published`.
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build and attach assets to (e.g. 2.25.1)"
+        required: true
+        type: string
+  # Kept for releases published by hand in the GitHub UI.
   release:
     types: [published]
+  # Recovery path: re-run the build for an existing tag without republishing it.
   workflow_dispatch:
     inputs:
       tag:
