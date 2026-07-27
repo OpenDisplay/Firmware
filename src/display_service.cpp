@@ -1776,6 +1776,14 @@ void updatemsdata(){
         return;
     }
     memcpy(prev_msd_payload, msd_payload, 16);
+    // The only record of what actually reaches the air. Without it, "the button
+    // event is logged but the host never sees it" cannot be split into a firmware
+    // publish failure vs a host-side one without a BLE sniffer.
+    {
+        char line[96];
+        od_log_hex_line(line, sizeof(line), "MSD publish: ", msd_payload, 16);
+        od_log_debug("%s", line);
+    }
     ble.setManufacturerData(msd_payload, 16);
 #ifdef OPENDISPLAY_HAS_WIFI
     // (Implies TARGET_ESP32; the enclosing target guard is gone with the split.)

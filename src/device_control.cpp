@@ -615,8 +615,17 @@ void processButtonEvents() {
                 dynamicreturndata[btn->byte_index] = buttonData;
             }
         }
-        updatemsdata();
+        // ORDER IS LOAD-BEARING: boost first, publish second. updatemsdata() ends in
+        // setManufacturerData(), which calls applyAdvInterval() and then restarts
+        // advertising -- so the interval is chosen DURING the publish. Boosting
+        // afterwards set the deadline too late to affect the packet it exists for:
+        // the press went out at the 160 ms slow interval (~1 advertisement in a
+        // typical 230 ms press window, which a passive scanner routinely misses)
+        // while the release 230 ms later got the 20 ms boosted interval, because by
+        // then s_advBoostUntil was set. Net effect: a host saw "not pressed"
+        // reliably and "pressed" almost never.
         ble.boostAdvertising();   // no-op where the stack has no fast-adv window
+        updatemsdata();
     }
 }
 
