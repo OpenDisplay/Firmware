@@ -95,12 +95,12 @@ static void pollConfiguredPowerOffButtons() {
 // voltage. They have no edge interrupt, so they are polled. Reported through
 // the same MSD button byte as digital buttons for a uniform host contract.
 //
-// This guard used to open far above, wrapping the power-off button poll as well;
-// that poll is portable and now sits outside it. The ladder itself stays ESP32-only
-// for now -- see the parity audit: nRF has a SAADC, so this is portable in
-// principle, but registerAdcLadder()'s omission there also makes a ladder input fall
-// through to the digital-button path instead of being rejected.
-#ifdef TARGET_ESP32
+// No target guard. Everything here is analogRead/pinMode/millis; the single
+// SoC-specific call (input range) is shimmed in adcLadderConfigurePin() below.
+// Gating the whole block on TARGET_ESP32 did not merely disable the feature on nRF,
+// it MIS-handled it: the `continue` that skips ladder inputs in initButtons() was
+// inside the same guard, so a BINARY_INPUT_TYPE_ADC_LADDER entry fell through to the
+// digital-button path and had a CHANGE interrupt attached to the ladder pin.
 #define MAX_ADC_LADDERS     4
 #define MAX_LADDER_BUTTONS  4    // reserved[] holds at most N+1 = 5 LE uint16 thresholds
 #define ADC_LADDER_POLL_MS  5
@@ -125,6 +125,27 @@ struct AdcLadder {
 };
 static AdcLadder adcLadders[MAX_ADC_LADDERS];
 static uint8_t   adcLadderCount = 0;
+
+// The one SoC-specific step: put the pad in its widest input range and fix the
+// reading scale, so a single set of config thresholds means the same thing on both.
+//
+// ESP32: 11 dB attenuation widens the usable span to roughly 0..2.5 V; analogRead is
+// already 12-bit there by default.
+// nRF52840: the SAADC needs no per-pad attenuation call, but the Adafruit core
+// defaults analogRead to 10-bit, which would silently quarter every reading against
+// thresholds written for a 12-bit part. Match the scale explicitly.
+//
+// UNVALIDATED ON nRF HARDWARE -- no nRF board with a ladder exists yet. The reference
+// voltages still differ, so thresholds remain a per-board calibration carried in
+// BinaryInputs.reserved[]; this only makes the SCALE comparable.
+static void adcLadderConfigurePin(uint8_t pin) {
+#if defined(TARGET_ESP32)
+    analogSetPinAttenuation(pin, ADC_11db);
+#else
+    (void)pin;
+    analogReadResolution(12);
+#endif
+}
 
 // Returns button index 0..num_buttons-1, or -1 when nothing is pressed.
 static int classifyAdcLadder(int adc, const AdcLadder* l) {
@@ -176,7 +197,7 @@ static void registerAdcLadder(const struct BinaryInputs* input) {
     l->last_press_time = 0;
     pinMode(l->pin, INPUT);
     (void)analogRead(l->pin);
-    analogSetPinAttenuation(l->pin, ADC_11db);
+    adcLadderConfigurePin(l->pin);
     adcLadderCount++;
     od_log_info("ADC ladder: pin %u n %u idBase %u byteIdx %u", l->pin, n, l->id_base, l->byte_index);
 }
@@ -219,9 +240,6 @@ static void pollAdcButtons() {
                     l->pin, adc, btn, l->last_button_id, l->press_count, state);
     }
 }
-#else
-static void pollAdcButtons() {}
-#endif
 
 // The BLE connect/disconnect application hooks that used to live here are gone
 // as of Phase 3. Both targets now service connect and disconnect from loop():
@@ -713,18 +731,18 @@ void initButtons() {
         buttonStates[i].power_off = false;
         buttonStates[i].power_off_hold_ms = 0;
     }
-#ifdef TARGET_ESP32
     adcLadderCount = 0;
-#endif
     if (globalConfig.binary_input_count == 0) return;
     for (uint8_t instanceIdx = 0; instanceIdx < globalConfig.binary_input_count; instanceIdx++) {
         struct BinaryInputs* input = &globalConfig.binary_inputs[instanceIdx];
-#ifdef TARGET_ESP32
+        // The `continue` is the load-bearing half. It used to be inside
+        // #ifdef TARGET_ESP32 along with registerAdcLadder(), so on nRF a ladder
+        // input did not merely go unregistered -- it fell through to the digital
+        // path below and got a CHANGE interrupt attached to the ladder pin.
         if (input->input_type == BINARY_INPUT_TYPE_ADC_LADDER) {
             registerAdcLadder(input);
             continue;
         }
-#endif
         if (input->input_type != OD_INPUT_TYPE_BUTTON) continue;
         if (input->button_data_byte_index > 10) continue;
         uint16_t instanceHoldMs = (input->power_off_hold_sec == 0) ? 3000u : (uint16_t)input->power_off_hold_sec * 1000u;
