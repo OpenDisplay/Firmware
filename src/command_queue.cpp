@@ -12,10 +12,6 @@
 #include "ble_transport.h"
 #include "od_log.h"
 
-// Defined in display_service.cpp. True for a mid-stream image-write data frame
-// (0x0071) whose per-frame logging should be suppressed.
-bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
-
 // --- RX ----------------------------------------------------------------------
 static CommandQueueItem s_rx[COMMAND_QUEUE_SIZE];
 static volatile uint8_t s_rxHead = 0;
@@ -117,7 +113,6 @@ void serviceBleTx(void) {
     if (ble.notifyReady()) {
         uint8_t drained = 0;
         while (s_txTail != s_txHead && drained < 16) {
-            const bool quietAck = imageWriteLogQuietFrame(s_tx[s_txTail].data, s_tx[s_txTail].len);
             // false means backpressure (NimBLE mbuf exhaustion): stop draining and
             // leave the entry queued to retry next pass rather than advancing past
             // a dropped ACK, which would stall the pipe window. See
@@ -127,14 +122,6 @@ void serviceBleTx(void) {
             }
             s_tx[s_txTail].pending = false;
             s_txTail = (s_txTail + 1) % RESPONSE_QUEUE_SIZE;
-            // The "[BLE][Q:n] TX ..." line in sendResponse() already logs every
-            // response with its queue depth, so the nominal drain (depth back to
-            // 0) is redundant. Report only the interesting case: entries still
-            // queued after this notify, i.e. the drain is behind the producer.
-            if (!quietAck) {
-                const uint8_t depth = bleTxQueueDepth();
-                if (depth > 0) od_log_debug("BLE Response Sent (queue size: %u)", depth);
-            }
             drained++;
         }
     } else if (ble.isConnected()) {

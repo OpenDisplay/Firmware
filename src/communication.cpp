@@ -86,21 +86,17 @@ String getChipIdHex();
 float readBatteryVoltage();
 
 /** Mirror responses to BLE only when a central is connected; LAN responses go via opendisplay_lan_send_frame. */
-static void queueBleNotifyCopy(const uint8_t* response, uint16_t len, bool quiet = false) {
+static void queueBleNotifyCopy(const uint8_t* response, uint16_t len) {
     // Nothing to queue against with no central attached; serviceBleTx() would
     // discard it on the next pass anyway.
     if (!ble.isConnected()) {
         return;
     }
-    if (!bleTxQueuePush(response, len)) {
-        return;   // bleTxQueuePush logs the reason (oversize / ring full)
-    }
-    // The "[BLE][Q:n] TX ..." line above already reports every response and its
-    // queue depth, so the nominal enqueue (depth 1, drained next loop pass) is
-    // pure noise. Log only when a backlog is forming and the 10-slot ring is at
-    // risk of dropping responses.
-    const uint8_t depth = bleTxQueueDepth();
-    if (!quiet && depth >= 2) od_log_debug("BLE: response queue backlog (queue size: %u)", depth);
+    // No log here. logTxFrame() reports every response with its PRE-enqueue depth,
+    // so the backlog this used to announce at "depth >= 2 after push" is the same
+    // event as "[Q:1] or higher" on the line immediately above -- it only ever
+    // restated the number. bleTxQueuePush logs the failures (oversize / ring full).
+    (void)bleTxQueuePush(response, len);
 }
 
 #ifndef BUILD_VERSION
@@ -178,13 +174,40 @@ static void buildHexDump(char* buf, size_t bufSize, const char* label, const uin
     }
 }
 
+// The single TX log line. Every response leaving this file goes through here, so a
+// response can never reach the drain side without having been logged at its source
+// -- sendResponseUnencrypted() previously had no TX line at all, which is why its
+// responses showed up only as an anonymous queue depth from serviceBleTx().
+//
+// The depth is read BEFORE the response is enqueued, so a healthy path reads
+// [BLE][Q:0] and a rising Q flags the drain falling behind the producer. LAN
+// responses bypass the ring entirely (opendisplay_lan_send_frame), so they carry
+// no depth -- the ORIGIN_BLE test below is deliberately the SAME predicate that
+// routes the frame in both senders, so [Q:n] appears exactly when the frame really
+// enters the ring. Keep the two in step or the depth becomes a lie.
+//
+// Not gated on TARGET_ESP32: both targets have queued their BLE responses through
+// this ring since Phase 3 (see the de-fan-out comment in sendResponse). nRF needs
+// the number more than ESP32 does -- loop() runs there at TASK_PRIO_LOW and is
+// starved by the Bluefruit tasks, which is exactly when the drain falls behind.
+static void logTxFrame(const uint8_t* frame, uint16_t len) {
+    const uint16_t cmd = (len >= 2) ? (uint16_t)((frame[0] << 8) | frame[1]) : frame[0];
+    char label[48];
+    if (g_commandOrigin == ORIGIN_BLE) {
+        snprintf(label, sizeof(label), "[%s][Q:%u] TX 0x%04X (%u B): ",
+                 originTag(), (unsigned)bleTxQueueDepth(), cmd, (unsigned)len);
+    } else {
+        snprintf(label, sizeof(label), "[%s] TX 0x%04X (%u B): ", originTag(), cmd, (unsigned)len);
+    }
+    // Label (~40 B) plus 32 bytes of hex (96 B) plus the truncation marker; the old
+    // 160-byte buffer here was close enough to truncating to be worth the margin.
+    char line[192];
+    buildHexDump(line, sizeof(line), label, frame, len);
+    od_log_debug("%s", line);
+}
+
 void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
-    od_log_debug("Sending unencrypted response (error/status):");
-    od_log_debug("  Length: %u bytes", len);
-    od_log_debug("  Command: 0x%02X%02X", response[0], response[1]);
-    char hexDump[160];
-    buildHexDump(hexDump, sizeof(hexDump), "  Full command: ", response, len);
-    od_log_debug("%s", hexDump);
+    logTxFrame(response, len);
     // F4 de-fan-out: reply over the origin transport only. One path for both
     // targets as of Phase 3 (see sendResponse).
     if (g_commandOrigin == ORIGIN_BLE) {
@@ -246,46 +269,16 @@ void sendResponse(uint8_t* response, uint16_t len) {
         }
     }
 
-    if (!quietAck) {
-        // One-line TX log: opcode, length, and up to 32 payload bytes (the opcode
-        // is also the first two bytes of the dump). Replaces the old 4-line block.
-        uint16_t cmd = (response[0] << 8) | response[1];
-        char line[160];
-        int pos;
-#ifdef TARGET_ESP32
-        // Queue depth *before* this response is enqueued, so a healthy path reads
-        // [BLE][Q:0] and a rising Q flags the drain falling behind the producer.
-        if (g_commandOrigin == ORIGIN_BLE) {
-            const uint8_t qdepth = bleTxQueueDepth();
-            pos = snprintf(line, sizeof(line), "[%s][Q:%u] TX 0x%04X (%u B):",
-                           originTag(), (unsigned)qdepth, cmd, (unsigned)len);
-        } else
-#endif
-        pos = snprintf(line, sizeof(line), "[%s] TX 0x%04X (%u B):", originTag(), cmd, (unsigned)len);
-        if (pos < 0) {
-            pos = 0;
-            line[0] = '\0';
-        }
-        int dumpLen = (len < 32) ? len : 32;
-        for (int i = 0; i < dumpLen && pos < (int)sizeof(line); i++) {
-            int n = snprintf(line + pos, sizeof(line) - pos, " %02X", response[i]);
-            if (n < 0) {
-                break;
-            }
-            pos += n;
-        }
-        if (len > 32 && pos >= 0 && pos < (int)sizeof(line)) {
-            snprintf(line + pos, sizeof(line) - pos, " ...");
-        }
-        od_log_debug("%s", line);
-    }
+    // Logged here, after the encryption swap, so the dump is the bytes actually sent
+    // and the depth is the pre-enqueue one.
+    if (!quietAck) logTxFrame(response, len);
     // F4 de-fan-out: reply over the origin transport only. One path for both
     // targets as of Phase 3: nRF used to notify() inline here with a blocking
     // delay(5) x 4 retry, which was only safe because it ran on the same task as
     // dispatch. Now that both targets dispatch from loop(), both queue and let
     // serviceBleTx() apply the non-blocking "retry next pass" backpressure rule.
     if (g_commandOrigin == ORIGIN_BLE) {
-        queueBleNotifyCopy(response, len, quietAck);
+        queueBleNotifyCopy(response, len);
     } else {
 #ifdef OPENDISPLAY_HAS_WIFI
         opendisplay_lan_send_frame(response, len);
