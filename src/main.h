@@ -338,14 +338,10 @@ static constexpr uint32_t DEFAULT_IDLE_HOLD_MS = 10000;
 #define AXP2101_REG_IRQ_STATUS4 0x47  // IRQ status register 4
 #define AXP2101_REG_LDO_ONOFF_CTRL1 0x91  // LDO control register 1 (BLDO1-2, CPUSLDO, DLDO1-2)
 
-// Application-owned deferred work (declared in ble_transport.h). These used to
-// live in ble_init.cpp alongside the stack code; they are loop() policy, not
-// link state, so they belong with the application. Portable as of Phase 3: nRF
-// services connect/disconnect from loop() too. bleRestartAdvertisingPending
-// stays unset on nRF, whose stack re-arms advertising itself -- see
-// BleTransport::restartsAdvertisingOnDisconnect().
-volatile bool bleDisconnectCleanupPending = false;
-volatile bool bleRestartAdvertisingPending = false;
-volatile bool msdUpdatePending = false;
+// The deferred-work flags that used to be defined here are now file-static in
+// main.cpp: nothing outside it reads them, and the two that other translation
+// units need to RAISE go through requestTransferSessionCleanup() /
+// requestAdvertisingRestart() (communication.h). Keeping them here would have
+// re-exported mutable state that only one file has any business touching.
 
 extern const uint8_t writelineFont[] PROGMEM;

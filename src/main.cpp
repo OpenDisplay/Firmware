@@ -204,6 +204,29 @@ uint32_t getDeepSleepCount() {
 #endif
 }
 
+// Deferred work, serviced by loop(). File-static on purpose: these encode
+// application policy, so nothing outside this file reads them, and the two that
+// other translation units need to RAISE do so through the request functions
+// below (declared in communication.h) rather than by touching the state.
+//
+// Declared here, above pollActivity(), because that reads the advertising flag
+// as its only trace of a connect+drop landing entirely inside one loop pass.
+//
+// Not volatile: every writer runs on the loop task. That became true in Phase 3,
+// when nRF's stack callbacks stopped running application code -- before that the
+// disconnect path executed on the SoftDevice callback task.
+static bool s_disconnectCleanupPending = false;
+static bool s_advertisingRestartPending = false;
+static bool s_msdUpdatePending = false;
+
+void requestTransferSessionCleanup(void) {
+    s_disconnectCleanupPending = true;
+}
+
+void requestAdvertisingRestart(void) {
+    s_advertisingRestartPending = true;
+}
+
 #ifdef TARGET_ESP32
 // Minimum awake window (first boot / button wake). A floor layered UNDER the
 // quiet-window logic, not a replacement: sleep requires both the existing
@@ -266,7 +289,7 @@ static void pollActivity() {
                // Set by onDisconnect and cleared further down this loop, so it is
                // the only trace of a connect+drop that lands entirely between two
                // passes — connCount reads 0 on both sides of such a blip.
-               bleRestartAdvertisingPending ||
+               s_advertisingRestartPending ||
                // A live link or unfinished work is activity in itself, not just its edges.
                connCount > 0 || lanSession ||
                bleRxQueuePending() || bleTxQueuePending()) {
@@ -291,8 +314,8 @@ static void pollActivity() {
 // Deferred while a refresh is mid-flight; the flag stays set until a later pass
 // clears it. Also raised by the LAN transport, so it is not a BLE-only path.
 static void serviceBleDisconnectCleanup() {
-    if (!bleDisconnectCleanupPending || epdRefreshInProgress) return;
-    bleDisconnectCleanupPending = false;
+    if (!s_disconnectCleanupPending || epdRefreshInProgress) return;
+    s_disconnectCleanupPending = false;
     // BLE and LAN both raise this flag, so tear down only when the transport that
     // OWNS the in-flight transfer is the one that went away. Otherwise a BLE
     // disconnect kills a live LAN push (and a LAN disconnect kills a BLE push)
@@ -324,7 +347,7 @@ static void serviceBleDisconnectCleanup() {
 // alongside the other loop()-serviced BLE helpers. The flag stays raised on the
 // "not yet" paths so a later pass retries.
 static void serviceBleAdvertisingRestart() {
-    if (!bleRestartAdvertisingPending) return;
+    if (!s_advertisingRestartPending) return;
     // Capability gate, and the reason this helper is safe for ANY caller to
     // raise the flag: where the stack re-arms advertising itself (nRF's
     // restartOnDisconnect(true)), driving our own stop()/start() would fight it.
@@ -333,16 +356,16 @@ static void serviceBleAdvertisingRestart() {
     // requestAdvertisingRestart() -- cannot reintroduce that conflict by
     // forgetting a target guard.
     if (ble.restartsAdvertisingOnDisconnect()) {
-        bleRestartAdvertisingPending = false;
+        s_advertisingRestartPending = false;
         return;
     }
     if (!ble.isReady()) return;                              // stack down; retry later
     if (ble.isConnected()) {                                 // a client beat us to it
-        bleRestartAdvertisingPending = false;
+        s_advertisingRestartPending = false;
         return;
     }
     if (epdRefreshInProgress) return;                        // never mid-refresh
-    bleRestartAdvertisingPending = false;
+    s_advertisingRestartPending = false;
     ble.restartAdvertising();
     updatemsdata();
 }
@@ -351,12 +374,12 @@ static void serviceBleAdvertisingRestart() {
 // application's deferred-work flags, and do the connect-side work that used to
 // run inline on the stack callback task. Must run before anything that reads
 // those flags -- including pollActivity(), which uses
-// bleRestartAdvertisingPending as its only trace of a connect+drop landing
+// s_advertisingRestartPending as its only trace of a connect+drop landing
 // entirely between two passes.
 static void serviceBleEvents() {
     if (ble.takeConnectedEvent()) {
         rebootFlag = 0;
-        msdUpdatePending = true;
+        s_msdUpdatePending = true;
         // SoftDevice PHY/DLE calls on nRF, no-op on ESP32. Deliberately here and
         // not in the connect callback: the callback contract is copy-and-flag only.
         ble.requestFastLink();
@@ -383,12 +406,12 @@ static void serviceBleEvents() {
         // refresh is mid-flight and checks whether LAN still owns the transfer.
         // Doing it inline would reintroduce the mid-refresh SPI teardown that
         // moving nRF off the callback task was meant to eliminate.
-        bleDisconnectCleanupPending = true;
+        s_disconnectCleanupPending = true;
         // Raised unconditionally: serviceBleAdvertisingRestart() owns the
         // capability decision, so this site does not need to know whether the
         // stack re-arms the radio by itself. On such a target the flag is simply
         // cleared unserviced, later in this same pass.
-        bleRestartAdvertisingPending = true;
+        s_advertisingRestartPending = true;
     }
 }
 
@@ -523,8 +546,8 @@ void loop() {
     serviceBleRx();
     serviceBleTx();
     serviceBleDisconnectCleanup();
-    if (msdUpdatePending) {
-        msdUpdatePending = false;
+    if (s_msdUpdatePending) {
+        s_msdUpdatePending = false;
         updatemsdata();
     }
     serviceBleAdvertisingRestart();   // no-op where the stack re-arms itself
@@ -570,11 +593,11 @@ void loop() {
     // Work in flight *this iteration* only. Every term is transient and most are
     // cleared earlier in this same pass, so this must never be the sole gate on
     // deep sleep — lastActivityMs supplies the quiet window. The terms that only
-    // one target can ever raise (bleRestartAdvertisingPending, wifiLanSession)
+    // one target can ever raise (s_advertisingRestartPending, wifiLanSession)
     // are simply false on the other, so one expression serves both.
     const bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
                               ble.isConnected() ||
-                              bleRestartAdvertisingPending ||
+                              s_advertisingRestartPending ||
                               epdRefreshInProgress ||
                               wifiLanSession;
     if (workInFlight) {

@@ -2401,13 +2401,12 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     }
     epdRefreshInProgress = false;
     cleanupDirectWriteState(false);
-#ifdef TARGET_ESP32
-    // Raise the flag rather than re-arming inline: serviceBleAdvertisingRestart()
-    // in main.cpp is the single place that owns the deferral policy, and it runs
-    // later in this same loop() pass (the refresh above is reached from the
-    // command drain), so the radio comes back up on the same pass as before.
-    bleRestartAdvertisingPending = true;
-#endif
+    // Request rather than re-arm inline: main.cpp owns the deferral policy and
+    // runs it later in this same loop() pass (the refresh above is reached from
+    // the command drain), so the radio comes back up on the same pass as before.
+    // No target guard needed -- the request is a no-op where the stack re-arms
+    // advertising itself.
+    requestAdvertisingRestart();
     if (refreshSuccess) {
         // A successful refresh changed the panel image. Commit the new etag
         // when the client supplied a valid one; otherwise clear the stale etag

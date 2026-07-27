@@ -70,15 +70,10 @@ public:
 
 extern BleTransport ble;
 
-// Deferred work, owned by the APPLICATION rather than by BleTransport: each flag
-// encodes a loop()-serviced policy decision (tear the session down, refresh the
-// advertisement, re-arm the radio) that the transport has no business making.
-// loop() raises them from takeConnectedEvent()/takeDisconnectedEvent().
-// bleDisconnectCleanupPending is also raised by the LAN transport
-// (wifi_service.cpp), which is exactly why it cannot be a BLE transport event.
-extern volatile bool bleDisconnectCleanupPending;
-extern volatile bool msdUpdatePending;
-// Only meaningful where restartsAdvertisingOnDisconnect() is false.
-extern volatile bool bleRestartAdvertisingPending;
+// The loop()-serviced deferred-work flags that used to be declared here have
+// moved: they encode application policy, not link state, so exporting them from
+// the transport seam was backwards. The two that other translation units need to
+// raise are now requestTransferSessionCleanup() / requestAdvertisingRestart() in
+// communication.h; the flags themselves are private to main.cpp.
 
 #endif  // BLE_TRANSPORT_H

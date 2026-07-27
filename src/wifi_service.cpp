@@ -801,9 +801,10 @@ void disconnectWiFiServer() {
     wifiServerConnected = false;
     tcpReceiveBufferPos = 0;
     // F4: abort any in-flight direct-write / pipe / partial transfer + tear down a
-    // mid-transfer panel session, DEFERRED to loop() (serviceBleDisconnectCleanup)
-    // so cleanup never races an in-progress EPD refresh. Reuses the BLE path's flag.
-    bleDisconnectCleanupPending = true;
+    // mid-transfer panel session, DEFERRED to loop() so cleanup never races an
+    // in-progress EPD refresh. Shared with the BLE disconnect path -- main.cpp
+    // works out which transport actually owned the transfer.
+    requestTransferSessionCleanup();
 }
 
 // lanReadIntoBuffer() return codes. A graceful peer close is deliberately distinct from

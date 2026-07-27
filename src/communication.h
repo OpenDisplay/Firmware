@@ -36,4 +36,24 @@ enum CommandOrigin { ORIGIN_BLE = 0, ORIGIN_LAN_PLAIN = 1, ORIGIN_LAN_TLS = 2 };
 /// Origin of the command currently being dispatched (a CommandOrigin value).
 uint8_t commandOrigin(void);
 
+// --- deferred work, serviced by loop() ---------------------------------------
+// Implemented in main.cpp, which owns loop() and the flags behind these. They
+// are requests, not commands: the work happens on a later pass, and main.cpp
+// decides when it is safe (never mid-EPD-refresh, never while the owning
+// transport is still live).
+//
+// Declared here rather than in ble_transport.h because they are application
+// policy, not link state -- and because neither is BLE-specific: the cleanup
+// request is raised by the LAN transport on a LAN disconnect.
+
+/// Abort any in-flight transfer and tear down the panel session. Raised on a
+/// BLE or LAN disconnect; honoured once no refresh is in flight and the
+/// transport that OWNS the transfer is confirmed gone.
+void requestTransferSessionCleanup(void);
+
+/// Re-arm BLE advertising when it is safe to. A no-op on targets whose stack
+/// re-arms itself (see BleTransport::restartsAdvertisingOnDisconnect), so
+/// callers need no target guard.
+void requestAdvertisingRestart(void);
+
 #endif
