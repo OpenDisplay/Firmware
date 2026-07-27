@@ -54,6 +54,26 @@ void od_log_raw(const char *fmt, ...) {
     s_port->print(buf);
 }
 
+void od_log_hex_line(char *buf, size_t bufSize, const char *label,
+                     const uint8_t *data, uint16_t len) {
+    int pos = snprintf(buf, bufSize, "%s", label);
+    if (pos < 0) {
+        pos = 0;
+        buf[0] = '\0';
+    }
+    int dumpLen = (len < 32) ? len : 32;
+    for (int i = 0; i < dumpLen && pos < (int)bufSize; i++) {
+        int n = snprintf(buf + pos, bufSize - pos, i > 0 ? " %02X" : "%02X", data[i]);
+        if (n < 0) {
+            break;
+        }
+        pos += n;
+    }
+    if (len > 32 && pos >= 0 && pos < (int)bufSize) {
+        snprintf(buf + pos, bufSize - pos, " ...");
+    }
+}
+
 void od_log_flush(void) {
     if (s_port == NULL) {
         return;

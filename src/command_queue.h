@@ -85,10 +85,17 @@ struct CommandQueueItem {
 // frame -- up to 33 of them per loop pass during a pipe transfer. The peeked
 // slot is deliberately mutable: the dispatcher decrypts in place, exactly as it
 // did when it was handed the raw ring slot.
-bool bleRxQueuePush(const uint8_t* data, uint16_t len);   // false = ring full
+// bleRxQueuePush also OWNS the RX logging, for both targets: the arrival hex line
+// and the three distinct failure reasons (empty / too large / ring full). Callers
+// are stack callbacks and must add no logging of their own -- a copy in each
+// transport is what let nRF report a malformed frame as "queue full". It logs at
+// arrival, on the callback task, so the timestamp is delivery time rather than
+// dispatch time; see the note on the definition for what that costs.
+bool bleRxQueuePush(const uint8_t* data, uint16_t len);   // false = dropped (logged)
 CommandQueueItem* bleRxQueuePeek(void);                   // nullptr = empty
 void bleRxQueueConsume(void);                             // advance past the peeked slot
 uint8_t bleRxQueueHead(void);                             // producer-side, for pollActivity()
+uint8_t bleRxQueueDepth(void);                            // unconsumed frame count
 bool bleRxQueuePending(void);                             // unconsumed frames waiting
 
 // Discard every unconsumed frame. Consumer-side: call only from the loop task,

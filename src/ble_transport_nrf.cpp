@@ -138,9 +138,11 @@ static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
 static void onWriteCb(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
     (void)conn_hdl;
     (void)chr;
-    if (!bleRxQueuePush(data, len)) {
-        od_log_error("ERROR: Command queue full, dropping command");
-    }
+    // bleRxQueuePush() owns the arrival log and every drop reason (empty, too large,
+    // ring full) so this callback and ESP32's onWrite() cannot report the same frame
+    // differently. This site used to print "queue full" for all three, sending you
+    // after ring depth when the real cause was a malformed frame. Add no logging here.
+    (void)bleRxQueuePush(data, len);
 }
 
 // --- BleTransport ------------------------------------------------------------

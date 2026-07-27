@@ -20,9 +20,6 @@
 #include "od_log.h"
 
 String getChipIdHex();
-// Defined in display_service.cpp. True for a mid-stream image-write data frame
-// (0x0071) whose per-frame receive/queue logging should be suppressed.
-bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
 
 BleTransport ble;
 
@@ -133,44 +130,11 @@ public:
         // would report length 0. .length()/.c_str() on NimBLEAttValue preserve
         // the binary payload.
         NimBLEAttValue value = pCharacteristic->getValue();
-        const bool quiet = imageWriteLogQuietFrame((const uint8_t*)value.c_str(), value.length());
-        if (value.length() > 0 && value.length() <= MAX_COMMAND_SIZE) {
-            uint8_t* data = (uint8_t*)value.c_str();
-            uint16_t len = value.length();
-            if (!quiet) {
-                // One-line RX log, mirroring the "[BLE] TX ..." response log.
-                // This callback is the BLE write path only, so the tag is always
-                // [BLE]; LAN frames are identified by the dispatch banner in
-                // imageDataWritten(), which reads g_commandOrigin.
-                uint16_t cmd = (len >= 2) ? ((data[0] << 8) | data[1]) : data[0];
-                char line[160] = {0};
-                int pos = snprintf(line, sizeof(line), "BLE: RX 0x%04X (%u B):", cmd, (unsigned)len);
-                if (pos < 0) {
-                    pos = 0;
-                    line[0] = '\0';
-                }
-                int dumpLen = (len < 32) ? len : 32;
-                for (int i = 0; i < dumpLen && pos < (int)sizeof(line); i++) {
-                    int n = snprintf(line + pos, sizeof(line) - pos, " %02X", data[i]);
-                    if (n < 0) {
-                        break;
-                    }
-                    pos += n;
-                }
-                if (len > 32 && pos >= 0 && pos < (int)sizeof(line)) {
-                    snprintf(line + pos, sizeof(line) - pos, " ...");
-                }
-                od_log_debug("%s", line);
-            }
-            // Copy-and-enqueue is all this callback may do; loop() dispatches.
-            if (!bleRxQueuePush(data, len)) {
-                od_log_error("ERROR: Command queue full, dropping command");
-            }
-        } else if (value.length() > MAX_COMMAND_SIZE) {
-            od_log_warn("WARNING: Command too large, dropping");
-        } else {
-            od_log_warn("WARNING: Empty data received");
-        }
+        // Copy-and-enqueue is all this callback may do; loop() dispatches.
+        // bleRxQueuePush() owns the arrival log and every drop reason (empty, too
+        // large, ring full) so this callback and nRF's onWriteCb() cannot report the
+        // same frame differently. Add no logging here.
+        (void)bleRxQueuePush((const uint8_t*)value.c_str(), value.length());
     }
 };
 

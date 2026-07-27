@@ -6,26 +6,72 @@
 // Phase 2 removed the TARGET_ESP32 guard: both targets now compile the rings.
 // nRF carries them unused until Phase 3 moves its dispatch to loop().
 
+#include <stdio.h>
 #include <string.h>
 
 #include "command_queue.h"
 #include "ble_transport.h"
 #include "od_log.h"
 
+// Defined in display_service.cpp. True for a mid-stream image-write data frame
+// (0x0071 / 0x0081) whose per-frame RX logging should be suppressed.
+bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
+
 // --- RX ----------------------------------------------------------------------
 static CommandQueueItem s_rx[COMMAND_QUEUE_SIZE];
 static volatile uint8_t s_rxHead = 0;
 static volatile uint8_t s_rxTail = 0;
 
+// The single RX log line, and the single place the three push failures are named.
+//
+// It lives here, not in either transport, because this is the one function both
+// stack callbacks call -- ESP32's onWrite() and nRF's onWriteCb(). A copy in each
+// callback is how the two targets drifted in the first place: ESP32 had a hex line
+// and separate "too large" / "empty" warnings, nRF had neither and reported all
+// three failures as "queue full", pointing at ring depth for what was actually a
+// malformed frame.
+//
+// Logged at ARRIVAL, on the stack callback task, so the timestamp is when the radio
+// delivered the frame rather than when loop() got to it -- that ordering is the
+// point of the line, and it cannot be had from the consumer side. The cost is real
+// and deliberate: od_log ends in a blocking serial write (~9 ms for a full hex line
+// at 115200), so this delays the NimBLE host / SoftDevice callback task. It is
+// compiled out entirely at the default INFO level; only the -debug envs pay it, and
+// only for frames the quiet predicate does not suppress.
+//
+// Depth is the PRE-push count, matching logTxFrame()'s pre-enqueue depth, so a
+// healthy path reads [BLE][Q:0] and a rising Q means arrivals are outrunning
+// loop()'s drain. RX is BLE-only by construction -- LAN frames reach the dispatcher
+// without touching this ring -- so the tag is a literal, not originTag().
 bool bleRxQueuePush(const uint8_t* data, uint16_t len) {
-    if (len == 0 || len > MAX_COMMAND_SIZE) return false;
+    if (len == 0) {
+        od_log_warn("WARNING: Empty BLE frame received, dropping");
+        return false;
+    }
+    if (len > MAX_COMMAND_SIZE) {
+        od_log_warn("WARNING: Command too large for queue (%u > %u), dropping",
+                    (unsigned)len, (unsigned)MAX_COMMAND_SIZE);
+        return false;
+    }
     // Publish head with RELEASE after the payload is fully written so the
     // consumer never observes a slot before its bytes land.
     uint8_t head = __atomic_load_n(&s_rxHead, __ATOMIC_RELAXED);
     uint8_t tail = __atomic_load_n(&s_rxTail, __ATOMIC_ACQUIRE);
     uint8_t nextHead = (head + 1) % COMMAND_QUEUE_SIZE;
     if (nextHead == tail) {
+        od_log_error("ERROR: Command queue full, dropping command (%u slots)",
+                     (unsigned)COMMAND_QUEUE_SIZE);
         return false;
+    }
+    if (!imageWriteLogQuietFrame(data, len)) {
+        const uint16_t cmd = (len >= 2) ? (uint16_t)((data[0] << 8) | data[1]) : data[0];
+        const uint8_t depth = (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
+        char label[48];
+        snprintf(label, sizeof(label), "[BLE][Q:%u] RX 0x%04X (%u B): ",
+                 (unsigned)depth, cmd, (unsigned)len);
+        char line[192];
+        od_log_hex_line(line, sizeof(line), label, data, len);
+        od_log_debug("%s", line);
     }
     memcpy(s_rx[head].data, data, len);
     s_rx[head].len = len;
@@ -67,6 +113,15 @@ uint8_t bleRxQueueDiscardAll(void) {
 
 uint8_t bleRxQueueHead(void) {
     return __atomic_load_n(&s_rxHead, __ATOMIC_RELAXED);
+}
+
+uint8_t bleRxQueueDepth(void) {
+    // RELAXED both: a snapshot for logging, not a synchronisation point. The
+    // producer may push concurrently, in which case this simply reads one frame
+    // stale -- which is the correct answer for "how deep was it a moment ago".
+    const uint8_t head = __atomic_load_n(&s_rxHead, __ATOMIC_RELAXED);
+    const uint8_t tail = __atomic_load_n(&s_rxTail, __ATOMIC_RELAXED);
+    return (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
 }
 
 bool bleRxQueuePending(void) {

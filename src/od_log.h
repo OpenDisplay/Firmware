@@ -30,3 +30,11 @@ void od_log_init(Stream *port);
 void _od_log(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void od_log_raw(const char *fmt, ...)         __attribute__((format(printf, 1, 2)));
 void od_log_flush(void);
+
+// Builds "<label><space-separated %02X bytes, up to 32><' ...' if truncated>" into
+// buf. Lives here rather than in one caller's translation unit because the RX line
+// (command_queue.cpp, on the stack callback task) and the TX line
+// (communication.cpp, on loop()) must render frames identically -- two copies of
+// this loop is how the two directions drift apart.
+void od_log_hex_line(char *buf, size_t bufSize, const char *label,
+                     const uint8_t *data, uint16_t len);
