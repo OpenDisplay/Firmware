@@ -84,40 +84,24 @@ String getChipIdHex();
 float readBatteryVoltage();
 
 #ifdef TARGET_ESP32
-// ResponseQueueItem / RESPONSE_QUEUE_SIZE / MAX_RESPONSE_SIZE and the ring itself
-// come from command_queue.h. This file previously redeclared the struct with a
-// hardcoded 512 and kept private *_LOCAL copies of both sizes, so the guard in
-// esp32_queue_ble_notify_copy() and the slot it protects were sized in two
-// different files and had to be edited in lockstep.
 extern WiFiClient wifiClient;
 extern bool wifiServerConnected;
-// Drains the response ring to BLE (defined in main.cpp). handleReadConfig() calls
-// this between chunks so a multi-chunk config read never overflows the ring.
-extern void flushResponseQueueToBle();
 
 /** Mirror responses to BLE only when a central is connected; LAN responses go via opendisplay_lan_send_frame. */
 static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
-    if (len > MAX_RESPONSE_SIZE) {
-        od_log_error("ERROR: Response too large for queue (%u > %u)", len, MAX_RESPONSE_SIZE);
-        return;
-    }
+    // Nothing to queue against with no central attached; bleServiceTx() would
+    // discard it on the next pass anyway.
     if (!ble.isConnected()) {
         return;
     }
-    uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE;
-    if (nextHead == responseQueueTail) {
-        od_log_error("ERROR: Response queue full, dropping response");
-        return;
+    if (!bleTxQueuePush(response, len)) {
+        return;   // bleTxQueuePush logs the reason (oversize / ring full)
     }
-    memcpy(responseQueue[responseQueueHead].data, response, len);
-    responseQueue[responseQueueHead].len = len;
-    responseQueue[responseQueueHead].pending = true;
-    responseQueueHead = nextHead;
     // The "[BLE][Q:n] TX ..." line above already reports every response and its
     // queue depth, so the nominal enqueue (depth 1, drained next loop pass) is
     // pure noise. Log only when a backlog is forming and the 10-slot ring is at
     // risk of dropping responses.
-    const uint8_t depth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
+    const uint8_t depth = bleTxQueueDepth();
     if (!quiet && depth >= 2) od_log_debug("BLE: response queue backlog (queue size: %u)", depth);
 }
 #endif
@@ -288,7 +272,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
         // Queue depth *before* this response is enqueued, so a healthy path reads
         // [BLE][Q:0] and a rising Q flags the drain falling behind the producer.
         if (g_commandOrigin == ORIGIN_BLE) {
-            const uint8_t qdepth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
+            const uint8_t qdepth = bleTxQueueDepth();
             pos = snprintf(line, sizeof(line), "[%s][Q:%u] TX 0x%04X (%u B):",
                            originTag(), (unsigned)qdepth, cmd, (unsigned)len);
         } else
@@ -463,7 +447,7 @@ void handleReadConfig() {
             // synchronously on the loop task, so the ring's only drainer cannot run
             // until we return. Without this, chunk 9+ overflows the 10-slot ring and
             // is silently dropped, truncating configs > ~864 B on read-back.
-            flushResponseQueueToBle();
+            bleServiceTx();
 #else
             delay(50);
 #endif

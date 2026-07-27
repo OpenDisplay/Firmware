@@ -53,6 +53,7 @@ extern "C" {
 #endif
 
 #include "ble_transport.h"
+#include "command_queue.h"
 
 extern BBEPDISP bbep;
 extern struct GlobalConfig globalConfig;
@@ -555,12 +556,10 @@ static void directWriteComputeGeometry(bool compressed);
 static void directWriteActivatePanel(void);
 static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t endOpcode);
 
-#ifdef TARGET_ESP32
-// Defined in main.cpp. The response ring's only drainer is the loop task, which is
-// the same task running these handlers — so anything queued here stays queued until
-// we return. Call it before any multi-second blocking work (see the refresh tail).
-extern void flushResponseQueueToBle();
-#endif
+// bleServiceTx() comes from command_queue.h. The response ring's only drainer is
+// the loop task, which is the same task running these handlers -- so anything
+// queued here stays queued until we return. Call it before any multi-second
+// blocking work (see the refresh tail).
 
 // PIPE_WRITE (0x0080-0x0082) sliding-window receive state + reorder queue. Declared
 // early so the quiet-logging predicates below can consult pipeState.active. The
@@ -2367,7 +2366,7 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     // + waitforrefresh occupy the loop task for seconds on a big panel, and the loop
     // task is the response ring's only drainer, so without this the client sits in its
     // tail-flush probe loop and aborts the (already complete) transfer on PTO.
-    flushResponseQueueToBle();
+    bleServiceTx();
 #endif
     delay(20);
     epdRefreshInProgress = true;

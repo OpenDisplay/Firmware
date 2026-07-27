@@ -243,8 +243,8 @@ static void pollActivity() {
     // a single pass still registers. The heads wrap (mod 5 and 10), but aliasing
     // needs a whole queue of traffic inside one pass, and queues only fill while a
     // client is connected — which stamps below regardless.
-    const uint8_t commandHead = commandQueueHead;
-    const uint8_t responseHead = responseQueueHead;
+    const uint8_t commandHead = bleRxQueueHead();
+    const uint8_t responseHead = bleTxQueueHead();
     // Covers connect and disconnect. The disconnect edge is what re-arms the
     // window so a dropped client gets a full reconnect opportunity.
     const uint8_t connCount = ble.connectedCount();
@@ -268,8 +268,7 @@ static void pollActivity() {
                bleRestartAdvertisingPending ||
                // A live link or unfinished work is activity in itself, not just its edges.
                connCount > 0 || lanSession ||
-               commandQueueTail != commandHead ||
-               responseQueueTail != responseHead) {
+               bleRxQueuePending() || bleTxQueuePending()) {
         lastActivityMs = millis();
     }
 
@@ -278,51 +277,6 @@ static void pollActivity() {
     prevConnCount = connCount;
     prevLanSession = lanSession;
     memcpy(prevDynamic, dynamicreturndata, sizeof(prevDynamic));
-}
-
-// Flush queued responses to BLE notifications. Called once per loop() pass and —
-// critically — between commands inside the bounded command drain: at small
-// negotiated ack_every (N_eff 1-2) a 33-command drain can emit up to ~32 pipe
-// ACKs, which would overflow the 10-slot response ring (drops the NEWEST entry)
-// and leave only stale ACKs — lagging window refunds and collapsing throughput.
-// Non-static: handleReadConfig() (communication.cpp) calls this between config
-// chunks so a single multi-chunk read never overflows the 10-slot response ring,
-// mirroring how the loop() command drain flushes between commands.
-void flushResponseQueueToBle() {
-    if (responseQueueTail == responseQueueHead) return;
-    if (ble.notifyReady()) {
-        uint8_t bleDrain = 0;
-        while (responseQueueTail != responseQueueHead && bleDrain < 16) {
-            const bool quietAck = imageWriteLogQuietFrame(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len);
-            // false means backpressure (NimBLE mbuf exhaustion): stop draining and
-            // leave the entry queued to retry next pass rather than advancing past
-            // a dropped ACK, which would stall the pipe window. See
-            // BleTransport::notify().
-            if (!ble.notify(responseQueue[responseQueueTail].data, responseQueue[responseQueueTail].len)) {
-                break;
-            }
-            responseQueue[responseQueueTail].pending = false;
-            responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
-            // The "[BLE][Q:n] TX ..." line in sendResponse() already logs every
-            // response with its queue depth, so the nominal drain (depth back to
-            // 0) is redundant. Report only the interesting case: entries still
-            // queued after this notify, i.e. the drain is behind the producer.
-            if (!quietAck) {
-                uint8_t depth = (responseQueueHead - responseQueueTail + RESPONSE_QUEUE_SIZE) % RESPONSE_QUEUE_SIZE;
-                // Only when a backlog actually forms -- a depth-0 line on every
-                // response is noise that hides the interesting case.
-                if (depth > 0) od_log_debug("BLE Response Sent (queue size: %u)", depth);
-            }
-            bleDrain++;
-        }
-    } else if (ble.isConnected()) {
-        // Connected but CCCD not enabled yet — keep responses queued
-    } else {
-        while (responseQueueTail != responseQueueHead) {
-            responseQueue[responseQueueTail].pending = false;
-            responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
-        }
-    }
 }
 
 // Services the deferred BLE-disconnect session teardown flagged by
@@ -452,22 +406,20 @@ void loop() {
     {
         uint8_t drained = 0;
         while (drained < COMMAND_QUEUE_SIZE) {
-            uint8_t tail = __atomic_load_n(&commandQueueTail, __ATOMIC_RELAXED);
-            uint8_t head = __atomic_load_n(&commandQueueHead, __ATOMIC_ACQUIRE);
-            if (tail == head) break;
+            CommandQueueItem* item = bleRxQueuePeek();
+            if (item == nullptr) break;
             // imageDataWritten (misleading name) actually services any BLE command.
             // The dispatch banner (commandName() in communication.cpp) already logs
             // which command runs, so no drain-start/-end framing line is needed here.
-            imageDataWritten(NULL, NULL, commandQueue[tail].data, commandQueue[tail].len);
-            commandQueue[tail].pending = false;
-            __atomic_store_n(&commandQueueTail, (uint8_t)((tail + 1) % COMMAND_QUEUE_SIZE), __ATOMIC_RELEASE);
+            imageDataWritten(0, nullptr, item->data, item->len);
+            bleRxQueueConsume();
             drained++;
             // Flush responses BETWEEN commands so pipe ACKs generated by this drain
-            // never overflow the 10-slot response ring (see flushResponseQueueToBle).
-            flushResponseQueueToBle();
+            // never overflow the 10-slot response ring (see bleServiceTx).
+            bleServiceTx();
         }
     }
-    flushResponseQueueToBle();
+    bleServiceTx();
     // Service the flag-only BLE callbacks on this (single) task. Cleanup runs
     // before the advertising restart so a disconnected session is fully torn down
     // before the radio re-arms.
@@ -515,8 +467,7 @@ void loop() {
     // Work in flight *this iteration* only. Every term below is transient and most
     // are cleared earlier in this same loop pass, so this must never be the sole
     // gate on deep sleep — lastActivityMs supplies the quiet window.
-    bool workInFlight = (commandQueueTail != commandQueueHead) ||
-                        (responseQueueTail != responseQueueHead) ||
+    bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
                         ble.isConnected() ||
                         bleRestartAdvertisingPending ||
                         epdRefreshInProgress ||

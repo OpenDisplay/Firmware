@@ -336,10 +336,6 @@ static constexpr uint32_t DEFAULT_IDLE_HOLD_MS = 10000;
 #define AXP2101_REG_LDO_ONOFF_CTRL1 0x91  // LDO control register 1 (BLDO1-2, CPUSLDO, DLDO1-2)
 
 #ifdef TARGET_ESP32
-// The RX/TX ring storage moved to command_queue.cpp -- it is shared with
-// communication.cpp and ble_transport_esp32.cpp, so it does not belong in this
-// single-inclusion globals header.
-
 // Application-owned deferred work (declared in ble_transport.h). These used to
 // live in ble_init.cpp alongside the stack code; they are loop() policy, not
 // link state, so they belong with the application.

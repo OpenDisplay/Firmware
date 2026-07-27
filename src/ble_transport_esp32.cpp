@@ -116,18 +116,8 @@ public:
                 }
                 od_log_debug("%s", line);
             }
-            // SPSC ring: publish head with RELEASE after the payload is fully
-            // written so the consumer (main loop) never observes a slot before
-            // its bytes land.
-            uint8_t head = __atomic_load_n(&commandQueueHead, __ATOMIC_RELAXED);
-            uint8_t tail = __atomic_load_n(&commandQueueTail, __ATOMIC_ACQUIRE);
-            uint8_t nextHead = (head + 1) % COMMAND_QUEUE_SIZE;
-            if (nextHead != tail) {
-                memcpy(commandQueue[head].data, data, len);
-                commandQueue[head].len = len;
-                commandQueue[head].pending = true;
-                __atomic_store_n(&commandQueueHead, nextHead, __ATOMIC_RELEASE);
-            } else {
+            // Copy-and-enqueue is all this callback may do; loop() dispatches.
+            if (!bleRxQueuePush(data, len)) {
                 od_log_error("ERROR: Command queue full, dropping command");
             }
         } else if (value.length() > MAX_COMMAND_SIZE) {
