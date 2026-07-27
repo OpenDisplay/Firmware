@@ -2,6 +2,14 @@
 
 **Date:** 2026-07-27 · **Status:** investigation only — no code changed
 
+> **Amendment 2026-07-27 — the RAM gate is retired.** The owner confirms nRF has
+> sufficient headroom for the shared rings, so the "≥15 KB or don't bother"
+> condition in §5 no longer blocks Level 2, and the RX ring keeps its full depth
+> (no narrowed PIPE window, no throughput trade). Idle current and pipe-write
+> throughput remain worth capturing, but as before/after **baselines** taken
+> ahead of the execution-model change — not as go/no-go gates. Sequencing and
+> file-level detail live in `PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md`.
+
 ## Question
 
 What would it take to collapse the two per-target loop/BLE paths into one, so the
@@ -177,21 +185,20 @@ dispatches.
 7. `pwrmgmLock` becomes uncontended. Keep it (it is nearly free) rather than
    remove it — touch/button paths still run from `loop()` and ISRs.
 
-**Blocking measurements — do these before committing:**
+**Measurements:**
 
-- **RAM.** The shared rings add ≈8.4 KB (`33 × 256`) + ≈2.6 KB (`10 × 256`) of
-  `.bss` on nRF, on top of the ≈8.3 KB PIPE reorder queue it already carries.
-  nRF52840 has 256 KB, but SoftDevice S140 with `configPrphBandwidth(BANDWIDTH_MAX)`
-  and a 247-byte MTU reserves a substantial share. There is precedent for this
-  being tight: `env:esp32-N4` already needed `PIPE_SMALL_DRAM_WINDOW`
-  (`structs.h:40-53`) to fit. If nRF needs the same treatment, note that
-  shrinking the RX ring below `W+1` caps the PIPE_WRITE window and costs
-  throughput — that trade must be made deliberately, not discovered at link time.
-- **Idle current.** nRF currently spends idle time inside `delay()`, which yields
+- ~~**RAM.**~~ **Resolved 2026-07-27 — headroom confirmed sufficient.** The
+  shared rings add ≈8.4 KB (`33 × 256`) + ≈2.6 KB (`10 × 256`) of `.bss` on nRF,
+  on top of the ≈8.3 KB PIPE reorder queue it already carries. That fits, so the
+  RX ring keeps its full depth. The concern was that shrinking it below `W+1`
+  would cap the PIPE_WRITE window and cost throughput — the `env:esp32-N4`
+  `PIPE_SMALL_DRAM_WINDOW` precedent (`structs.h:40-53`). That trade is no longer
+  on the table for nRF.
+- **Idle current** *(baseline, not a gate)*. nRF currently spends idle time inside `delay()`, which yields
   to the FreeRTOS idle task and `sd_app_evt_wait`. A loop that spins at
   `delay(1)` while a link is up (as ESP32 does under `workInFlight`) changes the
   battery profile. Measure before/after on a battery unit.
-- **Throughput.** nRF ACKs a PIPE frame within the same radio event today; via
+- **Throughput** *(baseline, not a gate)*. nRF ACKs a PIPE frame within the same radio event today; via
   the queue it waits for a loop pass. Re-run the pipe-write benchmark in
   `docs/pipe-write-protocol.md` on both targets and compare.
 
@@ -221,11 +228,13 @@ before or after Level 2.
 Do **Level 1** now: it removes the visible duplication, is independently
 valuable, has low hardware risk, and creates the seam Level 2 needs anyway.
 
-Then take the two nRF measurements (free RAM after link-up with a live
-connection; idle current on battery). **Level 2 is only worth it if nRF has
-≥15 KB of headroom** — otherwise the honest outcome is a smaller RX ring, a
-narrower PIPE window on nRF, and a throughput regression traded for
-architectural tidiness.
+~~Then take the two nRF measurements … **Level 2 is only worth it if nRF has
+≥15 KB of headroom**~~ — **superseded 2026-07-27.** nRF headroom is confirmed
+sufficient, so Level 2 is cleared to proceed with a full-depth RX ring. The
+feared outcome (smaller ring → narrower PIPE window → throughput regression
+traded for architectural tidiness) does not apply. Capture idle current and a
+pipe-write run as "before" baselines ahead of the execution-model change, so a
+regression is detectable rather than gate-keeping.
 
 The payoff for Level 2, stated plainly, is: one loop to reason about, one place
 to fix a queue/backpressure bug, nRF gains the response-ring flow control that

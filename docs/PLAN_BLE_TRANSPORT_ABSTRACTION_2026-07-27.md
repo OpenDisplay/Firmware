@@ -2,6 +2,14 @@
 
 **Date:** 2026-07-27 · **Scope:** `Firmware` repo only · **Status:** plan, not implemented
 
+> **Amendment 2026-07-27 — Phase 0 retired.** The owner confirms nRF has
+> sufficient RAM headroom for the ≈11 KB of new `.bss`, so the measurement gate
+> no longer blocks the start of work and `BLE_RX_QUEUE_SLOTS` keeps its full
+> 33-slot depth. The other two Phase 0 numbers (battery idle current,
+> pipe-write throughput) were never gates on Phases 1–2 — they are before/after
+> baselines and are now required **before Phase 3 lands**, not before Phase 1
+> starts. See §6.
+
 Companion to `PLAN_UNIFY_NRF_ESP32_LOOP_BLE_2026-07-27.md`, which established
 *why* this direction is the correct one. This document is the *how*.
 
@@ -200,7 +208,10 @@ out of `structs.h`'s `#ifdef TARGET_ESP32` (10 × 256 ≈ **2.6 KB**).
 `flushResponseQueueToBle()` becomes portable `bleServiceTx()`.
 
 **New `.bss` on nRF: ≈11 KB**, atop the ≈8.3 KB pipe reorder queue it already
-carries. This is the plan's primary risk — see §7.
+carries. This was the plan's primary risk; it is **retired** — nRF headroom is
+confirmed sufficient, so the full 33-slot depth stands and the
+`BLE_RX_QUEUE_SLOTS` knob is kept only as a future escape hatch, not as an
+expected fallback. See §7.
 
 ---
 
@@ -236,10 +247,9 @@ transport call.
 Each phase must build all 11 CI environments green and be independently
 revertable.
 
-- **Phase 0 — measurement gate (no code).** On nRF: free RAM with a live
-  connection mid-pipe-transfer, and battery idle current. Record both.
-  **If headroom < ~15 KB, stop and re-scope** to a reduced `BLE_RX_QUEUE_SLOTS`
-  with the throughput cost accepted explicitly.
+- ~~**Phase 0 — measurement gate (no code).**~~ **Retired 2026-07-27** — nRF RAM
+  headroom confirmed sufficient by the owner. Work starts at Phase 1 with the
+  full 33-slot `BLE_RX_QUEUE_SLOTS`.
 - **Phase 1 — introduce the abstraction, no behaviour change.** Create the six
   files; move existing per-target code behind the class verbatim; migrate all
   ~50 call sites. Threading untouched — nRF still dispatches in its callback.
@@ -247,7 +257,11 @@ revertable.
   requirements 3, 4 and 5.*
 - **Phase 2 — portable queues.** Move RX/TX rings out of the ESP32 guards
   (§4). ESP32 behaviour identical; nRF still bypasses them.
-- **Phase 3 — nRF copy-and-enqueue (the core change).** nRF write callback →
+- **Phase 3 — nRF copy-and-enqueue (the core change).** *Prerequisite (was
+  Phase 0): capture the two nRF **baselines** first — battery idle current, and
+  a pipe-write throughput run per `docs/pipe-write-protocol.md`. Neither gates
+  the work; both are the "before" half of a before/after pair, and Phase 3 is
+  the commit that can move them.* nRF write callback →
   `bleRxQueuePush()`. `loop()` drains and dispatches. `idleDelay()` gains a
   queue-service call. **In the same commit:** nRF `connect_callback` /
   `disconnect_callback` become flag-only (see §1 ordering hazard).
@@ -269,9 +283,9 @@ Phases 1–2 are safe to land without Phase 3. **Phase 3 must not be split.**
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| nRF `.bss` +11 KB doesn't fit alongside SoftDevice S140 @ `BANDWIDTH_MAX` | **High** | Phase 0 gate; `BLE_RX_QUEUE_SLOTS` knob |
+| ~~nRF `.bss` +11 KB doesn't fit alongside SoftDevice S140 @ `BANDWIDTH_MAX`~~ | ~~High~~ **Retired** | Headroom confirmed sufficient (2026-07-27); `BLE_RX_QUEUE_SLOTS` knob kept as an escape hatch only |
 | Command stalls up to 100 ms inside `idleDelay()` — nRF cannot stall today | **High** | `idleDelay()` must drain RX/TX every iteration, not just poll input |
-| nRF idle current rises if `loop()` spins to stay responsive | Medium | Measure in Phase 0; spin only while `workInFlight`, as ESP32 does |
+| nRF idle current rises if `loop()` spins to stay responsive | Medium | Baseline before Phase 3; spin only while `workInFlight`, as ESP32 does |
 | Pipe-write throughput regression on nRF (ACK now costs a loop pass) | Medium | Benchmark before/after per `docs/pipe-write-protocol.md` |
 | Callback→flag conversion missed somewhere on nRF | **High** | Same-commit rule (§1); grep `ble_transport_nrf.cpp` for any call outside push/flag |
 | Init-ordering regression (SoftDevice before SPI on nRF) | Medium | `begin()`/`startAdvertising()` deliberately kept separate; `setup()` ordering unchanged |
