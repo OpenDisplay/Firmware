@@ -215,7 +215,7 @@ static void pollAdcButtons() {}
 // The BLE connect/disconnect application hooks that used to live here are gone
 // as of Phase 3. Both targets now service connect and disconnect from loop():
 // serviceBleEvents() does the connect-side work (rebootFlag, MSD refresh, link
-// tuning) and raises bleDisconnectCleanupPending, and
+// tuning) and calls requestTransferSessionCleanup(), and
 // serviceBleDisconnectCleanup() owns the session teardown -- which is where the
 // mid-refresh and LAN-ownership guards live. nRF used to run that teardown
 // inline on the SoftDevice callback task with neither guard.

@@ -334,7 +334,7 @@ bool BleTransport::takeDisconnectedEvent(uint8_t* reason) {
 
 bool BleTransport::restartsAdvertisingOnDisconnect() const {
     // NimBLE does not re-advertise by itself here; the application schedules it
-    // via bleRestartAdvertisingPending so the restart can be held off while an
+    // via requestAdvertisingRestart() so the restart can be held off while an
     // EPD refresh is mid-flight.
     return false;
 }
