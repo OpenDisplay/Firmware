@@ -36,6 +36,7 @@ static volatile bool s_notifySubscribed = false;
 static volatile bool s_connectedEvent = false;
 static volatile bool s_disconnectedEvent = false;
 static volatile uint8_t s_disconnectReason = 0;
+static volatile uint16_t s_connHandle = BLE_HS_CONN_HANDLE_NONE;
 
 static void clearHandles() {
     s_server = nullptr;
@@ -48,9 +49,11 @@ static void clearHandles() {
 class OdServerCallbacks : public BLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
         (void)pServer;
-        (void)connInfo;
         od_log_info("=== BLE CLIENT CONNECTED (ESP32) ===");
         s_notifySubscribed = false;
+        // Captured here because it is the only place NimBLE hands it to us; the
+        // link tuning that consumes it runs later, on the loop task.
+        s_connHandle = connInfo.getConnHandle();
         // Flag-only. The app work this implies (rebootFlag reset, updatemsdata()
         // -- which polls I2C and mutates the shared advertisement vector that
         // loop() also drives on a 60 s cadence) would corrupt the heap if run
@@ -63,6 +66,7 @@ class OdServerCallbacks : public BLEServerCallbacks {
         od_log_info("=== BLE CLIENT DISCONNECTED (ESP32) ===");
         s_notifySubscribed = false;
         s_disconnectReason = (uint8_t)reason;
+        s_connHandle = BLE_HS_CONN_HANDLE_NONE;
         // Flag-only. The session teardown this implies (EPD force-off with
         // SPI.end()/rail cut, partial + pipe cleanup) is heavyweight,
         // state-mutating work that races loop()'s SPI streaming and pipe-frame
@@ -283,11 +287,28 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
     pAdvertising->start();
 }
 
+// Match nRF's link tuning: 2M PHY + 251-octet DLE. Like nRF, the peripheral only
+// auto-accepts what the central asks for, so without this the link stays at
+// 1M / 27 octets whenever the phone does not request better.
+//
+// Called from loop() when the connect event is consumed, not from the connect
+// callback -- these are host-stack calls, which the callback contract excludes.
 void BleTransport::requestFastLink() {
-    // No-op: NimBLE has no link tuning here today. nRF requests 2M PHY +
-    // 251-octet DLE; giving ESP32 the same is a one-file change now that the seam
-    // exists, but it is deliberately separate work so it can be measured alone
-    // (open question 2 in the plan).
+    if (s_server == nullptr || s_connHandle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    // 2 Mbps both directions. phyOptions applies only to the CODED PHY, so 0.
+    // The peer may decline and stay at 1M -- not an error.
+    if (!s_server->updatePhy(s_connHandle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0)) {
+        od_log_warn("2M PHY request rejected (staying at 1M)");
+    }
+    // 251-octet Link-Layer PDUs (max DLE); NimBLE derives the PHY-appropriate
+    // on-air duration itself, so there is no time parameter to pass.
+    s_server->setDataLen(s_connHandle, 251);
+    od_log_debug("Requested fast link: 2M PHY + 251-octet DLE");
+    // No negotiated-parameter logging here yet, unlike nRF: that would need an
+    // equivalent of nRF's delayed one-shot, since negotiation completes after
+    // this returns. NimBLEServer::getPhy() is the hook if it is wanted.
 }
 
 void BleTransport::boostAdvertising() {

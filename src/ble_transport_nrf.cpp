@@ -314,11 +314,19 @@ bool BleTransport::restartsAdvertisingOnDisconnect() const {
 }
 
 const char* BleTransport::addressString() {
-    // No nRF caller today: the only consumer is wifi_service.cpp, which is
-    // ESP32-only (OPENDISPLAY_HAS_WIFI). Returning an empty string rather than
-    // guessing at a Bluefruit address API that has never been exercised here --
-    // implement and bench-verify against the advertised AdvA before any nRF use.
-    return "";
+    // Lowercase colon-separated, matching the ESP32 implementation's contract.
+    //
+    // Byte order matters: Bluefruit::getAddr(mac) memcpy's ble_gap_addr_t.addr
+    // straight out of sd_ble_gap_addr_get(), and the SoftDevice stores that
+    // LSB-first (bluefruit.cpp:508-515). The advertised AdvA and every
+    // human-readable form are MSB-first, so emit it reversed -- otherwise this
+    // returns a byte-swapped address that looks plausible and matches nothing.
+    static char s_addr[18];
+    uint8_t mac[6] = {0};
+    (void)Bluefruit.getAddr(mac);   // return value is the address TYPE, not a status
+    snprintf(s_addr, sizeof(s_addr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+    return s_addr;
 }
 
 #endif  // TARGET_NRF
