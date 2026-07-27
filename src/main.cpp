@@ -325,6 +325,17 @@ static void serviceBleDisconnectCleanup() {
 // "not yet" paths so a later pass retries.
 static void serviceBleAdvertisingRestart() {
     if (!bleRestartAdvertisingPending) return;
+    // Capability gate, and the reason this helper is safe for ANY caller to
+    // raise the flag: where the stack re-arms advertising itself (nRF's
+    // restartOnDisconnect(true)), driving our own stop()/start() would fight it.
+    // Refusing here rather than at each raise site means a new raiser -- the
+    // post-refresh hook in display_service.cpp, or a future portable
+    // requestAdvertisingRestart() -- cannot reintroduce that conflict by
+    // forgetting a target guard.
+    if (ble.restartsAdvertisingOnDisconnect()) {
+        bleRestartAdvertisingPending = false;
+        return;
+    }
     if (!ble.isReady()) return;                              // stack down; retry later
     if (ble.isConnected()) {                                 // a client beat us to it
         bleRestartAdvertisingPending = false;
@@ -373,11 +384,11 @@ static void serviceBleEvents() {
         // Doing it inline would reintroduce the mid-refresh SPI teardown that
         // moving nRF off the callback task was meant to eliminate.
         bleDisconnectCleanupPending = true;
-        // Where the stack re-arms the radio itself (nRF's restartOnDisconnect),
-        // scheduling our own restart would fight it.
-        if (!ble.restartsAdvertisingOnDisconnect()) {
-            bleRestartAdvertisingPending = true;
-        }
+        // Raised unconditionally: serviceBleAdvertisingRestart() owns the
+        // capability decision, so this site does not need to know whether the
+        // stack re-arms the radio by itself. On such a target the flag is simply
+        // cleared unserviced, later in this same pass.
+        bleRestartAdvertisingPending = true;
     }
 }
 
