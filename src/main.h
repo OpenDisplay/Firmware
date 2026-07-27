@@ -144,8 +144,9 @@ uint16_t wifiServerPort = 2446;
 #endif
 #ifdef OPENDISPLAY_HAS_WIFI
 // Heavy WiFi-transport surface: the TCP server/client objects and the 16 KB RX
-// reassembly buffer exist ONLY when the WiFi transport is compiled in (S3/C6).
-// C3 / classic esp32-N4 reclaim this RAM.
+// reassembly buffer exist ONLY when the WiFi transport is compiled in -- every
+// S3 env (E1004 inherits the flag from esp32-s3-N32R8-extuart), C6, and both C3
+// envs. Only the classic esp32-N4 reclaims this RAM.
 // 16 KB = four max wire frames (OD_LAN_MAX_FRAME 4096): headroom for the
 // streaming client to keep whole frames queued ahead of the parser.
 WiFiServer wifiServer;

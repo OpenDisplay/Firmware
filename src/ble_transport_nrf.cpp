@@ -60,7 +60,11 @@ static void applyAdvInterval() {
 // default, up to 251 once negotiated. The nRF peripheral only auto-accepts the
 // central's request, which arrives AFTER the connect callback, so we log twice:
 // once at connect (baseline) and once ~2.5 s later (negotiated).
-static void logLinkParams(uint16_t conn_handle, const char* phase) {
+// `atInfo` separates the two callers: the pre-negotiation baseline is diagnostic
+// noise and stays at DEBUG, while the negotiated result -- the answer to "did the
+// 2M PHY and 251-octet DLE actually get granted" -- logs at INFO so it survives a
+// default-level bench capture. Mirrors logNegotiatedLink() on ESP32.
+static void logLinkParams(uint16_t conn_handle, const char* phase, bool atInfo) {
     BLEConnection* conn = Bluefruit.Connection(conn_handle);
     if (conn == nullptr) {
         od_log_debug("[LINK %s] no connection (handle %u)", phase, conn_handle);
@@ -72,8 +76,15 @@ static void logLinkParams(uint16_t conn_handle, const char* phase) {
     uint16_t ci  = conn->getConnectionInterval(); // units of 1.25 ms
     const char* phyStr = (phy == BLE_GAP_PHY_2MBPS) ? "2M" :
                          (phy == BLE_GAP_PHY_1MBPS) ? "1M" : "?";
-    od_log_debug("[LINK %s] PHY=%s  ATT_MTU=%u  DLE=%u octets  connInterval=%.2f ms",
-                 phase, phyStr, mtu, dle, ci * 1.25f);
+    char line[128];
+    snprintf(line, sizeof(line),
+             "[LINK %s] PHY=%s  ATT_MTU=%u  DLE=%u octets  connInterval=%.2f ms",
+             phase, phyStr, mtu, dle, ci * 1.25f);
+    if (atInfo) {
+        od_log_info("%s", line);
+    } else {
+        od_log_debug("%s", line);
+    }
 }
 
 // One-shot timer (armed only on connect -- no per-loop polling). Fires once on
@@ -84,7 +95,7 @@ static uint16_t      s_linkDiagConn = BLE_CONN_HANDLE_INVALID;
 
 static void linkDiagCallback(TimerHandle_t /*xTimer*/) {
     if (Bluefruit.connected()) {
-        logLinkParams(s_linkDiagConn, "negotiated");
+        logLinkParams(s_linkDiagConn, "negotiated", true);   // INFO: the granted result
     }
 }
 
@@ -248,7 +259,7 @@ void BleTransport::requestFastLink() {
     BLEConnection* conn = Bluefruit.Connection(s_connHandle);
     if (conn == nullptr) return;
 
-    logLinkParams(s_connHandle, "at connect");   // baseline (pre-negotiation)
+    logLinkParams(s_connHandle, "at connect", false);   // DEBUG: baseline, pre-negotiation
 
     // 2 Mbps PHY (tx + rx). Peer may decline and stay at 1M.
     conn->requestPHY(BLE_GAP_PHY_2MBPS);

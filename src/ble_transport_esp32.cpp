@@ -45,6 +45,35 @@ static void clearHandles() {
     s_notifySubscribed = false;
 }
 
+// --- link diagnostics (implementation-private) ------------------------------
+static const char* phyName(uint8_t phy) {
+    switch (phy) {
+        case BLE_GAP_LE_PHY_1M:    return "1M";
+        case BLE_GAP_LE_PHY_2M:    return "2M";
+        case BLE_GAP_LE_PHY_CODED: return "Coded";
+        default:                   return "?";
+    }
+}
+
+// Report the whole negotiated picture on every event rather than one field per
+// callback, so a single log line is enough to judge the link. Logged at INFO:
+// this is the answer to "did the 2M PHY / big MTU actually get granted", which
+// is worth having in a default-level capture from the bench.
+//
+// DLE (max LL PDU octets) is absent: NimBLEConnInfo exposes MTU and connection
+// interval but not the negotiated data length, unlike Bluefruit's
+// BLEConnection::getDataLength(). Not an oversight -- there is no accessor.
+static void logNegotiatedLink(NimBLEConnInfo& info, const char* trigger) {
+    uint8_t txPhy = 0;
+    uint8_t rxPhy = 0;
+    if (s_server != nullptr) {
+        s_server->getPhy(info.getConnHandle(), &txPhy, &rxPhy);
+    }
+    od_log_info("[LINK negotiated after %s] PHY tx=%s rx=%s  ATT_MTU=%u  connInterval=%.2f ms",
+                trigger, phyName(txPhy), phyName(rxPhy),
+                (unsigned)info.getMTU(), info.getConnInterval() * 1.25f);
+}
+
 // --- stack callbacks (NimBLE host task -- flag-only) ------------------------
 class OdServerCallbacks : public BLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
@@ -73,6 +102,18 @@ class OdServerCallbacks : public BLEServerCallbacks {
         // processing. loop() consumes the event and applies its own deferral
         // policy (see serviceBleDisconnectCleanup in main.cpp).
         s_disconnectedEvent = true;
+    }
+    // Negotiation completes asynchronously, after requestFastLink() returns, so
+    // these are the only points where the granted values are knowable. Both are
+    // log-only -- no state is touched, so the callback contract holds.
+    void onPhyUpdate(NimBLEConnInfo& connInfo, uint8_t txPhy, uint8_t rxPhy) override {
+        (void)txPhy;   // logNegotiatedLink re-reads both via getPhy() for one
+        (void)rxPhy;   // consistent source, and reports MTU/interval alongside
+        logNegotiatedLink(connInfo, "PHY update");
+    }
+    void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
+        (void)MTU;     // read back through connInfo.getMTU() with the rest
+        logNegotiatedLink(connInfo, "MTU exchange");
     }
 };
 
