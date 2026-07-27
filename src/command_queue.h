@@ -12,7 +12,7 @@
 // yet use it: its write callback still dispatches inline on the SoftDevice
 // callback task, and its responses still go straight out through
 // BleTransport::notify(). Phase 3 makes nRF a producer on the RX ring and moves
-// its dispatch to loop(), at which point bleServiceTx() drives both targets.
+// its dispatch to loop(), at which point serviceBleTx() drives both targets.
 // See docs/PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md.
 //
 // Deliberately not in structs.h: that header is the config-packet / wire-protocol
@@ -88,6 +88,6 @@ bool bleTxQueuePending(void);
 // entry) and leave only stale ACKs, lagging window refunds and collapsing
 // throughput. handleReadConfig() calls it between config chunks for the same
 // reason.
-void bleServiceTx(void);
+void serviceBleTx(void);
 
 #endif  // COMMAND_QUEUE_H

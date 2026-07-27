@@ -564,7 +564,7 @@ static void directWriteComputeGeometry(bool compressed);
 static void directWriteActivatePanel(void);
 static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t endOpcode);
 
-// bleServiceTx() comes from command_queue.h. The response ring's only drainer is
+// serviceBleTx() comes from command_queue.h. The response ring's only drainer is
 // the loop task, which is the same task running these handlers -- so anything
 // queued here stays queued until we return. Call it before any multi-second
 // blocking work (see the refresh tail).
@@ -2376,7 +2376,7 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     //
     // Portable as of Phase 3: nRF used to notify() inline from the BLE callback
     // task and so never needed this, but it now shares the ring and the loop task.
-    bleServiceTx();
+    serviceBleTx();
     delay(20);
     epdRefreshInProgress = true;
     bool refreshSuccess = false;

@@ -96,7 +96,7 @@ bool bleTxQueuePending(void) {
     return s_txTail != s_txHead;
 }
 
-void bleServiceTx(void) {
+void serviceBleTx(void) {
     if (s_txTail == s_txHead) return;
     if (ble.notifyReady()) {
         uint8_t drained = 0;

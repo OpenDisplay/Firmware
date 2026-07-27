@@ -87,7 +87,7 @@ float readBatteryVoltage();
 
 /** Mirror responses to BLE only when a central is connected; LAN responses go via opendisplay_lan_send_frame. */
 static void queueBleNotifyCopy(const uint8_t* response, uint16_t len, bool quiet = false) {
-    // Nothing to queue against with no central attached; bleServiceTx() would
+    // Nothing to queue against with no central attached; serviceBleTx() would
     // discard it on the next pass anyway.
     if (!ble.isConnected()) {
         return;
@@ -283,7 +283,7 @@ void sendResponse(uint8_t* response, uint16_t len) {
     // targets as of Phase 3: nRF used to notify() inline here with a blocking
     // delay(5) x 4 retry, which was only safe because it ran on the same task as
     // dispatch. Now that both targets dispatch from loop(), both queue and let
-    // bleServiceTx() apply the non-blocking "retry next pass" backpressure rule.
+    // serviceBleTx() apply the non-blocking "retry next pass" backpressure rule.
     if (g_commandOrigin == ORIGIN_BLE) {
         queueBleNotifyCopy(response, len, quietAck);
     } else {
@@ -412,7 +412,7 @@ void handleReadConfig() {
             // inline from the BLE callback task and only needed to pace the
             // SoftDevice. It now shares the ring, so it needs the same flush --
             // and drops 50 ms per chunk.
-            bleServiceTx();
+            serviceBleTx();
         }
     } else {
         uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_READ, 0x00, 0x00};
