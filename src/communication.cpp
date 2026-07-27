@@ -14,7 +14,9 @@
 #include "command_queue.h"
 
 #ifdef TARGET_ESP32
-#include <WiFi.h>
+// wifi_service.h only, deliberately: this file talks to the LAN transport
+// through opendisplay_lan_send_frame() and needs no WiFi stack types. <WiFi.h>
+// was here solely for two extern declarations that nothing used.
 #include "wifi_service.h"
 #endif
 
@@ -82,11 +84,6 @@ extern uint8_t configReadResponseBuffer[128];
 extern uint8_t msd_payload[16];
 String getChipIdHex();
 float readBatteryVoltage();
-
-#ifdef TARGET_ESP32
-extern WiFiClient wifiClient;
-extern bool wifiServerConnected;
-#endif
 
 /** Mirror responses to BLE only when a central is connected; LAN responses go via opendisplay_lan_send_frame. */
 static void queueBleNotifyCopy(const uint8_t* response, uint16_t len, bool quiet = false) {
