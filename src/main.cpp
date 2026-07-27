@@ -390,15 +390,13 @@ static void serviceBleRx() {
     }
 }
 
-void loop() {
-    serviceBleEvents();
-    processLedFlash();
-    epdSessionTick();   // millis()-poll: power the panel down screen_timeout_seconds after last release
-    buzzerService();
-    #ifdef TARGET_ESP32
+// Platform policy hook 1: work this target does before the shared body, with the
+// option to claim the whole pass. Only ESP32 has any -- the deep-sleep wake
+// window is a real capability difference, so the plan says hook it rather than
+// merge it. Returns true when the pass is finished and loop() must return.
+static bool platformLoopPrologue() {
+#ifdef TARGET_ESP32
     pollActivity();
-    #endif
-    #ifdef TARGET_ESP32
     // THIS IS THE MAIN (FIRST) LOOP FOR A DEEP SLEEP ENABLED ESP32
     if (woke_from_deep_sleep && advertising_timeout_active) {
         if (ble.isConnected()) {
@@ -406,7 +404,7 @@ void loop() {
             advertising_timeout_active = false;
             fullSetupAfterConnection();
             woke_from_deep_sleep = false;
-            return;
+            return true;
         }
         // A connect+drop entirely inside one poll gap leaves the radio dark for the
         // rest of the window; the flags are otherwise only serviced past this return.
@@ -427,7 +425,7 @@ void loop() {
                         (unsigned)idle_duration, (unsigned)advertisingElapsedMs);
             advertising_timeout_active = false;
             enterDeepSleep();
-            return;
+            return true;
         }
         // idleDelay() services buttons + touch (and LED flash) while it waits, so a
         // wake-time touch is polled during this window even though the branch returns
@@ -435,22 +433,79 @@ void loop() {
         // a mid-window client, and pollActivity picks it up next pass to hold the window
         // open — none of which happens if we just delay() here without servicing input.
         idleDelay(50); // idleDelay() polls touch and buttons while waiting
-        return;
+        return true;
     }
-    // THIS IS THE END OF THE MAIN LOOP() FOR DEEP SLEEP ESP32.  Loop starts over.
-    // IF CONNECTION OCCURED THEN SET woke_from_deep_sleep=false and escape above on next loop
-    // BELOW THIS IS WHERE ESP32 DOES WORK
+#endif
+    return false;
+}
+
+// Platform policy hook 2: what this target does when nothing is in flight.
+// ESP32 owns the deep-sleep decision; nRF just idles at its configured cadence.
+// Never reached while work is outstanding -- loop() handles that case itself.
+static void platformIdle() {
+#ifdef TARGET_ESP32
+    if (globalConfig.power_option.deep_sleep_time_seconds > 0 && globalConfig.power_option.power_mode == 1) {
+        uint32_t idleHoldMs = globalConfig.power_option.sleep_timeout_ms;
+        if (idleHoldMs == 0) {
+            idleHoldMs = DEFAULT_IDLE_HOLD_MS;
+        }
+        uint32_t idleMs = millis() - lastActivityMs;
+        // The min-wake hold covers first boot and connect-then-drop during a
+        // button-wake window (woke_from_deep_sleep cleared on connect above).
+        if (idleMs < idleHoldMs || minWakeHoldActive()) {
+            idleDelay(5);
+        } else {
+            od_log_info("Idle %u ms (hold %u ms) - entering deep sleep", (unsigned)idleMs, (unsigned)idleHoldMs);
+            enterDeepSleep();
+        }
+    } else {
+        // Non-battery (USB) idle: keep the loop responsive. A 2000 ms idle here
+        // stalls BLE command/response servicing for up to 2 s when a client
+        // connects mid-delay (the queued write waits out the delay before the
+        // loop re-evaluates), which reads as a sluggish/unreliable first
+        // exchange. Use the same short cadence as the battery idle-hold path.
+        idleDelay(5);
+    }
+    static uint32_t lastMsdUpdate = 0;
+    if (millis() - lastMsdUpdate >= 60000) {
+        lastMsdUpdate = millis();
+        updatemsdata();
+    }
+#else
+    if (globalConfig.power_option.sleep_timeout_ms > 0) {
+        idleDelay(globalConfig.power_option.sleep_timeout_ms);
+        updatemsdata();
+    } else {
+        idleDelay(500);
+    }
+#endif
+}
+
+// One loop body for both targets. The per-target policy that genuinely differs
+// lives in the two hooks above; everything here is shared.
+void loop() {
+    serviceBleEvents();
+    processLedFlash();
+    epdSessionTick();   // millis()-poll: power the panel down screen_timeout_seconds after last release
+    buzzerService();
+
+    if (platformLoopPrologue()) return;
+
+    // Drain commands, then service the deferred work the stack callbacks flagged.
+    // Cleanup runs before the advertising restart so a disconnected session is
+    // fully torn down before the radio re-arms.
     serviceBleRx();
     bleServiceTx();
-    // Service the flag-only BLE callbacks on this (single) task. Cleanup runs
-    // before the advertising restart so a disconnected session is fully torn down
-    // before the radio re-arms.
     serviceBleDisconnectCleanup();
     if (msdUpdatePending) {
         msdUpdatePending = false;
         updatemsdata();
     }
-    serviceBleAdvertisingRestart();
+    serviceBleAdvertisingRestart();   // no-op where the stack re-arms itself
+
+    // Session watchdogs. Shared as of Phase 4: these are transport-agnostic and
+    // were ESP32-only for no reason other than living in the ESP32 loop arm, so
+    // nRF gains them. A hung transfer there used to sit until disconnect.
     if (directWriteActive && directWriteStartTime > 0) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
         if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
@@ -459,6 +514,7 @@ void loop() {
         }
     }
     checkPartialWriteTimeout();
+
     #ifdef OPENDISPLAY_HAS_WIFI
     // WiFi handling runs after BLE queue processing to avoid blocking
     // BLE command responses (moved from top of loop in v1.6 fix).
@@ -480,94 +536,30 @@ void loop() {
             restartWiFiLanAfterReconnect();
         }
     }
-    #endif
-    #ifdef OPENDISPLAY_HAS_WIFI
     const bool wifiLanSession = wifiInitialized && wifiServerConnected && wifiClient.connected();
     #else
     const bool wifiLanSession = false;
     #endif
-    // Work in flight *this iteration* only. Every term below is transient and most
-    // are cleared earlier in this same loop pass, so this must never be the sole
-    // gate on deep sleep — lastActivityMs supplies the quiet window.
-    bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
-                        ble.isConnected() ||
-                        bleRestartAdvertisingPending ||
-                        epdRefreshInProgress ||
-                        wifiLanSession;
+
+    // Work in flight *this iteration* only. Every term is transient and most are
+    // cleared earlier in this same pass, so this must never be the sole gate on
+    // deep sleep — lastActivityMs supplies the quiet window. The terms that only
+    // one target can ever raise (bleRestartAdvertisingPending, wifiLanSession)
+    // are simply false on the other, so one expression serves both.
+    const bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
+                              ble.isConnected() ||
+                              bleRestartAdvertisingPending ||
+                              epdRefreshInProgress ||
+                              wifiLanSession;
     if (workInFlight) {
-        processButtonEvents();
-        processTouchInput();
-        buzzerService();
         delay(1);
     } else {
-        if(globalConfig.power_option.deep_sleep_time_seconds > 0 && globalConfig.power_option.power_mode == 1){
-            uint32_t idleHoldMs = globalConfig.power_option.sleep_timeout_ms;
-            if (idleHoldMs == 0) {
-                idleHoldMs = DEFAULT_IDLE_HOLD_MS;
-            }
-            uint32_t idleMs = millis() - lastActivityMs;
-            // The min-wake hold covers first boot and connect-then-drop during a
-            // button-wake window (woke_from_deep_sleep cleared on connect above).
-            if (idleMs < idleHoldMs || minWakeHoldActive()) {
-                idleDelay(5);
-            } else {
-                od_log_info("Idle %u ms (hold %u ms) - entering deep sleep", (unsigned)idleMs, (unsigned)idleHoldMs);
-                enterDeepSleep();
-            }
-        }
-        else{
-            // Non-battery (USB) idle: keep the loop responsive. A 2000 ms idle here
-            // stalls BLE command/response servicing for up to 2 s when a client
-            // connects mid-delay (the queued write waits out the delay before the
-            // loop re-evaluates), which reads as a sluggish/unreliable first
-            // exchange. Use the same short cadence as the battery idle-hold path.
-            idleDelay(5);
-        }
-        static uint32_t lastMsdUpdate = 0;
-        if (millis() - lastMsdUpdate >= 60000) {
-            lastMsdUpdate = millis();
-            updatemsdata();
-        }
-        processButtonEvents();
-        processTouchInput();
-        buzzerService();
+        platformIdle();
     }
-    #else
-    // nRF dispatches from loop() as of Phase 3, so this arm must service the
-    // rings before it goes idle -- the stack callback only enqueues now.
-    serviceBleRx();
-    bleServiceTx();
-    serviceBleDisconnectCleanup();
-    if (msdUpdatePending) {
-        msdUpdatePending = false;
-        updatemsdata();
-    }
-    // No-op on nRF (the stack re-arms advertising itself, so the flag is never
-    // raised); called anyway to keep both arms the same shape for Phase 4.
-    serviceBleAdvertisingRestart();
-    // Stay responsive while a link is up or work is outstanding: the idle waits
-    // below are the whole reason a queued command could sit unserviced, and
-    // idleDelay() returns early on RX anyway. Mirrors the ESP32 workInFlight arm.
-    if (bleRxQueuePending() || bleTxQueuePending() || ble.isConnected() || epdRefreshInProgress) {
-        ble.tick();
-        processButtonEvents();
-        processTouchInput();
-        buzzerService();
-        delay(1);
-    } else {
-        if(globalConfig.power_option.sleep_timeout_ms > 0){
-            idleDelay(globalConfig.power_option.sleep_timeout_ms);
-            updatemsdata();
-        }
-        else{
-            idleDelay(500);
-        }
-        ble.tick();
-        processButtonEvents();
-        processTouchInput();
-        buzzerService();
-    }
-    #endif
+    ble.tick();          // no-op on ESP32
+    processButtonEvents();
+    processTouchInput();
+    buzzerService();
 }
 
 // Button/LED runtime moved to device_control.cpp
