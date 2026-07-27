@@ -60,6 +60,11 @@ void bleRxQueueConsume(void);                             // advance past the pe
 uint8_t bleRxQueueHead(void);                             // producer-side, for pollActivity()
 bool bleRxQueuePending(void);                             // unconsumed frames waiting
 
+// Discard every unconsumed frame. Consumer-side: call only from the loop task,
+// and only when the frames are known to be worthless -- i.e. the client that sent
+// them is gone. Returns how many were dropped, for the log.
+uint8_t bleRxQueueDiscardAll(void);
+
 // --- TX: command handlers (producer) -> loop() flush (consumer) --------------
 // One definition of the struct, in one place: communication.cpp used to carry
 // its own copy plus a MAX_RESPONSE_SIZE_LOCAL constant, so the bound checked

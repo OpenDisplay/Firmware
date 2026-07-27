@@ -240,9 +240,10 @@ static void pollActivity() {
     static uint8_t prevDynamic[sizeof(dynamicreturndata)] = {0};
 
     // Queue heads are producer-side, so a command that arrived and drained within
-    // a single pass still registers. The heads wrap (mod 5 and 10), but aliasing
-    // needs a whole queue of traffic inside one pass, and queues only fill while a
-    // client is connected — which stamps below regardless.
+    // a single pass still registers. The heads wrap (RX mod COMMAND_QUEUE_SIZE,
+    // TX mod RESPONSE_QUEUE_SIZE), but aliasing needs a whole queue of traffic
+    // inside one pass, and queues only fill while a client is connected — which
+    // stamps below regardless.
     const uint8_t commandHead = bleRxQueueHead();
     const uint8_t responseHead = bleTxQueueHead();
     // Covers connect and disconnect. The disconnect edge is what re-arms the
@@ -352,6 +353,20 @@ static void serviceBleEvents() {
     uint8_t disconnectReason = 0;
     if (ble.takeDisconnectedEvent(&disconnectReason)) {
         od_log_info("Disconnect reason: %u", disconnectReason);
+        // Drop anything the departed client left in the RX ring. Without this,
+        // serviceBleRx() runs BEFORE serviceBleDisconnectCleanup() in the pass, so
+        // up to a full window of frames from a dead session would dispatch --
+        // touching pipe/partial state that resetPipeWriteState() is about to
+        // discard anyway, and emitting responses that queueBleNotifyCopy() then
+        // drops for want of a connection.
+        //
+        // Deliberately here and NOT in serviceBleDisconnectCleanup(): that flag is
+        // raised by the LAN transport too, and a LAN drop must not discard queued
+        // BLE frames. Only a real BLE disconnect event invalidates this ring.
+        const uint8_t droppedRx = bleRxQueueDiscardAll();
+        if (droppedRx > 0) {
+            od_log_warn("Dropped %u queued command(s) from the disconnected client", droppedRx);
+        }
         // Raise the flag; do NOT tear the session down here. The teardown belongs
         // in serviceBleDisconnectCleanup(), which holds it off while an EPD
         // refresh is mid-flight and checks whether LAN still owns the transfer.

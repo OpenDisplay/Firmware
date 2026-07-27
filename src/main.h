@@ -176,7 +176,10 @@ bool displayPowerState = false;  // Track display power state (true = powered on
 // enum PwrMgmState + EPD_KEEPALIVE_MAX_S are defined in display_service.h (shared header).
 volatile uint8_t pwrmgmState = PWR_OFF;  // PWR_OFF / PWR_WARM / PWR_ACTIVE
 uint32_t pwrmgmOffDeadlineMs = 0;        // keep-alive deadline (millis); valid only in PWR_WARM
-volatile uint8_t pwrmgmLock = 0;         // cross-task try-lock (nRF BLE task vs loop task)
+// Session try-lock, uncontended since Phase 3 moved nRF dispatch onto loop().
+// Kept as defence in depth -- see the rationale at pwrmgmLockTake() in
+// display_service.cpp.
+volatile uint8_t pwrmgmLock = 0;
 
 bool waitforrefresh(int timeout);
 void pwrmgm(bool onoff);

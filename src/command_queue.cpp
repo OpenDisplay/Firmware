@@ -53,6 +53,22 @@ void bleRxQueueConsume(void) {
     __atomic_store_n(&s_rxTail, (uint8_t)((tail + 1) % COMMAND_QUEUE_SIZE), __ATOMIC_RELEASE);
 }
 
+uint8_t bleRxQueueDiscardAll(void) {
+    // ACQUIRE the head for the same reason peek does, then jump the tail to it in
+    // one RELEASE store. Safe against a concurrent producer: it only ever advances
+    // the head, so a frame pushed after this load simply survives to the next pass
+    // rather than being lost or double-counted.
+    uint8_t tail = __atomic_load_n(&s_rxTail, __ATOMIC_RELAXED);
+    uint8_t head = __atomic_load_n(&s_rxHead, __ATOMIC_ACQUIRE);
+    if (tail == head) return 0;
+    const uint8_t dropped = (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
+    for (uint8_t i = tail; i != head; i = (uint8_t)((i + 1) % COMMAND_QUEUE_SIZE)) {
+        s_rx[i].pending = false;
+    }
+    __atomic_store_n(&s_rxTail, head, __ATOMIC_RELEASE);
+    return dropped;
+}
+
 uint8_t bleRxQueueHead(void) {
     return __atomic_load_n(&s_rxHead, __ATOMIC_RELAXED);
 }
