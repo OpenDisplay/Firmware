@@ -2360,14 +2360,15 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     }
     uint8_t ackResponse[] = {0x00, endOpcode};
     sendResponse(ackResponse, sizeof(ackResponse));
-#ifdef TARGET_ESP32
     // Push the END ack — and the final tail ACK the auto-complete path queued just
     // before calling us — onto the air BEFORE the blocking refresh below. bbepRefresh
     // + waitforrefresh occupy the loop task for seconds on a big panel, and the loop
     // task is the response ring's only drainer, so without this the client sits in its
     // tail-flush probe loop and aborts the (already complete) transfer on PTO.
+    //
+    // Portable as of Phase 3: nRF used to notify() inline from the BLE callback
+    // task and so never needed this, but it now shares the ring and the loop task.
     bleServiceTx();
-#endif
     delay(20);
     epdRefreshInProgress = true;
     bool refreshSuccess = false;

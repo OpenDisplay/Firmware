@@ -8,7 +8,7 @@
 
 #include "ble_transport.h"
 #include "ble_transport_nrf.h"
-#include "communication.h"   // imageDataWritten + its opaque parameter typedefs
+#include "command_queue.h"
 #include "structs.h"
 #include "encryption.h"
 #include "od_log.h"
@@ -35,6 +35,7 @@ static bool     s_begun = false;
 static uint16_t s_connHandle = BLE_CONN_HANDLE_INVALID;
 static volatile bool s_connectedEvent = false;
 static volatile bool s_disconnectedEvent = false;
+static volatile uint8_t s_disconnectReason = 0;
 
 // --- advertising interval policy --------------------------------------------
 static uint32_t s_advBoostUntil = 0;
@@ -98,34 +99,37 @@ static void armLinkDiag(uint16_t conn_handle) {
     s_linkDiagTimer.reset();   // start/restart the one-shot; fires ~2.5 s later
 }
 
-// --- stack callbacks ---------------------------------------------------------
-// Phase 1 preserves today's nRF threading: the app hook runs inline on the
-// SoftDevice callback task, exactly as connect_callback did before. Phase 3
-// converts these to flag-only, at which point the event flags below become the
-// sole output and bleAppOnConnect/Disconnect move to loop().
+// --- stack callbacks (SoftDevice callback task -- flag-only) -----------------
+// The threading contract, as of Phase 3 and matching ESP32: a stack callback may
+// do exactly two things, copy bytes into the RX ring and set a flag. Everything
+// else -- command dispatch, zlib inflate, EPD SPI streaming, notify(), the
+// connect/disconnect application work, even the PHY/DLE request -- runs on the
+// loop() task. Anything added below that is not a push or a flag store
+// reintroduces the cross-task races this phase exists to remove.
 static void onConnectCb(uint16_t conn_handle) {
+    od_log_info("=== BLE CLIENT CONNECTED (nRF) ===");
     s_connHandle = conn_handle;
     s_connectedEvent = true;
-    bleAppOnConnect();
-    logLinkParams(conn_handle, "at connect");  // baseline (pre-negotiation)
-    ble.requestFastLink();                     // request 2M PHY + 251-octet DLE
-    armLinkDiag(conn_handle);                  // re-log once negotiation settles
+}
+
+static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
+    (void)conn_handle;
+    od_log_info("=== BLE CLIENT DISCONNECTED (nRF) ===");
+    s_connHandle = BLE_CONN_HANDLE_INVALID;
+    s_disconnectReason = reason;
+    s_disconnectedEvent = true;
 }
 
 // Adapter: Bluefruit's write_callback_t is BLECharacteristic*-shaped, whereas the
 // shared dispatcher takes an opaque pointer (it ignores both leading arguments on
 // every target). Adapting here is what keeps Bluefruit types out of
-// communication.cpp. Still runs on the SoftDevice callback task in Phase 1;
-// Phase 3 replaces the body with a push onto the shared RX ring.
+// communication.cpp.
 static void onWriteCb(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
-    imageDataWritten(conn_hdl, (BLECharPtr)chr, data, len);
-}
-
-static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
-    (void)conn_handle;
-    s_connHandle = BLE_CONN_HANDLE_INVALID;
-    s_disconnectedEvent = true;
-    bleAppOnDisconnect(reason);
+    (void)conn_hdl;
+    (void)chr;
+    if (!bleRxQueuePush(data, len)) {
+        od_log_error("ERROR: Command queue full, dropping command");
+    }
 }
 
 // --- BleTransport ------------------------------------------------------------
@@ -234,9 +238,17 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
 // auto-accepts the central's PHY/DLE requests, so if the phone never asks we
 // stay at 1M / 27 octets. Both requests are no-ops if the peer already
 // negotiated the same or better.
+//
+// Called from loop() when the connect event is consumed, NOT from the connect
+// callback: these are SoftDevice calls, which the Phase 3 callback contract
+// ("copy bytes, set a flag") excludes. The few milliseconds of delay cost
+// nothing -- the central's own request arrives later than this either way, which
+// is why the diagnostics below log twice.
 void BleTransport::requestFastLink() {
     BLEConnection* conn = Bluefruit.Connection(s_connHandle);
     if (conn == nullptr) return;
+
+    logLinkParams(s_connHandle, "at connect");   // baseline (pre-negotiation)
 
     // 2 Mbps PHY (tx + rx). Peer may decline and stay at 1M.
     conn->requestPHY(BLE_GAP_PHY_2MBPS);
@@ -255,6 +267,7 @@ void BleTransport::requestFastLink() {
                     limit.tx_rx_time_limited_us);
     }
     od_log_debug("Requested fast link: 2M PHY + 251-octet DLE");
+    armLinkDiag(s_connHandle);                   // re-log once negotiation settles
 }
 
 void BleTransport::boostAdvertising() {
@@ -286,9 +299,17 @@ bool BleTransport::takeConnectedEvent() {
     return true;
 }
 
-bool BleTransport::takeDisconnectedEvent() {
+bool BleTransport::takeDisconnectedEvent(uint8_t* reason) {
     if (!s_disconnectedEvent) return false;
     s_disconnectedEvent = false;
+    if (reason != nullptr) *reason = s_disconnectReason;
+    return true;
+}
+
+bool BleTransport::restartsAdvertisingOnDisconnect() const {
+    // Bluefruit.Advertising.restartOnDisconnect(true) in startAdvertising(): the
+    // SoftDevice re-arms the radio itself, so the application must not also
+    // schedule a restart or the two fight over the advertising state.
     return true;
 }
 

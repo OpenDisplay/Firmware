@@ -86,9 +86,10 @@ float readBatteryVoltage();
 #ifdef TARGET_ESP32
 extern WiFiClient wifiClient;
 extern bool wifiServerConnected;
+#endif
 
 /** Mirror responses to BLE only when a central is connected; LAN responses go via opendisplay_lan_send_frame. */
-static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, bool quiet = false) {
+static void queueBleNotifyCopy(const uint8_t* response, uint16_t len, bool quiet = false) {
     // Nothing to queue against with no central attached; bleServiceTx() would
     // discard it on the next pass anyway.
     if (!ble.isConnected()) {
@@ -104,7 +105,6 @@ static void esp32_queue_ble_notify_copy(const uint8_t* response, uint16_t len, b
     const uint8_t depth = bleTxQueueDepth();
     if (!quiet && depth >= 2) od_log_debug("BLE: response queue backlog (queue size: %u)", depth);
 }
-#endif
 
 #ifndef BUILD_VERSION
 #define BUILD_VERSION "1.0.0"
@@ -188,28 +188,15 @@ void sendResponseUnencrypted(uint8_t* response, uint16_t len) {
     char hexDump[160];
     buildHexDump(hexDump, sizeof(hexDump), "  Full command: ", response, len);
     od_log_debug("%s", hexDump);
-#ifdef TARGET_ESP32
-    // F4 de-fan-out: reply over the origin transport only.
+    // F4 de-fan-out: reply over the origin transport only. One path for both
+    // targets as of Phase 3 (see sendResponse).
     if (g_commandOrigin == ORIGIN_BLE) {
-        esp32_queue_ble_notify_copy(response, len);
+        queueBleNotifyCopy(response, len);
     } else {
 #ifdef OPENDISPLAY_HAS_WIFI
         opendisplay_lan_send_frame(response, len);
 #endif
     }
-#endif
-#ifdef TARGET_NRF
-    if (ble.notifyReady()) {
-        char nrfHexDump[160] = {0};
-        buildHexDump(nrfHexDump, sizeof(nrfHexDump), "NRF: Sending unencrypted response: ", response, len);
-        od_log_debug("%s", nrfHexDump);
-        od_log_debug("NRF: BLE notification sent (%u bytes)", len);
-        ble.notify(response, len);
-    } else {
-        od_log_error("ERROR: Cannot send BLE response - not connected or notifications not enabled");
-        od_log_error("  Connected: %s", ble.isConnected() ? "yes" : "no");
-    }
-#endif
 }
 
 void sendResponse(uint8_t* response, uint16_t len) {
@@ -295,41 +282,18 @@ void sendResponse(uint8_t* response, uint16_t len) {
         }
         od_log_debug("%s", line);
     }
-#ifdef TARGET_ESP32
-    // F4 de-fan-out: reply over the origin transport only.
+    // F4 de-fan-out: reply over the origin transport only. One path for both
+    // targets as of Phase 3: nRF used to notify() inline here with a blocking
+    // delay(5) x 4 retry, which was only safe because it ran on the same task as
+    // dispatch. Now that both targets dispatch from loop(), both queue and let
+    // bleServiceTx() apply the non-blocking "retry next pass" backpressure rule.
     if (g_commandOrigin == ORIGIN_BLE) {
-        esp32_queue_ble_notify_copy(response, len, quietAck);
+        queueBleNotifyCopy(response, len, quietAck);
     } else {
 #ifdef OPENDISPLAY_HAS_WIFI
         opendisplay_lan_send_frame(response, len);
 #endif
     }
-#endif
-#ifdef TARGET_NRF
-    if (ble.notifyReady()) {
-        if (!quietAck) {
-            char nrfHexDump[160] = {0};
-            buildHexDump(nrfHexDump, sizeof(nrfHexDump), "NRF: Sending response: ", response, len);
-            od_log_debug("%s", nrfHexDump);
-            od_log_debug("NRF: BLE notification sent (%u bytes)", len);
-        }
-        // Bounded retry only when the SoftDevice TX queue is full (notify()==false).
-        // Replaces an unconditional delay(20): pays latency only on backpressure and
-        // speeds the legacy per-chunk path ~20 ms/chunk.
-        //
-        // Phase 3 deletes this loop: once nRF dispatches from loop() it inherits
-        // the ESP32 policy (leave the entry queued, retry next pass), which never
-        // blocks the caller. Kept verbatim here because Phase 1 changes no threading.
-        bool notified = ble.notify(response, len);
-        for (uint8_t attempt = 0; !notified && attempt < 4; ++attempt) {
-            delay(5);
-            notified = ble.notify(response, len);
-        }
-    } else {
-        od_log_error("ERROR: Cannot send BLE response - not connected or notifications not enabled");
-        od_log_error("  Connected: %s", ble.isConnected() ? "yes" : "no");
-    }
-#endif
 }
 
 void handleReadMSD() {
@@ -442,15 +406,16 @@ void handleReadConfig() {
             offset += chunkSize;
             remaining -= chunkSize;
             chunkNumber++;
-#ifdef TARGET_ESP32
             // Drain THIS chunk to BLE before enqueuing the next: this handler runs
             // synchronously on the loop task, so the ring's only drainer cannot run
             // until we return. Without this, chunk 9+ overflows the 10-slot ring and
             // is silently dropped, truncating configs > ~864 B on read-back.
+            //
+            // nRF used to sit in delay(50) here instead, because it notified
+            // inline from the BLE callback task and only needed to pace the
+            // SoftDevice. It now shares the ring, so it needs the same flush --
+            // and drops 50 ms per chunk.
             bleServiceTx();
-#else
-            delay(50);
-#endif
         }
     } else {
         uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_READ, 0x00, 0x00};

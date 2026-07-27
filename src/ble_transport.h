@@ -47,6 +47,12 @@ public:
     // Each implementation keeps its own restart semantics (see the .cpp).
     void setManufacturerData(const uint8_t* msd, uint8_t len);
 
+    // True where the stack re-arms advertising by itself after a disconnect
+    // (nRF: Bluefruit.Advertising.restartOnDisconnect(true)). Where it is false
+    // the application must schedule the restart itself. A genuine capability
+    // difference, stated as a query so callers need no target #ifdef.
+    bool restartsAdvertisingOnDisconnect() const;
+
     // --- link policy (no-op where the stack does not support it) ---
     void requestFastLink();        // nRF: 2M PHY + 251-octet DLE on the live link
     void boostAdvertising();       // nRF: temporary fast advertising interval
@@ -54,7 +60,9 @@ public:
 
     // --- events: consume-once, polled from loop(). No app-facing callbacks. ---
     bool takeConnectedEvent();
-    bool takeDisconnectedEvent();
+    // Optionally reports the stack's disconnect reason code, which is otherwise
+    // lost now that the callback no longer runs application code inline.
+    bool takeDisconnectedEvent(uint8_t* reason = nullptr);
 
     // --- identity ---
     const char* addressString();   // advertised BLE address, lowercase "aa:bb:.."
@@ -62,14 +70,6 @@ public:
 
 extern BleTransport ble;
 
-// Application hooks invoked by the transport on connect/disconnect. Defined in
-// device_control.cpp. On nRF these still run on the SoftDevice callback task
-// (Phase 1 preserves today's behaviour); on ESP32 the transport records an event
-// instead and loop() drives the equivalent work.
-void bleAppOnConnect();
-void bleAppOnDisconnect(uint8_t reason);
-
-#ifdef TARGET_ESP32
 // Deferred work, owned by the APPLICATION rather than by BleTransport: each flag
 // encodes a loop()-serviced policy decision (tear the session down, refresh the
 // advertisement, re-arm the radio) that the transport has no business making.
@@ -77,8 +77,8 @@ void bleAppOnDisconnect(uint8_t reason);
 // bleDisconnectCleanupPending is also raised by the LAN transport
 // (wifi_service.cpp), which is exactly why it cannot be a BLE transport event.
 extern volatile bool bleDisconnectCleanupPending;
-extern volatile bool bleRestartAdvertisingPending;
 extern volatile bool msdUpdatePending;
-#endif
+// Only meaningful where restartsAdvertisingOnDisconnect() is false.
+extern volatile bool bleRestartAdvertisingPending;
 
 #endif  // BLE_TRANSPORT_H

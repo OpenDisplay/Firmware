@@ -3,8 +3,6 @@
 
 #include <Arduino.h>
 
-// BLE connect/disconnect application hooks, invoked by BleTransport.
-// Declared in ble_transport.h; defined here in device_control.cpp.
 void reboot();
 void processButtonEvents();
 void flashLed(uint8_t color, uint8_t brightness);

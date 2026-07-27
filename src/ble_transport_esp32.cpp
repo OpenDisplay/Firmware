@@ -35,6 +35,7 @@ static BLEAdvertisementData s_advertisementData;
 static volatile bool s_notifySubscribed = false;
 static volatile bool s_connectedEvent = false;
 static volatile bool s_disconnectedEvent = false;
+static volatile uint8_t s_disconnectReason = 0;
 
 static void clearHandles() {
     s_server = nullptr;
@@ -59,9 +60,9 @@ class OdServerCallbacks : public BLEServerCallbacks {
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         (void)pServer;
         (void)connInfo;
-        (void)reason;
         od_log_info("=== BLE CLIENT DISCONNECTED (ESP32) ===");
         s_notifySubscribed = false;
+        s_disconnectReason = (uint8_t)reason;
         // Flag-only. The session teardown this implies (EPD force-off with
         // SPI.end()/rail cut, partial + pipe cleanup) is heavyweight,
         // state-mutating work that races loop()'s SPI streaming and pipe-frame
@@ -303,10 +304,18 @@ bool BleTransport::takeConnectedEvent() {
     return true;
 }
 
-bool BleTransport::takeDisconnectedEvent() {
+bool BleTransport::takeDisconnectedEvent(uint8_t* reason) {
     if (!s_disconnectedEvent) return false;
     s_disconnectedEvent = false;
+    if (reason != nullptr) *reason = s_disconnectReason;
     return true;
+}
+
+bool BleTransport::restartsAdvertisingOnDisconnect() const {
+    // NimBLE does not re-advertise by itself here; the application schedules it
+    // via bleRestartAdvertisingPending so the restart can be held off while an
+    // EPD refresh is mid-flight.
+    return false;
 }
 
 const char* BleTransport::addressString() {

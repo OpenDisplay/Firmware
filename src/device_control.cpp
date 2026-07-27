@@ -212,31 +212,13 @@ static void pollAdcButtons() {
 static void pollAdcButtons() {}
 #endif
 
-// Application response to a BLE connect. Invoked by BleTransport; the link
-// diagnostics and PHY/DLE tuning that used to sit here are transport-internal
-// now and run inside ble_transport_nrf.cpp. On nRF this still executes on the
-// SoftDevice callback task (Phase 1 changes no threading); on ESP32 the
-// transport records an event and loop() does the equivalent work instead, which
-// is why this hook has no ESP32 caller.
-void bleAppOnConnect() {
-    od_log_info("=== BLE CLIENT CONNECTED ===");
-    rebootFlag = 0;
-    updatemsdata();
-}
-
-void bleAppOnDisconnect(uint8_t reason) {
-    (void)reason;
-    od_log_info("=== BLE CLIENT DISCONNECTED ===");
-    od_log_info("Disconnect reason: %u", reason);
-    // Panel power on disconnect follows the ACTIVE-only-teardown invariant, so no
-    // logic change is needed here: a WARM (post-successful-refresh) panel SURVIVES
-    // disconnect and keeps its keep-alive window — a reconnect within the window
-    // pays only a warm re-acquire. Only a disconnect mid-transfer (still PWR_ACTIVE) tears the
-    // panel down, via the cleanup calls below (which no-op on power when WARM).
-    cleanupDirectWriteState(true);
-    cleanupPartialWriteOnDisconnect();   // 0x76 / pipe-partial session bookkeeping + panel power
-    resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect
-}
+// The BLE connect/disconnect application hooks that used to live here are gone
+// as of Phase 3. Both targets now service connect and disconnect from loop():
+// serviceBleEvents() does the connect-side work (rebootFlag, MSD refresh, link
+// tuning) and raises bleDisconnectCleanupPending, and
+// serviceBleDisconnectCleanup() owns the session teardown -- which is where the
+// mid-refresh and LAN-ownership guards live. nRF used to run that teardown
+// inline on the SoftDevice callback task with neither guard.
 
 #ifdef TARGET_ESP32
 // Tear NimBLE down before esp_restart(): esp_restart() resets the CPU but NOT the
