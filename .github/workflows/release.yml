@@ -3,186 +3,230 @@ name: Release Firmware
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and attach assets to (e.g. 2.25.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-upload:
-    name: Build & Upload Firmware
+  prepare:
+    name: Resolve tag & targets
     runs-on: ubuntu-latest
-
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      esp32: ${{ steps.targets.outputs.esp32 }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Install PlatformIO & Tools
+      - name: Resolve tag
+        id: tag
+        env:
+          # `release` and `workflow_dispatch` carry the tag in different places.
+          # Resolve it once here so no downstream job has to care which fired.
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
+          set -euo pipefail
+          if [[ -z "${TAG}" ]]; then
+            echo "::error::No tag could be resolved from the triggering event"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Building tag ${TAG}"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Load esp32 targets
+        id: targets
+        run: |
+          set -euo pipefail
+          esp32=$(jq -c '[.targets[] | select(.family == "esp32")]' .github/firmware-targets.json)
+          echo "esp32=${esp32}" >> "${GITHUB_OUTPUT}"
+          echo "esp32 targets: $(echo "${esp32}" | jq -r '[.[].env] | join(", ")')"
+
+  build-nrf52840:
+    name: Build nrf52840custom
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio-nrf52840custom-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-nrf52840custom-
+            ${{ runner.os }}-pio-
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # Versions are pinned so two builds of the same tag produce the same
+      # binaries. Unpinned, a toolchain release silently changes shipped
+      # firmware between a release and a later re-run of it.
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install platformio
-          pip install esptool
-          pip install --upgrade intelhex
-          pip install adafruit-nrfutil
-          curl -L https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py -o uf2conv.py
-          curl -L https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json -o uf2families.json
+          pip install platformio==6.1.19 adafruit-nrfutil==0.5.3.post16 intelhex==2.3.0
+
+      - name: Fetch uf2conv
+        env:
+          # Pinned to a commit: this runs in the release path, and `master` is
+          # someone else's branch.
+          UF2_REF: 90e9741f217f5a40c98ba74d663e408041037578
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/microsoft/uf2/${UF2_REF}/utils"
+          curl -fsSL "${base}/uf2conv.py" -o uf2conv.py
+          curl -fsSL "${base}/uf2families.json" -o uf2families.json
           chmod +x uf2conv.py
 
-      - name: Build & Package NRF Firmware
+      - name: Build & package
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pio run --environment nrf52840custom 
-          mkdir firmware_output
+          set -euo pipefail
+          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${TAG}\" -D SHA=${GITHUB_SHA}"
+          pio run --environment nrf52840custom
+          mkdir -p firmware_output
           cp .pio/build/nrf52840custom/firmware.hex firmware_output/NRF52840.hex
-          TAG_NAME=${{ github.event.release.tag_name }}
-          adafruit-nrfutil dfu genpkg --dev-type 0x0052 --application firmware_output/NRF52840.hex firmware_output/NRF52840.zip
-          python uf2conv.py firmware_output/NRF52840.hex --family 0xADA52840 --output firmware_output/NRF52840.uf2
+          adafruit-nrfutil dfu genpkg --dev-type 0x0052 \
+            --application firmware_output/NRF52840.hex firmware_output/NRF52840.zip
+          python uf2conv.py firmware_output/NRF52840.hex \
+            --family 0xADA52840 --output firmware_output/NRF52840.uf2
 
-      - name: Build & Package esp32-s3-N16R8 Firmware
-        run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-s3-N16R8
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-nrf52840custom
+          path: firmware_output/*
+          retention-days: 7
+          if-no-files-found: error
 
-      - name: Build & Package esp32-s3-N16R8-extuart Firmware
-        run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-s3-N16R8-extuart
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+  build-esp32:
+    name: Build ${{ matrix.target.env }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.prepare.outputs.esp32) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Build & Package esp32-s3-N8R8 Firmware
-        run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-s3-N8R8
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 8MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio-${{ matrix.target.env }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-${{ matrix.target.env }}-
+            ${{ runner.os }}-pio-
 
-      - name: Build & Package esp32-s3-N32R8 Firmware
-        run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-s3-N32R8
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 32MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
 
-      - name: Build & Package esp32-s3-N32R8-extuart Firmware
+      - name: Install toolchain
         run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-s3-N32R8-extuart
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 32MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install platformio==6.1.19 esptool==5.3.1
 
-      - name: Build & Package esp32-s3-E1004 Firmware
+      - name: Build ${{ matrix.target.env }}
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PIOENV: ${{ matrix.target.env }}
         run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-s3-E1004
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 32MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
-          
-      - name: Build & Package esp32-c6-N4 Firmware
-        run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-c6-N4
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-c6 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+          set -euo pipefail
+          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${TAG}\" -D SHA=${GITHUB_SHA}"
+          pio run --environment "${PIOENV}"
 
-      - name: Build & Package esp32-c3-N4 Firmware
+      - name: Package ${{ matrix.target.env }}
+        env:
+          PIOENV: ${{ matrix.target.env }}
+          CHIP: ${{ matrix.target.chip }}
+          FLASH_SIZE: ${{ matrix.target.flash_size }}
+          FLASH_MODE: ${{ matrix.target.flash_mode }}
+          FLASH_FREQ: ${{ matrix.target.flash_freq }}
+          BOOTLOADER_OFFSET: ${{ matrix.target.bootloader_offset }}
         run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-c3-N4
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-c6 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
-          
-      - name: Build & Package esp32-c3-N16 Firmware
-        run: |
-          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION=\"${{ github.ref_name }}\" -D SHA=$GITHUB_SHA"
-          pioenv=esp32-c3-N16
-          pio run --environment ${pioenv}
-          mkdir ${pioenv}
-          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin ${pioenv}/boot_app0.bin
-          cp .pio/build/${pioenv}/firmware.bin ${pioenv}/firmware.bin
-          cp .pio/build/${pioenv}/bootloader.bin ${pioenv}/bootloader.bin
-          cp .pio/build/${pioenv}/partitions.bin ${pioenv}/partitions.bin
-          cd ${pioenv}
-          esptool.py --chip esp32-c3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
-          cd ..
-          cp ${pioenv}/firmware.bin firmware_output/${pioenv}.bin
-          cp ${pioenv}/merged-firmware.bin firmware_output/${pioenv}_full.bin
+          set -euo pipefail
+          build=".pio/build/${PIOENV}"
+          boot_app0="${HOME}/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
 
-      - name: Upload Release Assets
-        uses: svenstaro/upload-release-action@v2
+          mkdir -p staging firmware_output
+          cp "${boot_app0}"            staging/boot_app0.bin
+          cp "${build}/firmware.bin"   staging/firmware.bin
+          cp "${build}/bootloader.bin" staging/bootloader.bin
+          cp "${build}/partitions.bin" staging/partitions.bin
+
+          # merge_bin bakes flash mode/freq/size into the image header and places
+          # the bootloader at a chip-specific offset — 0x1000 on the classic
+          # ESP32, 0x0000 on S3/C3/C6. Both come from firmware-targets.json.
+          ( cd staging && esptool.py --chip "${CHIP}" merge_bin \
+              -o merged-firmware.bin \
+              --flash_mode "${FLASH_MODE}" \
+              --flash_freq "${FLASH_FREQ}" \
+              --flash_size "${FLASH_SIZE}" \
+              "${BOOTLOADER_OFFSET}" bootloader.bin \
+              0x8000 partitions.bin \
+              0xe000 boot_app0.bin \
+              0x10000 firmware.bin )
+
+          cp staging/firmware.bin        "firmware_output/${PIOENV}.bin"
+          cp staging/merged-firmware.bin "firmware_output/${PIOENV}_full.bin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.target.env }}
+          path: firmware_output/*
+          retention-days: 7
+          if-no-files-found: error
+
+  upload:
+    name: Upload release assets
+    needs: [prepare, build-nrf52840, build-esp32]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # Depending on both build jobs means this runs only when every target
+      # succeeded, so a release can never end up with a partial asset set.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          merge-multiple: true
+          path: firmware_output
+
+      - name: List assets
+        run: ls -la firmware_output
+
+      - uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: firmware_output/*
-          tag: ${{ github.ref }}
+          tag: ${{ needs.prepare.outputs.tag }}
           file_glob: true
           overwrite: true
