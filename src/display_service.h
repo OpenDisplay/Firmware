@@ -77,6 +77,7 @@ bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
 extern volatile bool epdRefreshInProgress;
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
 void checkPartialWriteTimeout(void);
+void checkDirectWriteTimeout(void);
 void cleanupPartialWriteOnDisconnect(void);
 // Origin (see commandOrigin()) of the transport that opened the in-flight transfer.
 // A disconnect must only tear down a session its own transport owns.

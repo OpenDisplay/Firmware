@@ -69,7 +69,6 @@ extern bool displayPowerState;
 extern volatile uint8_t pwrmgmState;
 extern uint32_t pwrmgmOffDeadlineMs;
 extern volatile uint8_t pwrmgmLock;
-extern uint32_t directWriteStartTime;
 extern uint32_t directWriteCompressedReceived;
 extern uint8_t directWriteRefreshMode;
 extern uint32_t directWriteTotalBytes;
@@ -117,8 +116,18 @@ struct PartialStreamContext {
     uint32_t bytes_received;
     uint32_t bytes_written;
     uint8_t current_plane;
-    uint32_t start_time;
+    uint32_t last_activity_ms;
 };
+
+// Shared by the direct-write and partial-write watchdogs below: how long a
+// transfer may sit with no data chunk arriving before it's considered dead.
+// Measured from the LAST chunk, not from transfer start, so a slow-but-flowing
+// stream (weak BLE link) is never punished for its total duration.
+static const uint32_t TRANSFER_IDLE_TIMEOUT_MS = 60000UL;
+
+// Timestamp of the last direct-write (0x71/0x81) chunk accepted, or of START if
+// no chunk has arrived yet. Drives checkDirectWriteTimeout() below.
+static uint32_t directWriteLastChunkMs = 0;
 
 void pwrmgm(bool onoff);
 String getChipIdHex();
@@ -576,13 +585,24 @@ static PipeWriteState pipeState = {};
 static PipeReorderSlot pipeReorder[PIPE_REORDER_SLOTS];
 
 void checkPartialWriteTimeout(void) {
-    if (partialCtx.active && partialCtx.start_time > 0 &&
-        (millis() - partialCtx.start_time) > 900000UL) {
-        od_log_error("ERROR: Partial write timeout - cleaning up stuck state");
+    if (partialCtx.active && partialCtx.last_activity_ms > 0 &&
+        (millis() - partialCtx.last_activity_ms) > TRANSFER_IDLE_TIMEOUT_MS) {
+        od_log_error("ERROR: Partial write idle timeout - cleaning up stuck state");
         cleanup_partial_write_state();
         // A pipe-partial transfer shares partialCtx: also clear pipeState so a zombie
         // pipeState.active can't misroute later 0x0081 frames into the dead partialCtx.
         if (pipeState.partial) resetPipeWriteState();
+    }
+}
+
+void checkDirectWriteTimeout(void) {
+    if (!directWriteActive || directWriteLastChunkMs == 0) {
+        return;
+    }
+    uint32_t idleMs = millis() - directWriteLastChunkMs;
+    if (idleMs > TRANSFER_IDLE_TIMEOUT_MS) {
+        od_log_error("ERROR: Direct write idle timeout (%u ms since last chunk) - cleaning up stuck state", (unsigned)idleMs);
+        cleanupDirectWriteState(true);
     }
 }
 
@@ -1998,10 +2018,10 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteHeight = 0;
     directWriteTotalBytes = 0;
     directWriteRefreshMode = 0;
-    directWriteStartTime = 0;
+    directWriteLastChunkMs = 0;
     // Panel power acts only while a transfer/refresh is actually in flight
     // (PWR_ACTIVE). refreshDisplay==true is a terminal teardown (disconnect,
-    // 15-min timeout, mid-stream error) -> power fully off. refreshDisplay==false
+    // idle timeout, mid-stream error) -> power fully off. refreshDisplay==false
     // is the post-refresh path from directWriteFinishAndRefresh -> release to WARM
     // so keep-alive holds the rail for the next push.
     if (pwrmgmState == PWR_ACTIVE) {
@@ -2053,7 +2073,7 @@ static void directWriteComputeGeometry(bool compressed) {
 static void directWriteActivatePanel(void) {
     directWriteActive = true;
     directWriteBytesWritten = 0;
-    directWriteStartTime = millis();
+    directWriteLastChunkMs = millis();
     imageWriteLogStart(directWriteTotalBytes);
     // Full-frame write: acquire the session with the FULL init sequence. A warm
     // re-acquire skips the ~900 ms rail bring-up + bbepInitIO (replaces the old
@@ -2225,7 +2245,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
     partialCtx.expected_stream_size = expectedLogicalSize;
     partialCtx.plane_size = planeBytes;
     partialCtx.current_plane = 0xFF;
-    partialCtx.start_time = millis();
+    partialCtx.last_activity_ms = millis();
     imageWriteLogStart(expectedLogicalSize);
 
     partial_prepare_panel_ram();
@@ -2265,6 +2285,7 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
     }
     if (!directWriteActive || len == 0) return;
     if (!frameOwnsSession("0x0071")) return;
+    directWriteLastChunkMs = millis();
     imageWriteLogChunk(data, len);
     if (directWriteCompressed) {
         if (!handleDirectWriteCompressedData(data, len)) {
@@ -2351,7 +2372,7 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
 // {0xFF,endOpcode} on compressed-flush/completeness failure, then refreshes the
 // panel and emits {0x00,0x73}/{0x00,0x74}. Caller guarantees directWriteActive.
 static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t endOpcode) {
-    directWriteStartTime = 0;
+    directWriteLastChunkMs = 0;
     if (directWriteCompressed && !zlib_stream_to_direct_write(nullptr, 0, true)) {
         cleanupDirectWriteState(true);
         uint8_t errorResponse[] = {0xFF, endOpcode};
@@ -2742,7 +2763,7 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
         partialCtx.expected_stream_size = total_size;
         partialCtx.plane_size = planeBytes;
         partialCtx.current_plane = 0xFF;
-        partialCtx.start_time = millis();
+        partialCtx.last_activity_ms = millis();
     }
 
     // Respond BEFORE panel bring-up: slow panels (Spectra/ACeP-class init can take
@@ -2794,6 +2815,7 @@ void handlePipeWriteData(uint8_t* data, uint16_t len) {
     if (!pipeState.active || pipeState.error) return;   // silent discard
     if (len < 1) return;
     if (!frameOwnsSession("0x0081")) return;
+    directWriteLastChunkMs = millis();
     uint8_t  seq     = data[0];
     uint8_t* payload = data + 1;
     uint16_t plen    = (uint16_t)(len - 1);
@@ -3105,6 +3127,7 @@ static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
         }
     }
     partialCtx.bytes_received += len;
+    partialCtx.last_activity_ms = millis();
     if (partialCtx.compressed) return zlib_stream_to_partial_write(data, len, false);
     return partial_write_stream_bytes(data, len);
 }
