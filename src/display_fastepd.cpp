@@ -25,6 +25,21 @@ public:
     FASTEPDSTATE* state() { return &_state; }
 };
 
+// OpenDisplay panel_ic_type -> FastEPD native parallel panel id (-1 if not a
+// parallel panel). FastEPD owns the Inkplate bus/PMIC/IO-expanders internally.
+static int fastepd_parallel_panel(uint16_t panel_ic_type) {
+    switch (panel_ic_type) {
+        case OD_PANEL_IC_INKPLATE5V2_1280X720:   return BB_PANEL_INKPLATE5V2;
+        case OD_PANEL_IC_INKPLATE10_1200X825:    return BB_PANEL_INKPLATE10;
+        default:                                 return -1;
+    }
+}
+
+static bool fastepd_is_parallel(void) {
+    if (globalConfig.display_count < 1) return false;
+    return fastepd_parallel_panel(globalConfig.displays[0].panel_ic_type) >= 0;
+}
+
 static int8_t fastepd_aux_pin(uint8_t p, int8_t default_gpio) {
     if (p == 0 || p == 0xFF) {
         return default_gpio;
@@ -86,9 +101,12 @@ static uint32_t s_partial_plane_size;
 static uint32_t s_partial_bytes_written;
 static uint32_t s_partial_expected;
 
+// True when the framebuffer is 4bpp (16-level gray): ED103TC2 gray or GRAY16.
 static bool fastepd_panel_is_4gray(void) {
     if (globalConfig.display_count < 1) return false;
-    return globalConfig.displays[0].panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY;
+    const struct DisplayConfig& d = globalConfig.displays[0];
+    if (d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY) return true;
+    return d.color_scheme == OD_COLOR_SCHEME_GRAY16;
 }
 
 static size_t fb_byte_size(void) {
@@ -192,6 +210,27 @@ void fastepd_epaper_begin(void) {
     s_init_failed = false;
     initOrRestoreWireForOpenDisplay();
 
+    // Native parallel panels (Inkplate): initPanel() sets up the bus/PMIC and
+    // allocates the buffers. Guard on currentBuffer() — initPanel() re-allocs
+    // without freeing, so a warm re-init would leak; deInit() keeps the bus up.
+    int parallel = fastepd_parallel_panel(globalConfig.displays[0].panel_ic_type);
+    if (parallel >= 0) {
+        if (!g_epd.currentBuffer()) {
+            int prc = g_epd.initPanel(parallel);
+            if (prc != BBEP_SUCCESS || !g_epd.currentBuffer()) {
+                s_init_failed = true;
+                s_hw_initialized = false;
+                return;
+            }
+            g_epd.setMode(fastepd_panel_is_4gray() ? BB_MODE_4BPP : BB_MODE_1BPP);
+            g_epd.setPreviousMode((uint8_t)g_epd.getMode());
+        } else {
+            g_epd.einkPower(1);
+        }
+        s_hw_initialized = true;
+        return;
+    }
+
     int rc = g_epd.initIT8951((uint8_t)s_mosi, (uint8_t)s_miso, (uint8_t)s_sclk,
                               (uint8_t)s_cs, (uint8_t)s_busy, (uint8_t)s_rst,
                               (uint8_t)s_en, (uint8_t)s_ite_en);
@@ -219,9 +258,16 @@ void fastepd_epaper_begin(void) {
     s_hw_initialized = true;
 }
 
+// REFRESH_FULL: parallel panels flash-clear to flush ghosting; IT8951 clears
+// internally (ignores the mode) so it stays CLEAR_NONE.
+static void fastepd_full_refresh_impl(void) {
+    int clear = fastepd_is_parallel() ? CLEAR_FAST : CLEAR_NONE;
+    g_epd.fullUpdate(clear, true, NULL);
+}
+
 void fastepd_full_update(void) {
     if (!g_epd.currentBuffer()) return;
-    g_epd.fullUpdate(CLEAR_NONE, true, NULL);
+    fastepd_full_refresh_impl();
     g_epd.backupPlane();
 }
 
@@ -276,9 +322,16 @@ void fastepd_direct_write_chunk(const uint8_t* data, uint32_t len) {
 void fastepd_direct_refresh(int refresh_mode) {
     if (!g_epd.currentBuffer()) return;
     if (refresh_mode == 1) {
-        it8951_fullscreen_du();
+        // FAST: parallel 1bpp uses native diff; IT8951 uses its DU waveform.
+        // 4bpp has no fast path (fastUpdate is 1bpp-only) -> fall back to full.
+        if (fastepd_is_parallel()) {
+            if (fastepd_panel_is_4gray()) fastepd_full_refresh_impl();
+            else g_epd.fastUpdate(true);
+        } else {
+            it8951_fullscreen_du();
+        }
     } else {
-        g_epd.fullUpdate(CLEAR_NONE, true, NULL);
+        fastepd_full_refresh_impl();
     }
     g_epd.backupPlane();
 }
@@ -347,7 +400,11 @@ bool fastepd_partial_refresh(int refresh_mode) {
     if (!g_epd.currentBuffer()) return false;
 
     if (refresh_mode == 0) {
-        g_epd.fullUpdate(CLEAR_NONE, true, NULL);
+        fastepd_full_refresh_impl();
+    } else if (fastepd_is_parallel()) {
+        // Rect already blitted into the framebuffer; 4bpp has no fast path.
+        if (fastepd_panel_is_4gray()) fastepd_full_refresh_impl();
+        else g_epd.fastUpdate(true);
     } else {
         // Region rect is still applied to the framebuffer via blit; refresh is
         // full-screen DU (IT8951 region DU had persistent edge alignment issues).

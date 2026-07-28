@@ -693,8 +693,13 @@ bool fastepd_driver_used(void) {
 #else
     if (globalConfig.display_count < 1) return false;
     const struct DisplayConfig& d = globalConfig.displays[0];
-    if (d.panel_ic_type != OD_PANEL_IC_ED103TC2_1872X1404 &&
-        d.panel_ic_type != OD_PANEL_IC_ED103TC2_1872X1404_4GRAY) return false;
+    // FastEPD IT8951 (SPI) path: E Ink ED103TC2 (Seeed reTerminal).
+    const bool it8951 = (d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404 ||
+                         d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY);
+    // FastEPD native parallel path: Soldered Inkplate 5V2 / 10.
+    const bool inkplate = (d.panel_ic_type == OD_PANEL_IC_INKPLATE5V2_1280X720 ||
+                           d.panel_ic_type == OD_PANEL_IC_INKPLATE10_1200X825);
+    if (!it8951 && !inkplate) return false;
     if (d.display_technology != 0 && d.display_technology != 1) return false;
     return true;
 #endif
@@ -1536,7 +1541,7 @@ void initDisplay(){
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (fastepd_driver_used()) {
         pwrmgm(true);
-        writeSerial("Display: FastEPD IT8951 (panel_ic " + String(globalConfig.displays[0].panel_ic_type) + ", " +
+        writeSerial("Display: FastEPD (panel_ic " + String(globalConfig.displays[0].panel_ic_type) + ", " +
                     String(globalConfig.displays[0].pixel_width) + "x" + String(globalConfig.displays[0].pixel_height) + ", " +
                     String(getBitsPerPixel()) + " bpp)", true);
         fastepd_epaper_begin();
@@ -1632,6 +1637,7 @@ int getBitsPerPixel() {
 #endif
     if (globalConfig.displays[0].color_scheme == OD_COLOR_SCHEME_BWGBRY ||
         globalConfig.displays[0].color_scheme == OD_COLOR_SCHEME_BWGBRY_SPLIT) return 4;
+    if (globalConfig.displays[0].color_scheme == OD_COLOR_SCHEME_GRAY16) return 4;
     if (globalConfig.displays[0].color_scheme == OD_COLOR_SCHEME_BWRY) return 2;
     if (globalConfig.displays[0].color_scheme == OD_COLOR_SCHEME_GRAY4) return 2;
     return 1;
