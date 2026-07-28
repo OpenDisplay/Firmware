@@ -37,11 +37,12 @@ struct ImageData {
 // violation, not an expected condition. Indexing by seq % PIPE_REORDER_SLOTS is
 // collision-free because any live window spans <=W < PIPE_REORDER_SLOTS seqs.
 //
-// PIPE_SMALL_DRAM_WINDOW is set ONLY by the classic-ESP32 env:esp32-N4 (esp32dev,
-// 320KB RAM). Its static DRAM is far tighter than the S3/C3/C6 parts, so the full
-// 33-slot x 248 B queue (~8.3KB .bss) overflows dram0_0_seg by ~672 B at link.
-// Cap that env to W=16 / 17 slots (~4.2KB); 17 = W+1 keeps seq%SLOTS collision-free
-// (a live window spans <=16 < 17). All other ESP32 envs keep the full 32-deep window.
+// PIPE_SMALL_DRAM_WINDOW is set by classic-ESP32 envs esp32-N4 (esp32dev) and
+// esp32-wrover-e-N4R8 (esp-wrover-kit). Their static DRAM is far tighter than the
+// S3/C3/C6 parts, so the full 33-slot x 248 B queue (~8.3KB .bss) overflows
+// dram0_0_seg by ~672 B at link. Cap those envs to W=16 / 17 slots (~4.2KB);
+// 17 = W+1 keeps seq%SLOTS collision-free (a live window spans <=16 < 17).
+// All other ESP32 envs keep the full 32-deep window.
 #ifdef PIPE_SMALL_DRAM_WINDOW
 #define PIPE_REORDER_SLOTS      17
 #define PIPE_MAX_W      16

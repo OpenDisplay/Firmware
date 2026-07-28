@@ -389,7 +389,8 @@ enum ICType {
     OD_IC_TYPE_NRF52811              = 5, /**< @doc "nRF52811-based boards" */
     OD_IC_TYPE_EFR32BG22C222F352GM40 = 6, /**< @doc "Silicon Labs EFR32BG22 boards" */
     OD_IC_TYPE_NRF54L15              = 7, /**< @doc "Seeed XIAO nRF54L15 (Zephyr)" */
-    OD_IC_TYPE_NRF54LM20             = 8  /**< @doc "Seeed XIAO nRF54LM20A (Zephyr)" */
+    OD_IC_TYPE_NRF54LM20             = 8, /**< @doc "Seeed XIAO nRF54LM20A (Zephyr)" */
+    OD_IC_TYPE_ESP32                 = 9  /**< @doc "Classic ESP32-based boards" */
 };
 
 /** @enum ManufacturerId  @width 2  @doc "Device manufacturer (ManufacturerData.manufacturer_id).
@@ -400,7 +401,8 @@ enum ManufacturerId {
     OD_MANUFACTURER_SEEED       = 1, /**< @doc "Seeed Studio" */
     OD_MANUFACTURER_WAVESHARE   = 2, /**< @doc "Waveshare Electronics" */
     OD_MANUFACTURER_SOL         = 3, /**< @doc "SOL" */
-    OD_MANUFACTURER_OPENDISPLAY = 4  /**< @doc "OpenDisplay (free giveaways only)" */
+    OD_MANUFACTURER_OPENDISPLAY = 4, /**< @doc "OpenDisplay (free giveaways only)" */
+    OD_MANUFACTURER_SOLDERED    = 5  /**< @doc "Soldered Electronics" */
 };
 
 /* SystemConfig.communication_modes @bits CommunicationModes (bits 3-7 reserved). */
@@ -671,7 +673,9 @@ enum PanelIC {
     OD_PANEL_IC_SSD1619_022_LITE_BW      = 1029, /**< @doc "SSD1619 M3 Lite 2.2\" 250x128 B/W" */
     OD_PANEL_IC_SSD1619_022_LITE_BWR     = 1030, /**< @doc "SSD1619 M3 Lite 2.2\" 250x128 B/W/R" */
     OD_PANEL_IC_ED103TC2_1872X1404       = 3000, /**< @doc "E Ink ED103TC2 + IT8951 (10.3\", 1872x1404, 1bpp; FastEPD IT8951 path, values 3000+)" */
-    OD_PANEL_IC_ED103TC2_1872X1404_4GRAY = 3001 /**< @doc "same panel as 3000; 4bpp (16-level gray via FastEPD)" */
+    OD_PANEL_IC_ED103TC2_1872X1404_4GRAY = 3001, /**< @doc "same panel as 3000; 4bpp (16-level gray via FastEPD)" */
+    OD_PANEL_IC_INKPLATE5V2_1280X720     = 3002, /**< @doc "Soldered Inkplate 5 V2 (ED050WROW, 1280x720, 1bpp; FastEPD native parallel path)" */
+    OD_PANEL_IC_INKPLATE10_1200X825      = 3003  /**< @doc "Soldered Inkplate 10 (ED097TC2, 1200x825, 1bpp; FastEPD native parallel path)" */
 };
 
 /* DisplayConfig.transmission_modes @bits TransmissionModes (bits 5-6 reserved --

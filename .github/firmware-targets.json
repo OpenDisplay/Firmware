@@ -110,6 +110,15 @@
       "flash_mode": "dio",
       "flash_freq": "40m",
       "bootloader_offset": "0x1000"
+    },
+    {
+      "env": "esp32-wrover-e-N4R8",
+      "family": "esp32",
+      "chip": "esp32",
+      "flash_size": "4MB",
+      "flash_mode": "dio",
+      "flash_freq": "40m",
+      "bootloader_offset": "0x1000"
     }
   ]
 }

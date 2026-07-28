@@ -559,7 +559,7 @@ void fullSetupAfterConnection() {
 #endif
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (globalConfig.display_count > 0 && fastepd_driver_used()) {
-        od_log_info("Panel: FastEPD ED103/IT8951 (bb_epaper not used)");
+        od_log_info("Panel: FastEPD (bb_epaper not used)");
         od_log_info("=== Full setup completed ===");
         return;
     }
