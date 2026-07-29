@@ -34,11 +34,14 @@ static volatile uint8_t s_rxTail = 0;
 //
 // Logged at ARRIVAL, on the stack callback task, so the timestamp is when the radio
 // delivered the frame rather than when loop() got to it -- that ordering is the
-// point of the line, and it cannot be had from the consumer side. The cost is real
-// and deliberate: od_log ends in a blocking serial write (~9 ms for a full hex line
-// at 115200), so this delays the NimBLE host / SoftDevice callback task. It is
-// compiled out entirely at the default INFO level; only the -debug envs pay it, and
-// only for frames the quiet predicate does not suppress.
+// point of the line, and it cannot be had from the consumer side. The cost used to
+// be a blocking serial write (~9 ms for a full hex line at 115200) that delayed this
+// callback task; as of the od_log rewrite it is a formatting cost plus a
+// non-blocking write attempt, because od_log gives any task other than loop() a zero
+// wait budget and discards the record rather than waiting above loop()'s priority.
+// A frame's line can therefore be dropped under burst -- see the delivery contract
+// in od_log.h. It is compiled out entirely at the default INFO level; only the
+// -debug envs pay it, and only for frames the quiet predicate does not suppress.
 //
 // Depth is the PRE-push count, matching logTxFrame()'s pre-enqueue depth, so a
 // healthy path reads [BLE][Q:0] and a rising Q means arrivals are outrunning

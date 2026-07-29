@@ -89,7 +89,25 @@ void setup() {
     od_log_init(&LogSerialPort);
     #elif !defined(DISABLE_USB_SERIAL)
     od_log_init(&Serial);
+    #ifndef TARGET_ESP32
+    // nRF only. With DTR low the CDC TX FIFO is overwritable, so its free-space
+    // query reads 0 while a write would still succeed -- without this the logger
+    // would count a drop for every line on an unattended tag and hand the first
+    // terminal to attach a meaningless six-figure total. operator bool() is
+    // tud_cdc_n_connected(), i.e. exactly the condition that used to trap
+    // Adafruit_USBD_CDC::write().
+    //
+    // Deliberately NOT installed on ESP32: HWCDC::isCDC_Connected()'s SOF watchdog
+    // is documented to flap on a healthy link, so a hook there would silently
+    // discard good output.
+    od_log_set_ready_hook([]() -> bool { return (bool)Serial; });
     #endif
+    #endif
+    // Immediately after od_log_init(), so the boot lines below are not emitted at a
+    // zero budget. setup() and loop() share a task on both targets (nRF's loop_task
+    // calls setup() then loops; the ESP32 loopTask does the same), so capturing here
+    // identifies the right one.
+    od_log_set_loop_task(xTaskGetCurrentTaskHandle());
     od_log_info("=== FIRMWARE INFO ===");
     uint8_t fwMajor = getFirmwareMajor();
     uint8_t fwMinor = getFirmwareMinor();
