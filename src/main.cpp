@@ -701,14 +701,26 @@ void idleDelay(uint32_t delayMs) {
         // idleDelay would otherwise hold queued ACKs for its full duration.
         // Draining TX is safe here because it only notifies; it dispatches nothing.
         serviceBleTx();
-        // RX is deliberately NOT drained here -- return to loop() and let
-        // serviceBleRx() dispatch at top level instead. Dispatching inside
-        // idleDelay would make command handlers reentrant the moment anything
-        // calls idleDelay from a handler, corrupting multi-frame transfer state.
-        // Returning early also caps command latency at one CHECK_INTERVAL_MS
-        // rather than the caller's full delay, which is what makes nRF's move to
+        // RX and transport events are deliberately NOT serviced here -- return to
+        // loop() and let serviceBleEvents()/serviceBleRx() handle them at top
+        // level. Dispatching RX inside idleDelay would make command handlers
+        // reentrant the moment anything calls idleDelay from a handler, corrupting
+        // multi-frame transfer state; consuming events here would move the single
+        // consumer out of loop() and break the ordering serviceBleEvents() relies
+        // on. Returning early also caps latency at one CHECK_INTERVAL_MS rather
+        // than the caller's full delay, which is what makes nRF's move to
         // loop()-side dispatch viable: its idle waits are 500 ms and up.
-        if (bleRxQueuePending()) return;
+        //
+        // This break set answers "did work appear while we were parked?", which is
+        // NOT the question workInFlight answers ("is there work?"). A term belongs
+        // here only if (i) it can go false->true asynchronously, on a task other
+        // than loop(), and (ii) idleDelay cannot service that work itself. RX and
+        // transport events are the only two that qualify. bleTxQueuePending() is
+        // excluded because serviceBleTx() already runs every chunk above;
+        // epdRefreshInProgress, the transfer-state flags, s_advertisingRestartPending
+        // and wifiLanSession are excluded because only loop() itself raises them,
+        // so none can change while loop() is sitting inside this function.
+        if (bleRxQueuePending() || ble.eventPending()) return;
         uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
         delay(chunkDelay);
         remainingDelay -= chunkDelay;
