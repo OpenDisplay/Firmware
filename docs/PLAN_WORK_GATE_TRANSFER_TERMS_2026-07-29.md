@@ -1,4 +1,4 @@
-# Plan — terminate orphaned transfers, then teach `workInFlight` about them
+# Plan — orphaned transfer state: heal it, don't idle on it
 
 **Date:** 2026-07-29
 **Branch:** `fix/loop-hang-3`
@@ -7,195 +7,84 @@
 Part (b) of the three-part fix for the ~40 s post-disconnect park. Parts (a) and
 (c) landed in `4d37d43`.
 
-**Revision note.** The first draft of this plan proposed a single change: amend
-`transferActive()` to exclude `pipeState.error` and add it to `workInFlight`.
-Review found that unsafe — the 15-minute direct-write watchdog orphans full-PIPE
-state in a form the exclusion does not catch, so the amended predicate would
-still latch true forever. The work therefore splits into two commits, the first
-of which is a real bug fix that stands on its own.
+### Revision history
+
+This plan has been rewritten twice under review, and both rewrites changed the
+conclusion rather than the wording. Recorded because the reasoning matters more
+than the diff.
+
+**Draft 1** — amend `transferActive()` to exclude `pipeState.error`, add it and
+`ble.eventPending()` to `workInFlight`. *Refuted:* the 15-minute direct-write
+watchdog orphans full-PIPE state in a form the exclusion does not catch, so the
+predicate would still latch true forever. Split into two commits, the first a
+standalone bug fix.
+
+**Draft 2** — Commit 1 (the watchdog fix) landed as `77c2226`; Commit 2 kept the
+gate terms. *Refuted:* `transferActive()` in the gate is redundant in every state
+where the transfer can still progress, and actively harmful in the states where
+it cannot — it converts a low-power park into up to fifteen minutes of full-CPU
+spinning. The invariant it was meant to enforce is better enforced by healing the
+orphan than by refusing to sleep on it.
+
+**This draft** keeps `ble.eventPending()`, drops `transferActive()` from the gate,
+and replaces it with a self-healing assertion in the watchdog.
 
 ---
 
-## Commit 1 — `fix(pipe): terminate the pipe session when the transfer watchdog fires`
+## Commit 1 — landed as `77c2226`
 
-### The bug (present today, independent of any gate change)
+`fix(pipe): terminate the pipe session when the transfer watchdog fires`
 
-`main.cpp` runs two transfer watchdogs:
+The direct-write watchdog released the panel but left `pipeState.active` set with
+`pipeState.error` false. Because the `0x0081` handler gates on `pipeState` alone,
+a timed-out full PIPE kept accepting frames into a torn-down session — and since
+the cleanup zeroes the byte counters, the uncompressed auto-complete test read
+`0 >= 0` and drove `bbepRefresh()` + `waitforrefresh(60)` at an unpowered panel.
 
-```cpp
-if (directWriteActive && directWriteStartTime > 0) {
-    if (directWriteDuration > 900000UL) {      // 15 min
-        cleanupDirectWriteState(true);          // clears directWriteActive ONLY
-    }
-}
-checkPartialWriteTimeout();                     // resets pipe only if pipeState.partial
-```
-
-`cleanupDirectWriteState()` contains no reference to `pipeState`. A **full**
-(non-partial) PIPE transfer whose client stalls past 15 minutes therefore lands
-in a split state:
-
-| Flag | After the watchdog |
-|---|---|
-| `directWriteActive` | `false` — panel torn down, rail cut, touch resumed |
-| `partialCtx.active` | `false` |
-| `pipeState.active` | **`true`** |
-| `pipeState.error` | **`false`** |
-
-The pipe half survives its own hardware half. The `0x0081` DATA handler gates on
-`pipeState`, not on `directWriteActive` (`if (!pipeState.active || pipeState.error) return;`),
-so the session keeps accepting frames after its panel is gone. The only exits are
-a replacement `0x0080` START, an END, or a disconnect.
-
-**The consequence is worse than lost frames.** `cleanupDirectWriteState()` zeroes
-`directWriteTotalBytes`, `directWriteBytesWritten` and `directWriteCompressed`.
-That is precisely the state the auto-complete guard already warns about — the
-existing comment at `display_service.cpp:2820-2824` reads:
-
-> MUST be gated on `!partial`: a partial transfer never touches `directWrite*`
-> (both are 0), so `0>=0` would false-fire a FULL refresh on the very first frame
-
-The watchdog manufactures that same zeroed state for a **full** transfer, where
-the `!pipeState.partial` guard does not apply. So on an *uncompressed* full pipe,
-the next `0x0081` frame trips `directWriteBytesWritten >= directWriteTotalBytes`
-as `0 >= 0` and calls `directWriteFinishAndRefresh()`, which issues
-`bbepRefresh()` + `waitforrefresh(60)` **against an unpowered panel with no
-`epdSessionAcquire()`**. If the floating BUSY line reads busy, that spins
-`delay(10)` for up to **60 seconds inside `loop()`** — the exact class of stall
-this branch exists to remove.
-
-On a *compressed* full pipe, auto-complete is gated off, so every frame is
-accepted and ACKed with its payload silently discarded, and the eventual `0x0082`
-END runs the same bogus refresh — reporting success for an image that was never
-written.
-
-Scope: this only bites while the owning client stays connected across the 15
-minutes, since `serviceBleDisconnectCleanup()` resets pipe state on disconnect.
-
-The asymmetry exists because the two watchdogs were written in different files:
-the partial one sits in `display_service.cpp` beside the state it must clear, the
-direct one in `main.cpp`, where reaching that state means going through an
-accessor rather than seeing it inline. Nothing prevented it — see the correction
-under *The change* — but nothing prompted it either.
-
-### The change
-
-**Correction to an earlier draft:** this plan previously claimed the fix *had* to
-move into `display_service.cpp` because `pipeState` is file-static and
-unreachable from `main.cpp`. That is wrong. `display_service.h` already declares
-both `resetPipeWriteState()` (:64) and `pipeWriteActive()` (:66), and `main.cpp`
-already calls the former at :404. The minimal fix is two lines in `loop()`:
-
-```c
-cleanupDirectWriteState(true);
-if (pipeWriteActive()) resetPipeWriteState();
-```
-
-Moving the block is therefore a **cohesion** choice, not a necessity — the two
-watchdogs belong together beside the state they terminate, and their separation
-is why one of them forgot the pipe. Recommended, but the commit message must not
-claim it was required.
-
-**`display_service.h`** — replace the `checkPartialWriteTimeout()` declaration:
-
-```c
-// Both transfer watchdogs, together: the direct-write timeout must terminate the
-// enclosing pipe session, and keeping the two apart is exactly how it came to
-// tear down the panel and leave that session running.
-void checkTransferTimeouts(void);
-```
-
-**`display_service.cpp`** — the direct block moves in, and gains the pipe
-teardown:
-
-```c
-void checkTransferTimeouts(void) {
-    if (directWriteActive && directWriteStartTime > 0 &&
-        (millis() - directWriteStartTime) > TRANSFER_WATCHDOG_MS) {
-        od_log_error("ERROR: Direct write timeout (%u ms) - cleaning up stuck state",
-                     (unsigned)(millis() - directWriteStartTime));
-        cleanupDirectWriteState(true);
-        // A full PIPE owns this direct-write session as its hardware half. Reset
-        // the pipe with it: leaving pipeState.active set orphans a transfer with
-        // no panel, and the 0x0081 handler gates on pipeState, so it would keep
-        // accepting frames into a torn-down session. Deliberately NOT folded into
-        // cleanupDirectWriteState(), which normal END also calls and where the
-        // pipe reset is already sequenced separately.
-        if (pipeState.active) resetPipeWriteState();
-    }
-    checkPartialWriteTimeout();   // unchanged; already resets pipe when partial
-}
-```
-
-**`main.cpp`** — the two calls collapse to one; the 15-minute literal and the log
-line move out with the block.
-
-### Why reset rather than NACK
-
-Disconnect cleanup already resets rather than notifies, and after 15 minutes of
-silence there is rarely a client to tell. Reset also cannot fail on a dead link,
-where `sendPipeNack()` would queue a response that `serviceBleTx()` discards.
-
-### Test
-
-- **Full PIPE watchdog, uncompressed.** Start an *uncompressed* full PIPE
-  transfer, send a few frames, stop, **stay connected**. After 15 minutes assert:
-  the timeout logs once, the panel powers down, and a subsequent `0x0081` frame is
-  rejected rather than processed. Before this commit that frame trips the `0>=0`
-  auto-complete and drives `bbepRefresh()` at a dead panel — run it once against
-  unfixed code to confirm the test has teeth, and watch for the up-to-60 s
-  `waitforrefresh()` stall.
-- **Full PIPE watchdog, compressed.** Same, but assert the eventual `0x0082` END
-  does not report success for an image that was never written.
-- **Pipe-partial watchdog.** Unchanged behaviour; regression only.
-- **Normal END.** Confirm the reordered call site did not disturb the ordinary
-  completion path.
-
-### Why it stands alone
-
-It fixes a live defect — frames processed into a torn-down session — with no
-dependency on the gate change. It is also the prerequisite for Commit 2.
+Both watchdogs now live in `display_service.cpp` behind `checkTransferTimeouts()`
+and share `TRANSFER_WATCHDOG_MS`. Full reasoning is in the commit message; it is
+not repeated here.
 
 ---
 
-## Commit 2 — `fix(ble): count unconsumed events and live transfers as work`
+## Commit 2 (revised) — `fix(loop): heal orphaned transfer state; count pending events as work`
 
-### What is still wrong after `4d37d43`
+### Why `transferActive()` does not belong in the gate
 
-```cpp
-const bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
-                          ble.isConnected() ||
-                          s_advertisingRestartPending ||
-                          epdRefreshInProgress ||
-                          wifiLanSession;
-```
+Draft 2 argued the gate was "wrong about what constitutes work" because a
+half-finished transfer with the panel powered was not counted. That framing does
+not survive contact with the state space. **A transfer whose transport is gone
+cannot progress** — frames arrive only over BLE or LAN — so enumerate every state
+in which `transferActive()` would be true:
 
-Two blind spots: an event raised after `serviceBleEvents()` ran in this pass, and
-a live transfer with the panel powered. Consequence today is bounded — one
-`CHECK_INTERVAL_MS` (~100 ms) rather than the original 40 s, because `4d37d43`
-makes the wait interruptible — but the gate is still wrong about what constitutes
-work, and it governs ESP32 deep sleep.
+| State | What the gate does today | What the term would add |
+|---|---|---|
+| Owner connected, transfer live | `ble.isConnected()` / `wifiLanSession` already true | Nothing — redundant |
+| Owner disconnecting | `serviceBleDisconnectCleanup()` runs at `main.cpp:619`, **before** the gate at :665, and resets all three flags. Deferral needs `epdRefreshInProgress`, refusal needs `ownerStillUp` — both already gate terms | Nothing — redundant |
+| Orphaned: state set, transport gone | Gate false → `platformIdle()` → park (nRF) or deep sleep (ESP32) | Holds the gate until the 15-minute watchdog |
+
+The third row is the only distinct behaviour, and it is a regression:
+
+- `workInFlight` true takes the `delay(1)` path. On nRF that is **one tick**,
+  below `configEXPECTED_IDLE_TIME_BEFORE_SLEEP` (2), and the core's
+  `vApplicationIdleHook` is an empty weak stub — so it does not sleep. The idle
+  task spins at 64 MHz and the loop body re-runs ~1000×/s.
+- The watchdog measures from START, so the spin lasts *15 minutes minus however
+  long the transfer already ran*.
+- Cost per event: **~0.9–1.5 mAh** on nRF52840 (≈1.5–2 days of CR2450 standby),
+  **~6–12 mAh** on an ESP32-S3 tag with WiFi+BLE up.
+- Worse, it removes an existing recovery. On battery ESP32 an orphan is
+  *self-healing today*, because deep sleep is a reboot and all transfer state is
+  plain RAM. The term converts a self-healing state into a fifteen-minute awake
+  one.
+
+So the term buys invariant-hardening at the price of the only states it applies
+to. The right response to "this state should not exist" is to remove the state,
+not to refuse to sleep while it exists.
 
 ### The change
 
-**`display_service.cpp`** — `transferActive()` stops reporting dead sessions:
-
-```c
-bool transferActive(void) {
-    // pipeState.error means the session is dead but deliberately remembered:
-    // sendPipeNack() keeps pipeState so the reported ACK position stays
-    // consistent for the client, and the panel has already been released. That
-    // is bookkeeping, not work. A genuinely live transfer always has
-    // directWriteActive (full pipe/direct START -> directWriteActivatePanel) or
-    // partialCtx.active (0x76 / pipe-partial START) set, so excluding the errored
-    // case never under-reports -- given Commit 1, which stops the watchdog
-    // leaving a non-errored pipe behind with neither hardware flag set.
-    return directWriteActive || partialCtx.active ||
-           (pipeState.active && !pipeState.error);
-}
-```
-
-**`main.cpp`** — two terms:
+**1. `main.cpp` — one gate term, not two:**
 
 ```diff
  const bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
@@ -203,114 +92,144 @@ bool transferActive(void) {
 +                          ble.eventPending() ||
                            s_advertisingRestartPending ||
                            epdRefreshInProgress ||
-+                          transferActive() ||
                            wifiLanSession;
 ```
 
-### Why amend `transferActive()` rather than add a gate-only predicate
+`eventPending()` closes the real gap: an event raised after `serviceBleEvents()`
+ran in this pass is otherwise invisible until the next one, and the pass is about
+to park. This defers idle by exactly one pass, deliberately.
 
-It has four other callers — `touch_input.cpp:587`, `wifi_service.cpp:697`, and
-two log-quieting predicates at `display_service.cpp:1898-1903`. Each asks "is a
-transfer in flight?" and each is currently told "yes" by a session that is dead
-and whose panel has already been released: touch polling stays suspended, WiFi
-roam scans stay blocked, and frames the session is silently discarding are
-suppressed from the log rather than shown. Reviewed individually, none of the
-four is protected by the current behaviour. Amending fixes the meaning once; a
-separate narrow predicate would fork the concept and leave the misuse in place.
+**2. `display_service.cpp` — heal the orphan in `checkTransferTimeouts()`:**
+
+```c
+// Commit 77c2226 proved a live pipe session always has a hardware half, and
+// closed the one path that broke it. This asserts it at runtime rather than
+// resting on the proof: any future path that recreates the orphan gets one log
+// line and a reset, instead of a session that silently accepts 0x0081 frames
+// into torn-down state. Deliberately not a gate term -- a transfer whose
+// transport is gone cannot progress, so refusing to sleep on it burns power for
+// work that will never happen.
+if (pipeState.active && !pipeState.error && !directWriteActive && !partialCtx.active) {
+    od_log_error("ERROR: orphaned pipe session (no hardware half) - resetting");
+    resetPipeWriteState();
+}
+```
+
+**3. `display_service.cpp` — drop the `> 0` timestamp guards:**
+
+```c
+if (directWriteActive && directWriteStartTime > 0)          // -> drop "&& ... > 0"
+if (partialCtx.active && partialCtx.start_time > 0 && ...)  // -> drop "&& ... > 0"
+```
+
+The `active` flag is set in straight-line code eleven lines from the `millis()`
+stamp with no return between, so it already implies a valid timestamp. The guard
+is not merely redundant: a transfer starting in the ~1 ms window where `millis()`
+wraps through zero has its watchdog disabled **permanently**. Odds are of order
+1 in 10⁹ transfers — this is a free removal of a reasoning burden, not a live
+risk, and it matters because item 2 makes the watchdog the backstop for the
+orphan assertion.
+
+**4. Split the two questions `transferActive()` currently answers.** It has five
+callers asking two different things:
+
+| Caller | Question | Wants |
+|---|---|---|
+| `workInFlight` (proposed) | is live work in flight? | — *not adding it, see above* |
+| `touch_input.cpp:587` | may I poll GT911 over I2C? | live work only |
+| `wifi_service.cpp:697` | may I run a full-channel scan? | live work only |
+| `display_service.cpp:1921,1925` | would logging this frame spam? | **any** stream, including a dead one still receiving frames |
+
+Amend `transferActive()` to `directWriteActive || partialCtx.active ||
+(pipeState.active && !pipeState.error)` for the first three, and give the
+log-quieting predicates their own broader test that keeps the errored case quiet.
+
+Without the split, a fatal NACK un-suppresses every remaining in-flight `0x0081`
+frame — up to a full window from a compliant client, unbounded from one that
+ignores the NACK until END — at ~90 frames/s, two log lines each
+(`bleRxQueuePush()` arrival + dispatch banner), evicting the NACK itself from the
+ring. That is the opposite of the diagnostic improvement Draft 2 claimed.
+
+Note also that `imageWriteLogQuietFrame()` is called from `bleRxQueuePush()`,
+which runs on the **callback task** — so `transferActive()` is already read
+cross-task. Keeping the logging predicate separate avoids widening that read to
+`pipeState.error`.
+
+**5. Optional, same commit or its own:** make `takeConnectedEvent()` /
+`takeDisconnectedEvent()` atomic read-and-clear (`__atomic_exchange_n`). The
+current check-then-clear can lose a whole event, not just its payload — and a
+lost disconnect means no `s_disconnectCleanupPending` *and* no
+`s_advertisingRestartPending`, so the radio never re-arms. Instruction-scale
+window, but a one-line fix.
 
 ### Proof obligations
 
 | Term | Set by | Cleared by | Cannot latch because |
 |---|---|---|---|
-| `ble.eventPending()` | stack callbacks | `take*Event()` at the next loop top | Survives at most to the next pass; the peek clears nothing, the take always runs |
-| `directWriteActive` | `directWriteActivatePanel()` only | `cleanupDirectWriteState()` only — END, NACK, replacement START, refresh completion/failure, disconnect cleanup, watchdog | Single set site, single clear site, watchdog backstop |
-| `partialCtx.active` | `0x76` START, pipe-partial START | whole-struct `memset` in `cleanup_partial_write_state()` | Watchdog backstop via `checkPartialWriteTimeout()` |
-| `pipeState.active && !pipeState.error` | pipe START only | `resetPipeWriteState()` — END, auto-complete, replacement START, disconnect, **and the watchdog as of Commit 1**; or `pipeState.error` going true | Commit 1 closes the only path that produced a non-errored orphan |
+| `ble.eventPending()` | stack callbacks | `take*Event()` at the next loop top | The peek clears nothing; the take always runs. Continuous new events are ongoing work, not a latch |
+| orphan assertion | n/a — it is the clear | itself | Runs every pass, unconditionally |
 
-### ESP32 deep sleep — corrected claim
+No transfer flag enters the gate, so no transfer flag can veto sleep. That is the
+point of this revision.
 
-The first draft asserted the new terms cannot change sleep *duration* because
-neither touches `lastActivityMs`. That was too strong: `workInFlight` bypasses
-`platformIdle()` entirely, so any stuck term is an independent sleep veto
-regardless of the quiet window.
+### ESP32 deep sleep
 
-The accurate claim: **for normal, fully-observed transport teardown**, sleep
-behaviour is unchanged, because a live transfer already held the device awake via
-`ble.isConnected()` (BLE-owned) or `wifiLanSession` (LAN-owned), and both go
-false at the same point the new term does. What the change does add is a veto on
-*stale* transfer state — which is precisely why Commit 1 must land first, and why
-the "cleanup is dropped, not deferred" residual below is now a safety
-consideration rather than documentation debt.
-
-### The `workInFlight` comment
-
-The existing text — *"Every term is transient and most are cleared earlier in
-this same pass"* — becomes false and must be rewritten. It must not be replaced
-with "`lastActivityMs` is the sole authority on sleep", which is also false while
-`workInFlight` short-circuits `platformIdle()`. State instead: every term is
-bounded either within the pass or by a terminal transfer path with a watchdog
-backstop, and none is a sticky "ever happened" flag.
+`ble.eventPending()` defers `platformIdle()` by one pass when an event lands
+after `serviceBleEvents()`. That is the term's purpose and its entire effect.
+Nothing else changes: no transfer state reaches the gate, `lastActivityMs` still
+supplies the quiet window, and a deep-sleep wake is a full reboot, so no state
+here survives it.
 
 ### Test
 
-1. **Mid-transfer disconnect.** `sleep_timeout_ms` ≈ 40 s. Connect, authenticate,
-   start a PIPE transfer, send enough frames to power the panel, kill the link
-   before END. Assert `Disconnect reason:` within one pass, transfer state
-   cleared, panel down, advertising back up, no departed-client frame dispatched
-   afterwards. Repeat for full PIPE, pipe-partial, legacy partial.
-   *Timing caveat:* do not assert a hard sub-50 ms bound. A disconnect landing
-   during a synchronous refresh cannot be serviced until `waitforrefresh()`
-   returns; the assertion is "one pass after the handler returns", not wall-clock.
-2. **The latch, fault-injected.** The obvious test — fatal NACK then disconnect —
-   is worthless: `serviceBleDisconnectCleanup()` calls `resetPipeWriteState()`
-   unconditionally before the gate is evaluated, so it passes with or without the
-   amendment. Reproduce instead via the path that skips cleanup: force the
-   `ownerStillUp` early return, or inject a lost disconnect event, then evaluate
-   the gate. Alternatively use the Commit 1 watchdog path, which now terminates
-   cleanly and can be asserted directly.
-3. **ESP32 deep-sleep regression.** Battery config: idle → sleeps; connect and
-   disconnect with no transfer → sleeps after the re-armed window; mid-transfer
-   disconnect → prompt cleanup then sleeps; completed transfer → sleeps.
-4. **nRF idle current.** Unchanged expected; this touches the gate, not the wait.
-   Any delta means a term is stuck.
-5. **Build matrix.** All 11 environments, both commits.
+1. **`eventPending()`.** Raise a connect or disconnect after `serviceBleEvents()`
+   has run and before the gate is evaluated; assert the pass takes `delay(1)` and
+   the next pass consumes the event. On hardware, the observable is a
+   mid-transfer disconnect being serviced one pass later rather than after a
+   `CHECK_INTERVAL_MS`.
+2. **Orphan assertion.** Fault-inject the orphan (clear `directWriteActive`
+   without resetting the pipe), then assert: one `ERROR:` line, pipe state
+   cleared, a subsequent `0x0081` frame rejected, and the device idling/sleeping
+   normally. Confirm it does *not* fire in ordinary operation — a full transfer,
+   a partial transfer, a fatal NACK, and a mid-transfer disconnect should each
+   complete with the assertion silent.
+3. **Watchdog guards.** Regression only: both watchdogs still fire at 15 minutes.
+4. **Log split.** Force a fatal NACK mid-stream with frames still in flight;
+   assert the NACK line survives in the ring and the per-frame lines stay
+   suppressed.
+5. **nRF idle current**, disconnected, before and after. Expected unchanged; a
+   delta means something reaches the gate that should not.
+6. **Build matrix**, all 11 environments.
 
 ---
 
-## Residuals — deliberately not in either commit
+## Residuals — not in this commit
 
-0. **The watchdog is a duration timer, not an idle timer.** `directWriteStartTime`
-   is stamped at START and cleared only on completion or cleanup, so the 15-minute
-   limit measures the *whole* transfer, not silence. A genuinely healthy but slow
-   push — a large panel over a poor link, or a client that throttles — is aborted
-   mid-flight, and after Commit 1 that abort now also resets the pipe, which is
-   more correct but no less abrupt. Converting it to an idle timer (stamp on each
-   accepted frame) is a behaviour change worth its own commit and its own
-   argument; flagged here so the choice is deliberate rather than inherited.
-1. **A fatally-NACKed pipe session is still remembered indefinitely.**
-   `pipeState` has no timestamp field, so there is no watchdog for a session
-   whose hardware half was already released by `sendPipeNack()`. Harmless after
-   Commit 2, since nothing reads it as work, and bounded in practice by the next
-   START/END/disconnect. Adding `start_ms` to `PipeWriteState` would close it.
-2. **Event coalescing.** `takeDisconnectedEvent()` does check-then-clear and then
-   reads `s_disconnectReason`, so a second same-type event inside that window is
-   lost and its payload can attach to the wrong edge. `serviceBleEvents()` also
-   processes connect before disconnect regardless of true order. Observed in the
-   8.5 h capture as a connect/disconnect/connect burst inside 400 ms.
+1. **Duration, not idle.** Both watchdogs measure from START, so a genuinely slow
+   15-minute push is aborted mid-flight. Converting to an idle timer (stamp on
+   each accepted frame) is a behaviour change deserving its own argument.
+2. **A fatally-NACKed pipe session is remembered indefinitely.** `PipeWriteState`
+   has no timestamp, so nothing bounds it; harmless, since it is excluded from
+   every live-work predicate and bounded in practice by the next
+   START/END/disconnect.
 3. **Cleanup is dropped, not deferred.** `serviceBleDisconnectCleanup()` clears
    `s_disconnectCleanupPending` *before* the `ownerStillUp` test and returns, so
-   when the skip fires that disconnect's teardown never runs at all. Now a safety
-   consideration, per the deep-sleep correction above.
-4. **nRF MSD cadence** is still coupled to the idle duration.
+   when the skip fires that disconnect's teardown never runs. Less severe now
+   that no transfer flag vetoes sleep, but still a silent drop.
+4. **`sessionOrigin` is never cleared** — stamped at every START, so a refusal log
+   line can cite a transfer that ended long ago.
+5. **nRF MSD cadence** is still coupled to the idle duration.
+6. **A stale source comment** at `display_service.cpp:2771-2772` still says nRF
+   dispatches from its callback task; untrue since Phase 3.
 
 ## Risk and rollback
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Commit 1 reorders the normal END path | Low | Test 1.3; the moved block is the watchdog only |
-| A transfer flag latches through a path not in the table | Low after Commit 1 | Fault-injected test 2; watchdog backstops |
-| ESP32 stops deep-sleeping | Low | Test 3; residual 3 is the remaining exposure |
-| Amending `transferActive()` changes touch/WiFi behaviour | Low, and desirable | Only for errored sessions, where suspension was already wrong |
+| Orphan assertion fires in normal operation | Low | Test 2's negative cases; it logs at ERROR, so a false positive is loud rather than silent |
+| Dropping the `> 0` guards changes watchdog timing | None | `active` already implies a valid stamp |
+| Log split leaves a case unsuppressed | Low | Test 4 |
+| `eventPending()` defers sleep unexpectedly | By design, one pass | Test 5 measures the aggregate |
 
-Both commits revert independently. Commit 2 depends on Commit 1; Commit 1 depends
-on nothing.
+Every item reverts independently. None depends on `77c2226` except the orphan
+assertion, which asserts the invariant that commit established.
