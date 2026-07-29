@@ -662,8 +662,20 @@ void loop() {
     // deep sleep — lastActivityMs supplies the quiet window. The terms that only
     // one target can ever raise (s_advertisingRestartPending, wifiLanSession)
     // are simply false on the other, so one expression serves both.
+    // eventPending() closes the callback-timing hole: an event raised after
+    // serviceBleEvents() ran in this pass is otherwise invisible until the next
+    // pass -- and this pass is about to park. It is transient like the rest;
+    // take*Event() clears the peeked flag at the next loop top.
+    //
+    // No transfer-state term belongs here, and its absence is deliberate. A live
+    // transfer already has its connected BLE or LAN owner holding the gate, and
+    // one whose transport is gone cannot progress, so refusing to sleep on it
+    // would burn power for work that will never happen. That state is healed in
+    // checkTransferTimeouts() instead. See
+    // docs/PLAN_WORK_GATE_TRANSFER_TERMS_2026-07-29.md.
     const bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
                               ble.isConnected() ||
+                              ble.eventPending() ||
                               s_advertisingRestartPending ||
                               epdRefreshInProgress ||
                               wifiLanSession;
