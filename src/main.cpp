@@ -626,14 +626,10 @@ void loop() {
     // Session watchdogs. Shared as of Phase 4: these are transport-agnostic and
     // were ESP32-only for no reason other than living in the ESP32 loop arm, so
     // nRF gains them. A hung transfer there used to sit until disconnect.
-    if (directWriteActive && directWriteStartTime > 0) {
-        uint32_t directWriteDuration = millis() - directWriteStartTime;
-        if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
-            od_log_error("ERROR: Direct write timeout (%u ms) - cleaning up stuck state", (unsigned)directWriteDuration);
-            cleanupDirectWriteState(true);
-        }
-    }
-    checkPartialWriteTimeout();
+    // Both now live in display_service.cpp, beside the transfer state they tear
+    // down. Splitting them across files is how the direct-write one came to
+    // release the panel while leaving its enclosing PIPE session running.
+    checkTransferTimeouts();
 
     #ifdef OPENDISPLAY_HAS_WIFI
     // WiFi handling runs after BLE queue processing to avoid blocking

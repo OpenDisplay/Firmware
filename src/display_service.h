@@ -76,7 +76,12 @@ bool imageWriteLogQuietAck(void);
 bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
 extern volatile bool epdRefreshInProgress;
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
-void checkPartialWriteTimeout(void);
+// Both transfer watchdogs, together. They live beside the state they terminate
+// rather than in loop(): pipeState is reachable from main.cpp via
+// resetPipeWriteState(), so this is cohesion rather than necessity -- but keeping
+// the two apart is exactly how the direct-write timeout came to tear down the
+// panel and leave its enclosing PIPE session running.
+void checkTransferTimeouts(void);
 void cleanupPartialWriteOnDisconnect(void);
 // Origin (see commandOrigin()) of the transport that opened the in-flight transfer.
 // A disconnect must only tear down a session its own transport owns.

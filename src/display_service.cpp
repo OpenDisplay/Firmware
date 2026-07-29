@@ -575,9 +575,31 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
 static PipeWriteState pipeState = {};
 static PipeReorderSlot pipeReorder[PIPE_REORDER_SLOTS];
 
-void checkPartialWriteTimeout(void) {
+// Shared by both watchdogs below. Measured from START, not from the last accepted
+// frame, so it bounds the whole transfer rather than a stall -- see the residual
+// note in docs/PLAN_WORK_GATE_TRANSFER_TERMS_2026-07-29.md before changing that.
+static const uint32_t TRANSFER_WATCHDOG_MS = 900000UL;   // 15 min (upload + refresh window)
+
+void checkTransferTimeouts(void) {
+    if (directWriteActive && directWriteStartTime > 0) {
+        uint32_t directWriteDuration = millis() - directWriteStartTime;
+        if (directWriteDuration > TRANSFER_WATCHDOG_MS) {
+            od_log_error("ERROR: Direct write timeout (%u ms) - cleaning up stuck state", (unsigned)directWriteDuration);
+            cleanupDirectWriteState(true);
+            // Parity with the pipe-partial branch below: a full PIPE transfer owns this
+            // direct-write session as its hardware half, so the pipe half must die with
+            // it. Left alive, pipeState.active keeps the 0x0081 handler accepting frames
+            // into a torn-down session -- and because the cleanup above zeroes the byte
+            // counters, the uncompressed auto-complete test reads 0 >= 0 and drives a
+            // full refresh at an unpowered panel. Deliberately not folded into
+            // cleanupDirectWriteState(), which normal END also calls and where the pipe
+            // reset is already sequenced separately.
+            if (pipeState.active) resetPipeWriteState();
+        }
+    }
+
     if (partialCtx.active && partialCtx.start_time > 0 &&
-        (millis() - partialCtx.start_time) > 900000UL) {
+        (millis() - partialCtx.start_time) > TRANSFER_WATCHDOG_MS) {
         od_log_error("ERROR: Partial write timeout - cleaning up stuck state");
         cleanup_partial_write_state();
         // A pipe-partial transfer shares partialCtx: also clear pipeState so a zombie
