@@ -34,6 +34,16 @@ Counts: CRITICAL 0, HIGH 0, MEDIUM 2, LOW 5.
 
 ## M1 — 4 KB stack buffer in the BLE write-callback context (nRF)
 
+- **STATUS: RESOLVED**, on both of its independent counts.
+  1. The buffer itself is gone: `handleReadConfig` now takes its scratch from
+     `getConfigScratch()` rather than declaring `uint8_t configData[4096]` on the
+     stack. This landed separately from the BLE work.
+  2. The context is gone: Phase 3 of
+     `docs/PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md` moved nRF command
+     dispatch off the Bluefruit callback task onto `loop()`, so no command
+     handler runs on the small callback stack any more. This class of finding —
+     "handler X is unsafe because of the stack it runs on" — is now structurally
+     impossible on both targets.
 - **Severity:** MEDIUM (latent stack overflow / crash)
 - **Location:** `src/communication.cpp:352` (`handleReadConfig`), reached from
   `imageDataWritten` case `0x0040` (`communication.cpp:584-589`).
@@ -209,6 +219,21 @@ before `bbepWriteData`, and fail if the stream still has more to emit.
 
 ## L4 — Buzzer playback busy-waits up to ~5 s, starving the main loop
 
+- **STATUS: RESOLVED**, independently of the BLE transport work and before it.
+  The software square-wave busy-loop is gone: `buzzer_drive_tone_sw` no longer
+  exists. Tone generation is now hardware PWM (`buzzer_hw_tone_start` in
+  `src/buzzer_hw.cpp` — nRF PWM peripheral, ESP32 LEDC), and playback is a
+  millis()-poll state machine (`buzzer_run` / `buzzerService` over `s_buzzer`,
+  `buzzer_control.cpp`) driven from `loop()` and `idleDelay()`. Nothing blocks:
+  `buzzerService()` returns immediately while a step is still timing out. The
+  5 s cap survives as `kBuzzerMaxTotalMs`, now enforced across polls rather than
+  inside a spin.
+
+  Note for anyone tracing this finding's history: a Phase 5 note briefly claimed
+  L4 was still open and made worse by moving nRF dispatch to `loop()`. That was
+  wrong — it reasoned from this document's original text without checking the
+  code, which had already been rewritten. The reasoning would have been correct
+  had the busy-wait still existed.
 - **Severity:** LOW (bounded; degrades BLE latency / keep-alive during a tone)
 - **Location:** `src/buzzer_control.cpp:71-78` (`buzzer_drive_tone_sw`), driven by
   `handleBuzzerActivate` (buzzer_control.cpp:148-175).

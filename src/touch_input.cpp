@@ -14,10 +14,9 @@
 
 extern struct GlobalConfig globalConfig;
 extern uint8_t dynamicreturndata[11];
-#ifdef TARGET_ESP32
 // True while any of DIRECT / PIPE / PARTIAL is streaming (display_service.cpp).
+// Defined unguarded there; both targets consult it in processTouchInput().
 bool transferActive(void);
-#endif
 void updatemsdata(void);
 
 static_assert(sizeof(TouchController) == 32, "TouchController must be 32 bytes for packet 0x28");
@@ -577,14 +576,17 @@ void processTouchInput(void) {
     if (globalConfig.touch_controller_count == 0) {
         return;
     }
-#ifdef TARGET_ESP32
     // Skip the I2C poll while a transfer is streaming or an EPD refresh is in flight:
     // GT911 reads contend with the transfer for the bus and the loop task. This used to
     // test directWriteActive alone, so a PIPE or PARTIAL stream was left unprotected.
+    //
+    // No target guard. The contention is a property of sharing one bus and one loop
+    // task, not of the SoC, and since Phase 3 nRF dispatches commands from loop() too
+    // -- so it has exactly the same conflict and was the only target still polling
+    // GT911 mid-transfer.
     if (transferActive() || s_epd_refresh_suspend > 0) {
         return;
     }
-#endif
     uint32_t now = millis();
     if ((uint32_t)(now - s_last_touch_process_ms) < TOUCH_PROCESS_MIN_INTERVAL_MS) {
         return;

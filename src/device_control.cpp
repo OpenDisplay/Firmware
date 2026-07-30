@@ -11,8 +11,7 @@ void enterDeepSleep(bool force = false, uint16_t overrideSleepSeconds = 0);
 #endif
 
 #ifdef TARGET_NRF
-#include <bluefruit.h>
-#include "ble_init.h"
+#include <bluefruit.h>   // enterDFUMode() drives the SoftDevice teardown directly
 extern "C" {
 #include "nrf_soc.h"
 }
@@ -22,10 +21,10 @@ extern "C" void bootloader_util_app_start(uint32_t start_addr);
 #include <esp_system.h>
 #include "driver/gpio.h"
 #include "esp32-hal-gpio.h"
-#include "ble_init.h"          // BLEDevice/BLEServer/BLEAdvertising aliases + esp32_ble_clear_handles()
 #include "wifi_service.h"      // OPENDISPLAY_HAS_WIFI + opendisplay_lan_teardown()
-extern BLEServer* pServer;     // defined in main.cpp
 #endif
+
+#include "ble_transport.h"
 
 extern uint8_t rebootFlag;
 extern struct GlobalConfig globalConfig;
@@ -44,7 +43,11 @@ void sendResponse(uint8_t* response, uint16_t len);
 
 extern ButtonState buttonStates[MAX_BUTTONS];
 
-#ifdef TARGET_ESP32
+// No target guard: every line below is portable Arduino GPIO, and the two
+// powerLatch*Configured() predicates return false unless the board actually declares
+// a latch (DEVICE_FLAG_BATTERY_LATCH / DEVICE_FLAG_PWR_LATCH_DFF plus the pins). The
+// old #ifdef TARGET_ESP32 was inherited from power_latch.cpp being ESP32-gated as a
+// whole; that gate is gone, because the latch is a board feature, not a SoC feature.
 static bool s_pwrOffReleased[MAX_BUTTONS];
 static bool s_pwrOffPressing[MAX_BUTTONS];
 static bool s_pwrOffDone[MAX_BUTTONS];
@@ -91,6 +94,13 @@ static void pollConfiguredPowerOffButtons() {
 // Several buttons share one ADC pin via a resistor ladder, distinguished by
 // voltage. They have no edge interrupt, so they are polled. Reported through
 // the same MSD button byte as digital buttons for a uniform host contract.
+//
+// No target guard. Everything here is analogRead/pinMode/millis; the single
+// SoC-specific call (input range) is shimmed in adcLadderConfigurePin() below.
+// Gating the whole block on TARGET_ESP32 did not merely disable the feature on nRF,
+// it MIS-handled it: the `continue` that skips ladder inputs in initButtons() was
+// inside the same guard, so a BINARY_INPUT_TYPE_ADC_LADDER entry fell through to the
+// digital-button path and had a CHANGE interrupt attached to the ladder pin.
 #define MAX_ADC_LADDERS     4
 #define MAX_LADDER_BUTTONS  4    // reserved[] holds at most N+1 = 5 LE uint16 thresholds
 #define ADC_LADDER_POLL_MS  5
@@ -115,6 +125,27 @@ struct AdcLadder {
 };
 static AdcLadder adcLadders[MAX_ADC_LADDERS];
 static uint8_t   adcLadderCount = 0;
+
+// The one SoC-specific step: put the pad in its widest input range and fix the
+// reading scale, so a single set of config thresholds means the same thing on both.
+//
+// ESP32: 11 dB attenuation widens the usable span to roughly 0..2.5 V; analogRead is
+// already 12-bit there by default.
+// nRF52840: the SAADC needs no per-pad attenuation call, but the Adafruit core
+// defaults analogRead to 10-bit, which would silently quarter every reading against
+// thresholds written for a 12-bit part. Match the scale explicitly.
+//
+// UNVALIDATED ON nRF HARDWARE -- no nRF board with a ladder exists yet. The reference
+// voltages still differ, so thresholds remain a per-board calibration carried in
+// BinaryInputs.reserved[]; this only makes the SCALE comparable.
+static void adcLadderConfigurePin(uint8_t pin) {
+#if defined(TARGET_ESP32)
+    analogSetPinAttenuation(pin, ADC_11db);
+#else
+    (void)pin;
+    analogReadResolution(12);
+#endif
+}
 
 // Returns button index 0..num_buttons-1, or -1 when nothing is pressed.
 static int classifyAdcLadder(int adc, const AdcLadder* l) {
@@ -166,7 +197,7 @@ static void registerAdcLadder(const struct BinaryInputs* input) {
     l->last_press_time = 0;
     pinMode(l->pin, INPUT);
     (void)analogRead(l->pin);
-    analogSetPinAttenuation(l->pin, ADC_11db);
+    adcLadderConfigurePin(l->pin);
     adcLadderCount++;
     od_log_info("ADC ladder: pin %u n %u idBase %u byteIdx %u", l->pin, n, l->id_base, l->byte_index);
 }
@@ -209,36 +240,14 @@ static void pollAdcButtons() {
                     l->pin, adc, btn, l->last_button_id, l->press_count, state);
     }
 }
-#else
-static void pollAdcButtons() {}
-#endif
 
-void connect_callback(uint16_t conn_handle) {
-    (void)conn_handle;
-    od_log_info("=== BLE CLIENT CONNECTED ===");
-    rebootFlag = 0;
-    updatemsdata();
-#ifdef TARGET_NRF
-    ble_nrf_log_link_params(conn_handle, "at connect");  // baseline (pre-negotiation)
-    ble_nrf_request_fast_link(conn_handle);              // request 2M PHY + 251-octet DLE
-    ble_nrf_arm_link_diag(conn_handle);                  // re-log once negotiation settles
-#endif
-}
-
-void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
-    (void)conn_handle;
-    (void)reason;
-    od_log_info("=== BLE CLIENT DISCONNECTED ===");
-    od_log_info("Disconnect reason: %u", reason);
-    // Panel power on disconnect follows the ACTIVE-only-teardown invariant, so no
-    // logic change is needed here: a WARM (post-successful-refresh) panel SURVIVES
-    // disconnect and keeps its keep-alive window — a reconnect within the window
-    // pays only a warm re-acquire. Only a disconnect mid-transfer (still PWR_ACTIVE) tears the
-    // panel down, via the cleanup calls below (which no-op on power when WARM).
-    cleanupDirectWriteState(true);
-    cleanupPartialWriteOnDisconnect();   // 0x76 / pipe-partial session bookkeeping + panel power
-    resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect
-}
+// The BLE connect/disconnect application hooks that used to live here are gone
+// as of Phase 3. Both targets now service connect and disconnect from loop():
+// serviceBleEvents() does the connect-side work (rebootFlag, MSD refresh, link
+// tuning) and calls requestTransferSessionCleanup(), and
+// serviceBleDisconnectCleanup() owns the session teardown -- which is where the
+// mid-refresh and LAN-ownership guards live. nRF used to run that teardown
+// inline on the SoftDevice callback task with neither guard.
 
 #ifdef TARGET_ESP32
 // Tear NimBLE down before esp_restart(): esp_restart() resets the CPU but NOT the
@@ -253,13 +262,9 @@ static void esp32_ble_deinit_before_restart() {
     // the next boot re-inits WiFi cleanly (mirrors the BLE deinit below).
     opendisplay_lan_teardown();
 #endif
-    if (pServer != nullptr) {
-        BLEAdvertising* pAdvertising = pServer->getAdvertising();
-        if (pAdvertising != nullptr) pAdvertising->stop();
-    }
+    ble.stopAdvertising();
     delay(200);
-    BLEDevice::deinit(true);      // clearAll: disables + releases the BT controller
-    esp32_ble_clear_handles();
+    ble.end();                    // clearAll: disables + releases the BT controller
     delay(100);
     od_log_info("BLE deinitialized before restart");
 }
@@ -586,10 +591,8 @@ void handleLedStop(uint8_t* data, uint16_t len) {
 
 void processButtonEvents() {
     powerButtonPoll();
-#ifdef TARGET_ESP32
-    pollConfiguredPowerOffButtons();
-#endif
-    pollAdcButtons();
+    pollConfiguredPowerOffButtons();   // no-op unless the board declares a latch
+    pollAdcButtons();                  // no-op off ESP32 (see the ADC ladder guard)
     if (buttonEventPending) {
         noInterrupts();
         buttonEventPending = false;
@@ -612,10 +615,17 @@ void processButtonEvents() {
                 dynamicreturndata[btn->byte_index] = buttonData;
             }
         }
+        // ORDER IS LOAD-BEARING: boost first, publish second. updatemsdata() ends in
+        // setManufacturerData(), which calls applyAdvInterval() and then restarts
+        // advertising -- so the interval is chosen DURING the publish. Boosting
+        // afterwards set the deadline too late to affect the packet it exists for:
+        // the press went out at the 160 ms slow interval (~1 advertisement in a
+        // typical 230 ms press window, which a passive scanner routinely misses)
+        // while the release 230 ms later got the 20 ms boosted interval, because by
+        // then s_advBoostUntil was set. Net effect: a host saw "not pressed"
+        // reliably and "pressed" almost never.
+        ble.boostAdvertising();   // no-op where the stack has no fast-adv window
         updatemsdata();
-#ifdef TARGET_NRF
-        ble_nrf_boost_advertising();
-#endif
     }
 }
 
@@ -730,18 +740,18 @@ void initButtons() {
         buttonStates[i].power_off = false;
         buttonStates[i].power_off_hold_ms = 0;
     }
-#ifdef TARGET_ESP32
     adcLadderCount = 0;
-#endif
     if (globalConfig.binary_input_count == 0) return;
     for (uint8_t instanceIdx = 0; instanceIdx < globalConfig.binary_input_count; instanceIdx++) {
         struct BinaryInputs* input = &globalConfig.binary_inputs[instanceIdx];
-#ifdef TARGET_ESP32
+        // The `continue` is the load-bearing half. It used to be inside
+        // #ifdef TARGET_ESP32 along with registerAdcLadder(), so on nRF a ladder
+        // input did not merely go unregistered -- it fell through to the digital
+        // path below and got a CHANGE interrupt attached to the ladder pin.
         if (input->input_type == BINARY_INPUT_TYPE_ADC_LADDER) {
             registerAdcLadder(input);
             continue;
         }
-#endif
         if (input->input_type != OD_INPUT_TYPE_BUTTON) continue;
         if (input->button_data_byte_index > 10) continue;
         uint16_t instanceHoldMs = (input->power_off_hold_sec == 0) ? 3000u : (uint16_t)input->power_off_hold_sec * 1000u;

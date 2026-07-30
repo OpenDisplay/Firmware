@@ -5,7 +5,8 @@
 #include <SPI.h>
 #include "encryption_state.h"
 #include "config_parser.h"
-#include "ble_init.h"
+#include "ble_transport.h"
+#include "command_queue.h"
 #include "wifi_service.h"
 #include "display_service.h"
 
@@ -57,10 +58,9 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_PWR_LATCH_DFF (1 << 4) // Bit 4: 74AHC1G79 D-FF latch; pwr_pin_2=D, pwr_pin_3=CP; release via command 0x0052
 
 #ifdef TARGET_NRF
-#include <bluefruit.h>
-extern BLEDfu bledfu;
-extern BLEService imageService;
-extern BLECharacteristic imageCharacteristic;
+// The Bluefruit stack objects (BLEDfu / BLEService / BLECharacteristic) are now
+// file-static inside ble_transport_nrf.cpp, so <bluefruit.h> no longer belongs
+// here. Only the raw SoftDevice APIs below are still used directly.
 // Forward declaration for SoftDevice temperature API
 extern "C" uint32_t sd_temp_get(int32_t *p_temp);
 extern "C" {
@@ -69,19 +69,13 @@ extern "C" {
 #endif
 
 #ifdef TARGET_ESP32
-// BLE types come from ble_init.h (NimBLE-Arduino + BLE* aliases), included above.
+// No BLE stack types here any more: NimBLE lives behind ble_transport_esp32.cpp.
 #include <esp_system.h>
 #include <esp_mac.h>
 #include <esp_timer.h>
 #include "esp_sleep.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
-
-extern BLEServer* pServer;
-extern BLEService* pService;
-extern BLECharacteristic* pTxCharacteristic;
-extern BLECharacteristic* pRxCharacteristic;
-extern BLEAdvertisementData* advertisementData;  // Pointer to global advertisementData object
 
 // RTC memory variables for deep sleep state tracking (declared in main.cpp)
 extern bool advertising_timeout_active;
@@ -150,8 +144,9 @@ uint16_t wifiServerPort = 2446;
 #endif
 #ifdef OPENDISPLAY_HAS_WIFI
 // Heavy WiFi-transport surface: the TCP server/client objects and the 16 KB RX
-// reassembly buffer exist ONLY when the WiFi transport is compiled in (S3/C6).
-// C3 / classic esp32-N4 reclaim this RAM.
+// reassembly buffer exist ONLY when the WiFi transport is compiled in -- every
+// S3 env (E1004 inherits the flag from esp32-s3-N32R8-extuart), C6, and both C3
+// envs. Only the classic esp32-N4 reclaims this RAM.
 // 16 KB = four max wire frames (OD_LAN_MAX_FRAME 4096): headroom for the
 // streaming client to keep whole frames queued ahead of the parser.
 WiFiServer wifiServer;
@@ -182,7 +177,10 @@ bool displayPowerState = false;  // Track display power state (true = powered on
 // enum PwrMgmState + EPD_KEEPALIVE_MAX_S are defined in display_service.h (shared header).
 volatile uint8_t pwrmgmState = PWR_OFF;  // PWR_OFF / PWR_WARM / PWR_ACTIVE
 uint32_t pwrmgmOffDeadlineMs = 0;        // keep-alive deadline (millis); valid only in PWR_WARM
-volatile uint8_t pwrmgmLock = 0;         // cross-task try-lock (nRF BLE task vs loop task)
+// Session try-lock, uncontended since Phase 3 moved nRF dispatch onto loop().
+// Kept as defence in depth -- see the rationale at pwrmgmLockTake() in
+// display_service.cpp.
+volatile uint8_t pwrmgmLock = 0;
 
 bool waitforrefresh(int timeout);
 void pwrmgm(bool onoff);
@@ -190,8 +188,6 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
 void powerDownExternalFlashFromConfig(void);
 void xiaoinit();
 void ws_pp_init();
-void connect_callback(uint16_t conn_handle);
-void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 #ifdef TARGET_ESP32
 void fullSetupAfterConnection();
 // force: sleep even with a client connected (explicit host request 0x0053).
@@ -203,16 +199,7 @@ extern uint32_t advertising_start_time;
 #endif
 String getChipIdHex();
 
-// Platform-specific type aliases for BLE callback
-#ifdef TARGET_NRF
-    typedef uint16_t BLEConnHandle;
-    typedef BLECharacteristic* BLECharPtr;
-#else
-    typedef void* BLEConnHandle;
-    typedef void* BLECharPtr;
-#endif
-
-void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len);
+// imageDataWritten + its opaque parameter typedefs come from communication.h.
 void sendResponse(uint8_t* response, uint16_t len);
 void sendResponseUnencrypted(uint8_t* response, uint16_t len);
 void secureEraseConfig();
@@ -228,11 +215,10 @@ void flashLed(uint8_t color, uint8_t brightness);  // Flash LED with color and b
 void processLedFlash();  // Advance async LED flash state machine
 void handleLedActivate(uint8_t* data, uint16_t len);  // Handle LED activation command
 void handleLedStop(uint8_t* data, uint16_t len);  // Stop running LED flash sequence
-#ifdef TARGET_ESP32
-void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler (IRAM_ATTR in implementation)
-#else
-void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler
-#endif
+// Shared ISR handler. No target guard: both arms of the former #ifdef declared this
+// identically -- IRAM_ATTR belongs on the DEFINITION (device_control.cpp), not here,
+// and a declaration that differs only in its trailing comment is not a difference.
+void handleButtonISR(uint8_t buttonIndex);
 void scanI2CDevices();
 void initSensors();
 void initAXP2101(uint8_t busId);
@@ -352,43 +338,10 @@ static constexpr uint32_t DEFAULT_IDLE_HOLD_MS = 10000;
 #define AXP2101_REG_IRQ_STATUS4 0x47  // IRQ status register 4
 #define AXP2101_REG_LDO_ONOFF_CTRL1 0x91  // LDO control register 1 (BLDO1-2, CPUSLDO, DLDO1-2)
 
-#ifdef TARGET_NRF
-BLEDfu bledfu;
-BLEService imageService("2446");
-// max_len is a GATT-declared attribute length the SoftDevice reserves for real (vloc =
-// BLE_GATTS_VLOC_STACK), so 512 cost 512 B of attribute table while the link caps at
-// ATT MTU 247 (payload 244) -- half of it was unreachable.
-BLECharacteristic imageCharacteristic("2446", BLEWrite | BLEWriteWithoutResponse | BLENotify, OD_BLE_MAX_FRAME);
-#endif
-
-#ifdef TARGET_ESP32
-// RESPONSE_QUEUE_SIZE / MAX_RESPONSE_SIZE / ResponseQueueItem come from structs.h so
-// this file and communication.cpp cannot drift apart on the slot size.
-// PIPE_WRITE ingest sizing: 33 slots hold a full W=32 in-flight window + END across a
-// 60 s Spectra SPI stall (loop blocked in bbepWriteData). OD_BLE_MAX_FRAME (256) covers
-// pipe <=244, legacy <=232, HA <=244; the GATT layer now rejects anything larger with
-// ATT 0x0D rather than the app dropping it silently.
-#define COMMAND_QUEUE_SIZE 33
-#define MAX_COMMAND_SIZE OD_BLE_MAX_FRAME
-
-ResponseQueueItem responseQueue[RESPONSE_QUEUE_SIZE];
-uint8_t responseQueueHead = 0;
-uint8_t responseQueueTail = 0;
-
-#include "esp32_ble_callbacks.h"
-
-CommandQueueItem commandQueue[COMMAND_QUEUE_SIZE];
-volatile uint8_t commandQueueHead = 0;
-volatile uint8_t commandQueueTail = 0;
-
-BLEServer* pServer = nullptr;
-BLEService* pService = nullptr;
-BLECharacteristic* pTxCharacteristic = nullptr;
-BLECharacteristic* pRxCharacteristic = nullptr;
-BLEAdvertisementData globalAdvertisementData;  // Global object, not pointer
-BLEAdvertisementData* advertisementData = &globalAdvertisementData;  // Pointer to global object
-MyBLEServerCallbacks staticServerCallbacks;  // Static callback object (no dynamic allocation)
-MyBLECharacteristicCallbacks staticCharCallbacks;  // Static callback object (no dynamic allocation)
-#endif
+// The deferred-work flags that used to be defined here are now file-static in
+// main.cpp: nothing outside it reads them, and the two that other translation
+// units need to RAISE go through requestTransferSessionCleanup() /
+// requestAdvertisingRestart() (communication.h). Keeping them here would have
+// re-exported mutable state that only one file has any business touching.
 
 extern const uint8_t writelineFont[] PROGMEM;

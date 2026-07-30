@@ -282,11 +282,27 @@ and `back > W`) is a protocol violation → NACK `0x04`.
 
 ### 3.4 ESP32 ingest ring (transport, not protocol)
 
-On ESP32 the BLE callback copies each command into a lock-free SPSC ring
-(`COMMAND_QUEUE_SIZE = 33`, `MAX_COMMAND_SIZE = 256`) with acquire/release
-atomics; the main loop drains up to 33 per pass and flushes responses **between**
-commands so small ACK cadences can't overflow the response ring. Sized to hold a
-full W=32 window plus END across an SPI stall.
+On **both** targets (nRF since the Phase 3 transport work, ESP32 since the NimBLE
+port) the BLE callback copies each command into a lock-free SPSC ring with
+acquire/release atomics; the main loop drains up to `COMMAND_QUEUE_SIZE` per pass
+and flushes responses **between** commands so small ACK cadences can't overflow
+the response ring.
+
+Depth is **derived**, not hardcoded: `COMMAND_QUEUE_SIZE = PIPE_MAX_W + 2`
+(`src/command_queue.h`, with a `static_assert` enforcing it). The ring reserves
+one slot to distinguish full from empty, so usable capacity is `SLOTS - 1`, and
+the worst case it must absorb across an SPI stall is a full `PIPE_MAX_W` window
+of DATA **plus END** — END carries no `seq`, sits outside the window's sequence
+space, and is therefore not bounded by the sender's window rule. That gives 34
+slots at `PIPE_MAX_W = 32`, and 18 on `env:esp32-N4`
+(`PIPE_SMALL_DRAM_WINDOW`, `PIPE_MAX_W = 16`).
+
+> This constant read a hardcoded `33` until 2026-07-27, which yielded 32 usable
+> slots — one short of the "full window plus END" case it was documented to
+> cover, so the END was rejected at exactly the stall it was sized for. Note that
+> `PIPE_REORDER_SLOTS = W + 1` is *correct* for its own purpose (collision-free
+> `seq % SLOTS` indexing); the two constants have different rationales and must
+> not be kept equal by habit.
 
 ---
 

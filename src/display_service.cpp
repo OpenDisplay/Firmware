@@ -44,16 +44,16 @@
 extern "C" {
 #include "nrf_soc.h"
 }
-#include <bluefruit.h>
-#include "ble_init.h"
 #include "nrf.h"
 #endif
 
 #ifdef TARGET_ESP32
-#include "ble_init.h"   // NimBLE-Arduino + BLE* aliases
 #include "wifi_service.h"
 #include <SPI.h>
 #endif
+
+#include "ble_transport.h"
+#include "command_queue.h"
 
 extern BBEPDISP bbep;
 extern struct GlobalConfig globalConfig;
@@ -119,12 +119,6 @@ struct PartialStreamContext {
     uint8_t current_plane;
     uint32_t start_time;
 };
-
-#ifdef TARGET_ESP32
-extern BLEAdvertisementData* advertisementData;
-extern BLEServer* pServer;
-extern BLEService* pService;
-#endif
 
 void pwrmgm(bool onoff);
 String getChipIdHex();
@@ -394,16 +388,24 @@ static uint32_t epdKeepAliveWindowMs(void) {
     return (uint32_t)s * 1000;
 }
 
-// Cross-task try-lock. On nRF the Bluefruit write-callback task and the loop()
-// task can both touch the session (a transfer begins Acquire on one while the
-// keep-alive tick fires ForceOff on the other). Acquire/Release/ForceOff take it;
-// the tick TRY-locks and skips its pass if held, so it can never rail-cut mid-init.
+// Session try-lock, now UNCONTENDED on both targets and kept as defence in depth.
+//
+// It existed because nRF dispatched commands on the Bluefruit write-callback
+// task while the keep-alive tick ran on loop(): a transfer could Acquire on one
+// task while ForceOff rail-cut on the other. Phase 3 moved nRF dispatch to
+// loop(), so every Acquire/Release/ForceOff/tick caller is now that single task
+// (see docs/PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md).
+//
+// Kept rather than deleted: it is nearly free, it still guards against a future
+// caller arriving from an ISR or another task, and the try-lock in the tick is
+// what keeps a rail-cut from landing mid-init regardless of who calls it.
 static void pwrmgmLockTake(void) {
-    // MUST yield while waiting: on nRF this runs on the Bluefruit callback task,
-    // which outranks the loop task holding the lock during the tick's ForceOff
-    // (SPI ops + delay(50)). A bare busy-spin starves the lower-priority holder
-    // forever on the single core (priority-inversion livelock); delay(1) is
-    // vTaskDelay, which blocks the spinner so the holder can finish and release.
+    // The yield here is now belt-and-braces. It was load-bearing under the old
+    // model: this ran on the Bluefruit callback task, which outranks the loop
+    // task holding the lock during the tick's ForceOff (SPI ops + delay(50)), so
+    // a bare busy-spin starved the lower-priority holder forever on the single
+    // core (priority-inversion livelock). With one task there is nothing to spin
+    // against, but delay(1) is vTaskDelay and stays correct if that ever changes.
     while (__atomic_exchange_n(&pwrmgmLock, 1, __ATOMIC_ACQUIRE)) { delay(1); }
 }
 static bool pwrmgmLockTryTake(void) {
@@ -562,12 +564,10 @@ static void directWriteComputeGeometry(bool compressed);
 static void directWriteActivatePanel(void);
 static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t endOpcode);
 
-#ifdef TARGET_ESP32
-// Defined in main.cpp. The response ring's only drainer is the loop task, which is
-// the same task running these handlers — so anything queued here stays queued until
-// we return. Call it before any multi-second blocking work (see the refresh tail).
-extern void flushResponseQueueToBle();
-#endif
+// serviceBleTx() comes from command_queue.h. The response ring's only drainer is
+// the loop task, which is the same task running these handlers -- so anything
+// queued here stays queued until we return. Call it before any multi-second
+// blocking work (see the refresh tail).
 
 // PIPE_WRITE (0x0080-0x0082) sliding-window receive state + reorder queue. Declared
 // early so the quiet-logging predicates below can consult pipeState.active. The
@@ -1770,57 +1770,30 @@ void updatemsdata(){
     m.battery_voltage_low = batteryVoltageLowByte;
     m.status = statusByte;
     memcpy(msd_payload, &m, sizeof m);
-#ifdef TARGET_NRF
-    static uint8_t prev_msd_payload_nrf[16] = {0xFF};
-    if (memcmp(prev_msd_payload_nrf, msd_payload, 16) == 0) {
+    // Skip the (relatively expensive) advertisement rebuild when nothing changed;
+    // the loop counter still advances so successive advertisements stay
+    // distinguishable. Both targets used to keep their own copy of this check
+    // inside their own #ifdef -- it is transport-independent, so it lives once
+    // here and only the push below is platform-specific.
+    static uint8_t prev_msd_payload[16] = {0xFF};
+    if (memcmp(prev_msd_payload, msd_payload, 16) == 0) {
         mloopcounter++;
         mloopcounter &= 0x0F;
         return;
     }
-    memcpy(prev_msd_payload_nrf, msd_payload, 16);
-    Bluefruit.Advertising.clearData();
-    Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-    Bluefruit.Advertising.addName();
-    Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, msd_payload, 16);
-    ble_nrf_apply_adv_interval();
-    Bluefruit.Advertising.setFastTimeout(1);
-    Bluefruit.Advertising.stop();
-    Bluefruit.Advertising.start(0);
-#endif
-#ifdef TARGET_ESP32
-    if (advertisementData != nullptr) {
-        static uint8_t prev_msd_payload[16] = {0xFF};
-        if (memcmp(prev_msd_payload, msd_payload, 16) == 0) {
-            mloopcounter++;
-            mloopcounter &= 0x0F;
-            return;
-        }
-        memcpy(prev_msd_payload, msd_payload, 16);
-        advertisementData->setManufacturerData(msd_payload, 16);
-        BLEAdvertising *pAdvertising = (pServer != nullptr) ? pServer->getAdvertising() : BLEDevice::getAdvertising();
-        // Only rebuild+restart advertising while disconnected. The former connected
-        // branch rebuilt *advertisementData but never pushed it via
-        // setAdvertisementData(), so it was dead work — dropped.
-        if (pAdvertising != nullptr && !(pServer != nullptr && pServer->getConnectedCount() > 0)) {
-            pAdvertising->stop();
-            BLEAdvertisementData freshAdvertisementData;
-            static String savedDeviceName = "";
-            if (savedDeviceName.length() == 0) savedDeviceName = "OD" + getChipIdHex();
-            freshAdvertisementData.setName(savedDeviceName.c_str());
-            freshAdvertisementData.setFlags(0x06);
-            freshAdvertisementData.setManufacturerData(msd_payload, 16);
-            *advertisementData = freshAdvertisementData;
-            // setAdvertisementData() must be the last data call before start():
-            // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data
-            // flag and would make start() drop this manufacturer-data payload.
-            pAdvertising->setAdvertisementData(freshAdvertisementData);
-            delay(50);
-            pAdvertising->start();
-        }
+    memcpy(prev_msd_payload, msd_payload, 16);
+    // The only record of what actually reaches the air. Without it, "the button
+    // event is logged but the host never sees it" cannot be split into a firmware
+    // publish failure vs a host-side one without a BLE sniffer.
+    {
+        char line[96];
+        od_log_hex_line(line, sizeof(line), "MSD publish: ", msd_payload, 16);
+        od_log_debug("%s", line);
     }
+    ble.setManufacturerData(msd_payload, 16);
 #ifdef OPENDISPLAY_HAS_WIFI
+    // (Implies TARGET_ESP32; the enclosing target guard is gone with the split.)
     opendisplay_mdns_update_msd_txt();
-#endif
 #endif
     mloopcounter++;
     mloopcounter &= 0x0F;
@@ -2409,14 +2382,15 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     }
     uint8_t ackResponse[] = {0x00, endOpcode};
     sendResponse(ackResponse, sizeof(ackResponse));
-#ifdef TARGET_ESP32
     // Push the END ack — and the final tail ACK the auto-complete path queued just
     // before calling us — onto the air BEFORE the blocking refresh below. bbepRefresh
     // + waitforrefresh occupy the loop task for seconds on a big panel, and the loop
     // task is the response ring's only drainer, so without this the client sits in its
     // tail-flush probe loop and aborts the (already complete) transfer on PTO.
-    flushResponseQueueToBle();
-#endif
+    //
+    // Portable as of Phase 3: nRF used to notify() inline from the BLE callback
+    // task and so never needed this, but it now shares the ring and the loop task.
+    serviceBleTx();
     delay(20);
     epdRefreshInProgress = true;
     bool refreshSuccess = false;
@@ -2441,9 +2415,12 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     }
     epdRefreshInProgress = false;
     cleanupDirectWriteState(false);
-#ifdef TARGET_ESP32
-    esp32_restart_ble_advertising();
-#endif
+    // Request rather than re-arm inline: main.cpp owns the deferral policy and
+    // runs it later in this same loop() pass (the refresh above is reached from
+    // the command drain), so the radio comes back up on the same pass as before.
+    // No target guard needed -- the request is a no-op where the stack re-arms
+    // advertising itself.
+    requestAdvertisingRestart();
     if (refreshSuccess) {
         // A successful refresh changed the panel image. Commit the new etag
         // when the client supplied a valid one; otherwise clear the stale etag

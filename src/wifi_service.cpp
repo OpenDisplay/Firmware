@@ -6,7 +6,7 @@
 #include "encryption.h"
 #include "structs.h"
 #include "od_log.h"
-#include "ble_init.h"   // NimBLE-Arduino + BLE* aliases (NimBLEDevice for the advertised MAC)
+#include "ble_transport.h"
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
@@ -75,9 +75,7 @@ static void lanBeginConnect(void);   // defined with the roaming / RTC AP-cache 
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
 
-typedef void* BLEConnHandle;
-typedef void* BLECharPtr;
-void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len);
+// imageDataWritten + its opaque parameter typedefs come from communication.h.
 
 // ------------------------------------------------------------------ TLS-PSK ---
 // One TLS session at a time, driven cooperatively from handleWiFiServer(). The
@@ -157,7 +155,7 @@ static String tlsFailNote(int ret) {
 // churns small blocks in between: the odds degrade the longer the device stays up.
 //
 // Fix: reserve the two slots ONCE at boot -- from setup(), right after full_config_init()
-// and BEFORE ble_init()/initWiFi() take their ~100 KB -- when the heap is still
+// and BEFORE BleTransport::begin()/initWiFi() take their ~100 KB -- when the heap is still
 // contiguous, then serve mbedTLS from them via its allocator hook. This does not raise
 // peak usage (the buffers are needed whenever TLS runs); it moves the allocation to the
 // one moment where success is guaranteed, and recycling the slots stops TLS fragmenting
@@ -388,15 +386,11 @@ void opendisplay_mdns_update_msd_txt(void) {
 }
 
 // The advertised BLE address, lowercase colon-separated (SECTION 9 rule 6, key
-// `mac`). This is a genuinely new call: prior identity used getChipIdHex()
-// (eFuse), which is NOT what HA stores as the device unique_id. HARDWARE
-// VALIDATION REQUIRED: confirm NimBLEDevice::getAddress() == the advertised AdvA
-// HA sees (public vs static-random) on BOTH S3 and C6.
+// `mac`). Prior identity used getChipIdHex() (eFuse), which is NOT what HA
+// stores as the device unique_id. The lowercasing and the hardware-validation
+// caveat now live in BleTransport::addressString().
 static String advertisedBleMacLower(void) {
-    auto s = NimBLEDevice::getAddress().toString();
-    String out(s.c_str());
-    out.toLowerCase();
-    return out;
+    return String(ble.addressString());
 }
 
 static void restartLanService(void) {
@@ -807,9 +801,10 @@ void disconnectWiFiServer() {
     wifiServerConnected = false;
     tcpReceiveBufferPos = 0;
     // F4: abort any in-flight direct-write / pipe / partial transfer + tear down a
-    // mid-transfer panel session, DEFERRED to loop() (serviceBleDisconnectCleanup)
-    // so cleanup never races an in-progress EPD refresh. Reuses the BLE path's flag.
-    bleDisconnectCleanupPending = true;
+    // mid-transfer panel session, DEFERRED to loop() so cleanup never races an
+    // in-progress EPD refresh. Shared with the BLE disconnect path -- main.cpp
+    // works out which transport actually owned the transfer.
+    requestTransferSessionCleanup();
 }
 
 // lanReadIntoBuffer() return codes. A graceful peer close is deliberately distinct from

@@ -16,6 +16,16 @@ void handleReadConfig();
 void handleWriteConfig(uint8_t* data, uint16_t len);
 void handleWriteConfigChunk(uint8_t* data, uint16_t len);
 
+// The shared command dispatcher, serving nRF BLE, ESP32 BLE and the ESP32 LAN
+// transport. Both leading parameters are unused by the dispatch logic, so they
+// are opaque on every target and this declaration needs no BLE stack types --
+// which is what lets three callers in three files share one declaration instead
+// of each re-typedef'ing their own. On nRF the Bluefruit write callback has a
+// BLECharacteristic*-shaped signature; ble_transport_nrf.cpp adapts it to this.
+typedef uint16_t BLEConnHandle;
+typedef void*    BLECharPtr;
+void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len);
+
 // Transport a command arrived on. Set by the LAN listener around each dispatch and
 // ORIGIN_BLE at all other times. Multi-frame transfers use it to reject frames from
 // a transport that does not own the in-flight session, and to scope transport-only
@@ -25,5 +35,25 @@ enum CommandOrigin { ORIGIN_BLE = 0, ORIGIN_LAN_PLAIN = 1, ORIGIN_LAN_TLS = 2 };
 
 /// Origin of the command currently being dispatched (a CommandOrigin value).
 uint8_t commandOrigin(void);
+
+// --- deferred work, serviced by loop() ---------------------------------------
+// Implemented in main.cpp, which owns loop() and the flags behind these. They
+// are requests, not commands: the work happens on a later pass, and main.cpp
+// decides when it is safe (never mid-EPD-refresh, never while the owning
+// transport is still live).
+//
+// Declared here rather than in ble_transport.h because they are application
+// policy, not link state -- and because neither is BLE-specific: the cleanup
+// request is raised by the LAN transport on a LAN disconnect.
+
+/// Abort any in-flight transfer and tear down the panel session. Raised on a
+/// BLE or LAN disconnect; honoured once no refresh is in flight and the
+/// transport that OWNS the transfer is confirmed gone.
+void requestTransferSessionCleanup(void);
+
+/// Re-arm BLE advertising when it is safe to. A no-op on targets whose stack
+/// re-arms itself (see BleTransport::restartsAdvertisingOnDisconnect), so
+/// callers need no target guard.
+void requestAdvertisingRestart(void);
 
 #endif

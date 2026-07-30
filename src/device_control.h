@@ -3,8 +3,6 @@
 
 #include <Arduino.h>
 
-void connect_callback(uint16_t conn_handle);
-void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 void reboot();
 void processButtonEvents();
 void flashLed(uint8_t color, uint8_t brightness);

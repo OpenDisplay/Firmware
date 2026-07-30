@@ -1,7 +1,7 @@
 ### C++ template
 # Prerequisites
 *.d
-./*.uf2
+/*.uf2
 # Compiled Object files
 *.slo
 *.lo

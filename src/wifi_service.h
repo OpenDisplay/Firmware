@@ -6,10 +6,12 @@
 // OPENDISPLAY_HAS_WIFI gates the entire WiFi/LAN transport surface (mDNS, TCP
 // server, TLS-PSK listener, RX reassembly buffer, LAN response framing). It is
 // defined only on ESP32 targets built with -DOPENDISPLAY_ENABLE_WIFI, which is
-// applied to the S3, C6, and C3 platformio envs. The classic esp32-N4 builds
-// without it, so it does not compile the WiFi surface and reclaims the 8 KB RX
-// buffer + WiFiServer/WiFiClient RAM. Call sites in main.cpp /
-// communication.cpp / display_service.cpp are #ifdef-guarded on this macro.
+// applied to every S3, C6, and C3 platformio env (esp32-s3-E1004 sets no flag of
+// its own but inherits it from esp32-s3-N32R8-extuart). The classic esp32-N4 is
+// the sole ESP32 env without it, so it does not compile the WiFi surface and
+// reclaims the 16 KB RX buffer + WiFiServer/WiFiClient RAM. Call sites in
+// main.cpp / communication.cpp / display_service.cpp / device_control.cpp /
+// config_parser.cpp are #ifdef-guarded on this macro.
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_ENABLE_WIFI)
 #define OPENDISPLAY_HAS_WIFI 1
 #endif
@@ -19,7 +21,7 @@
 // Reserve mbedTLS's two ~16.7 KB record buffers while the heap is still contiguous, and
 // route mbedTLS allocations through them. MUST be called early in setup() -- after
 // full_config_init() (it needs securityConfig to know whether TLS is used) and before
-// ble_init()/initWiFi() take their ~100 KB. No-op when encryption is disabled, and
+// BleTransport::begin()/initWiFi() take their ~100 KB. No-op when encryption is disabled, and
 // idempotent. Without it, ssl_setup() intermittently fails with -0x7f00 even with ~50 KB
 // free, because the two buffers need contiguous internal DRAM.
 void od_tls_reserve_records(void);
