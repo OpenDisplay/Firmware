@@ -316,6 +316,10 @@ void BleTransport::tick() {
     Bluefruit.Advertising.start(0);
 }
 
+bool BleTransport::eventPending() const {
+    return s_connectedEvent || s_disconnectedEvent;
+}
+
 bool BleTransport::takeConnectedEvent() {
     if (!s_connectedEvent) return false;
     s_connectedEvent = false;

@@ -563,6 +563,7 @@ static PartialStreamContext partialCtx = {};
 static void directWriteComputeGeometry(bool compressed);
 static void directWriteActivatePanel(void);
 static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t endOpcode);
+static bool imageWriteFramesMayStillArrive(void);
 
 // serviceBleTx() comes from command_queue.h. The response ring's only drainer is
 // the loop task, which is the same task running these handlers -- so anything
@@ -575,14 +576,64 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
 static PipeWriteState pipeState = {};
 static PipeReorderSlot pipeReorder[PIPE_REORDER_SLOTS];
 
-void checkPartialWriteTimeout(void) {
-    if (partialCtx.active && partialCtx.start_time > 0 &&
-        (millis() - partialCtx.start_time) > 900000UL) {
+// Shared by both watchdogs below. Measured from START, not from the last accepted
+// frame, so it bounds the whole transfer rather than a stall -- see the residual
+// note in docs/PLAN_WORK_GATE_TRANSFER_TERMS_2026-07-29.md before changing that.
+static const uint32_t TRANSFER_WATCHDOG_MS = 900000UL;   // 15 min (upload + refresh window)
+
+void checkTransferTimeouts(void) {
+    // No "&& startTime > 0" sentinel on either watchdog: each START sets the active
+    // flag and its millis() stamp in straight-line setup with no return between, so
+    // the flag already implies a valid stamp. Zero is a legitimate stamp -- treating
+    // it as "unset" would permanently disable the watchdog for a transfer that began
+    // in the ~1 ms window where millis() wraps through zero. Of order one in 10^9
+    // transfers, so this is removing a special case from the invariant rather than
+    // fixing a live risk.
+    if (directWriteActive) {
+        uint32_t directWriteDuration = millis() - directWriteStartTime;
+        if (directWriteDuration > TRANSFER_WATCHDOG_MS) {
+            od_log_error("ERROR: Direct write timeout (%u ms) - cleaning up stuck state", (unsigned)directWriteDuration);
+            cleanupDirectWriteState(true);
+            // Parity with the pipe-partial branch below: a full PIPE transfer owns this
+            // direct-write session as its hardware half, so the pipe half must die with
+            // it. Left alive, pipeState.active keeps the 0x0081 handler accepting frames
+            // into a torn-down session -- and because the cleanup above zeroes the byte
+            // counters, the uncompressed auto-complete test reads 0 >= 0 and drives a
+            // full refresh at an unpowered panel. Deliberately not folded into
+            // cleanupDirectWriteState(), which normal END also calls and where the pipe
+            // reset is already sequenced separately.
+            if (pipeState.active) resetPipeWriteState();
+        }
+    }
+
+    if (partialCtx.active &&
+        (millis() - partialCtx.start_time) > TRANSFER_WATCHDOG_MS) {
         od_log_error("ERROR: Partial write timeout - cleaning up stuck state");
         cleanup_partial_write_state();
         // A pipe-partial transfer shares partialCtx: also clear pipeState so a zombie
         // pipeState.active can't misroute later 0x0081 frames into the dead partialCtx.
         if (pipeState.partial) resetPipeWriteState();
+    }
+
+    // Postcondition over both branches above: a live, non-errored pipe session
+    // always has a hardware half. 77c2226 proved that and closed the one path that
+    // broke it; this asserts it at runtime rather than resting on the proof, and
+    // heals it rather than merely reporting it. Placed last deliberately -- run
+    // first it would only inspect entry state, and could leave an inconsistency
+    // either watchdog had just created until the next pass.
+    //
+    // What a recurrence costs: the 0x0081 handler gates on pipeState alone, so
+    // frames are accepted into torn-down state, and with the byte counters zeroed by
+    // cleanup the uncompressed auto-complete reads 0 >= 0 and drives a full refresh
+    // at an unpowered panel.
+    //
+    // Deliberately NOT a workInFlight term. A transfer whose transport is gone
+    // cannot progress, so holding the loop awake for it burns power for work that
+    // will never happen -- on nRF a delay(1) gate is below the tickless threshold
+    // and spins rather than sleeping. Remove the state; do not idle on it.
+    if (pipeState.active && !pipeState.error && !directWriteActive && !partialCtx.active) {
+        od_log_error("ERROR: orphaned pipe session (no hardware half) - resetting");
+        resetPipeWriteState();
     }
 }
 
@@ -1902,11 +1953,11 @@ static void imageWriteLogFinish(uint32_t written, uint32_t total) {
 }
 
 bool imageWriteLogQuietCmd(void) {
-    return transferActive() && imgLogChunks >= 1;
+    return imageWriteFramesMayStillArrive() && imgLogChunks >= 1;
 }
 
 bool imageWriteLogQuietAck(void) {
-    return transferActive() && imgLogChunks >= 2;
+    return imageWriteFramesMayStillArrive() && imgLogChunks >= 2;
 }
 
 // True when this raw frame is a mid-stream image-write data chunk (command
@@ -2472,18 +2523,40 @@ void resetPipeWriteState(void) {
 
 bool pipeWriteActive(void) { return pipeState.active; }
 
-// True while ANY of the three transfer types is streaming. The three flags live in
-// three different places (directWriteActive is a global; pipeState/partialCtx are
-// file-static here), so every caller that just means "a transfer is in flight" used
-// to spell the disjunction out itself -- and drifted: the WiFi roam gate checked
-// direct+pipe but not partial, so a BLE-origin partial write with no LAN client
-// attached could be interrupted by a full-channel scan. Add a fourth transfer type
-// here, not in each caller.
+// Two predicates, because the callers ask two different questions of the same three
+// flags. The flags live in three different places (directWriteActive is a global;
+// pipeState/partialCtx are file-static here), so every caller that just meant "a
+// transfer is in flight" used to spell the disjunction out itself -- and drifted:
+// the WiFi roam gate checked direct+pipe but not partial, so a BLE-origin partial
+// write with no LAN client attached could be interrupted by a full-channel scan.
+// Add a fourth transfer type to BOTH of these, not to each caller.
 //
 // Callers wanting ONE specific transfer keep testing that flag directly (the
 // direct-write watchdog and its teardown, the 0x0072 session-ownership check).
+//
+// transferActive() -- "is viable work in flight?" Excludes a fatally NACKed pipe,
+// whose panel sendPipeNack() has already released: touch I2C polling and a
+// full-channel WiFi scan are safe again the moment that happens, and suspending
+// them until the client next says something is protecting nothing.
+//
+// imageWriteFramesMayStillArrive() -- "would logging this frame spam?" Keeps the
+// errored pipe, because frames keep arriving after a fatal NACK: a compliant client
+// may already have a full window in flight, one that ignores the NACK streams until
+// END. At ~90 frames/s and two lines each (bleRxQueuePush() arrival plus the
+// dispatch banner) un-suppressing those would evict the NACK itself from the log
+// ring -- losing exactly the line worth keeping.
+//
+// The split also keeps the new pipeState.error read off the logging path, which
+// imageWriteLogQuietFrame() reaches from bleRxQueuePush() on the stack callback
+// task. That predicate is read cross-task; it keeps precisely the field reads it
+// has always made.
 bool transferActive(void) {
-    return directWriteActive || pipeState.active || partialCtx.active;
+    return directWriteActive || partialCtx.active ||
+           (pipeState.active && !pipeState.error);
+}
+
+static bool imageWriteFramesMayStillArrive(void) {
+    return directWriteActive || partialCtx.active || pipeState.active;
 }
 
 // A chunk c is "received" for ACK purposes if it was accepted in-order (lies just

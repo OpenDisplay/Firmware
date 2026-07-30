@@ -58,7 +58,18 @@ public:
     void boostAdvertising();       // nRF: temporary fast advertising interval
     void tick();                   // periodic housekeeping (advertising interval restore)
 
-    // --- events: consume-once, polled from loop(). No app-facing callbacks. ---
+    // --- events: polled from loop(), consumed once by the take*() pair below.
+    // No app-facing callbacks. ---
+    // Non-destructive peek. Cooperative waits need to return to loop() on an event
+    // without taking it away from serviceBleEvents(), which remains the single
+    // consumer -- so event ordering, the disconnect RX-boundary capture and the
+    // deferred-cleanup flags are all unaffected by anything that polls this.
+    //
+    // The backing flags are plain volatile, and the existing take/clear protocol
+    // has a known pre-existing coalescing weakness: a second same-type event
+    // arriving inside the check-then-clear window is lost. This peek neither
+    // introduces nor worsens that; fixing it is a separate change.
+    bool eventPending() const;
     bool takeConnectedEvent();
     // Optionally reports the stack's disconnect reason code, which is otherwise
     // lost now that the callback no longer runs application code inline.

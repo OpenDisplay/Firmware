@@ -89,7 +89,25 @@ void setup() {
     od_log_init(&LogSerialPort);
     #elif !defined(DISABLE_USB_SERIAL)
     od_log_init(&Serial);
+    #ifndef TARGET_ESP32
+    // nRF only. With DTR low the CDC TX FIFO is overwritable, so its free-space
+    // query reads 0 while a write would still succeed -- without this the logger
+    // would count a drop for every line on an unattended tag and hand the first
+    // terminal to attach a meaningless six-figure total. operator bool() is
+    // tud_cdc_n_connected(), i.e. exactly the condition that used to trap
+    // Adafruit_USBD_CDC::write().
+    //
+    // Deliberately NOT installed on ESP32: HWCDC::isCDC_Connected()'s SOF watchdog
+    // is documented to flap on a healthy link, so a hook there would silently
+    // discard good output.
+    od_log_set_ready_hook([]() -> bool { return (bool)Serial; });
     #endif
+    #endif
+    // Immediately after od_log_init(), so the boot lines below are not emitted at a
+    // zero budget. setup() and loop() share a task on both targets (nRF's loop_task
+    // calls setup() then loops; the ESP32 loopTask does the same), so capturing here
+    // identifies the right one.
+    od_log_set_loop_task(xTaskGetCurrentTaskHandle());
     od_log_info("=== FIRMWARE INFO ===");
     uint8_t fwMajor = getFirmwareMajor();
     uint8_t fwMinor = getFirmwareMinor();
@@ -626,14 +644,10 @@ void loop() {
     // Session watchdogs. Shared as of Phase 4: these are transport-agnostic and
     // were ESP32-only for no reason other than living in the ESP32 loop arm, so
     // nRF gains them. A hung transfer there used to sit until disconnect.
-    if (directWriteActive && directWriteStartTime > 0) {
-        uint32_t directWriteDuration = millis() - directWriteStartTime;
-        if (directWriteDuration > 900000UL) {  // 15 minute timeout (upload + refresh window)
-            od_log_error("ERROR: Direct write timeout (%u ms) - cleaning up stuck state", (unsigned)directWriteDuration);
-            cleanupDirectWriteState(true);
-        }
-    }
-    checkPartialWriteTimeout();
+    // Both now live in display_service.cpp, beside the transfer state they tear
+    // down. Splitting them across files is how the direct-write one came to
+    // release the panel while leaving its enclosing PIPE session running.
+    checkTransferTimeouts();
 
     #ifdef OPENDISPLAY_HAS_WIFI
     // WiFi handling runs after BLE queue processing to avoid blocking
@@ -666,8 +680,20 @@ void loop() {
     // deep sleep — lastActivityMs supplies the quiet window. The terms that only
     // one target can ever raise (s_advertisingRestartPending, wifiLanSession)
     // are simply false on the other, so one expression serves both.
+    // eventPending() closes the callback-timing hole: an event raised after
+    // serviceBleEvents() ran in this pass is otherwise invisible until the next
+    // pass -- and this pass is about to park. It is transient like the rest;
+    // take*Event() clears the peeked flag at the next loop top.
+    //
+    // No transfer-state term belongs here, and its absence is deliberate. A live
+    // transfer already has its connected BLE or LAN owner holding the gate, and
+    // one whose transport is gone cannot progress, so refusing to sleep on it
+    // would burn power for work that will never happen. That state is healed in
+    // checkTransferTimeouts() instead. See
+    // docs/PLAN_WORK_GATE_TRANSFER_TERMS_2026-07-29.md.
     const bool workInFlight = bleRxQueuePending() || bleTxQueuePending() ||
                               ble.isConnected() ||
+                              ble.eventPending() ||
                               s_advertisingRestartPending ||
                               epdRefreshInProgress ||
                               wifiLanSession;
@@ -701,14 +727,26 @@ void idleDelay(uint32_t delayMs) {
         // idleDelay would otherwise hold queued ACKs for its full duration.
         // Draining TX is safe here because it only notifies; it dispatches nothing.
         serviceBleTx();
-        // RX is deliberately NOT drained here -- return to loop() and let
-        // serviceBleRx() dispatch at top level instead. Dispatching inside
-        // idleDelay would make command handlers reentrant the moment anything
-        // calls idleDelay from a handler, corrupting multi-frame transfer state.
-        // Returning early also caps command latency at one CHECK_INTERVAL_MS
-        // rather than the caller's full delay, which is what makes nRF's move to
+        // RX and transport events are deliberately NOT serviced here -- return to
+        // loop() and let serviceBleEvents()/serviceBleRx() handle them at top
+        // level. Dispatching RX inside idleDelay would make command handlers
+        // reentrant the moment anything calls idleDelay from a handler, corrupting
+        // multi-frame transfer state; consuming events here would move the single
+        // consumer out of loop() and break the ordering serviceBleEvents() relies
+        // on. Returning early also caps latency at one CHECK_INTERVAL_MS rather
+        // than the caller's full delay, which is what makes nRF's move to
         // loop()-side dispatch viable: its idle waits are 500 ms and up.
-        if (bleRxQueuePending()) return;
+        //
+        // This break set answers "did work appear while we were parked?", which is
+        // NOT the question workInFlight answers ("is there work?"). A term belongs
+        // here only if (i) it can go false->true asynchronously, on a task other
+        // than loop(), and (ii) idleDelay cannot service that work itself. RX and
+        // transport events are the only two that qualify. bleTxQueuePending() is
+        // excluded because serviceBleTx() already runs every chunk above;
+        // epdRefreshInProgress, the transfer-state flags, s_advertisingRestartPending
+        // and wifiLanSession are excluded because only loop() itself raises them,
+        // so none can change while loop() is sitting inside this function.
+        if (bleRxQueuePending() || ble.eventPending()) return;
         uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
         delay(chunkDelay);
         remainingDelay -= chunkDelay;
