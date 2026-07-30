@@ -19,6 +19,9 @@ extern void it8951LoadImgAreaStart(FASTEPDSTATE* pState, uint16_t endian, uint16
 extern void it8951WriteCmdCode(FASTEPDSTATE* pState, uint16_t cmd);
 extern void it8951DisplayArea1Bit(FASTEPDSTATE* pState, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                                   uint16_t mode, uint8_t bg_gray, uint8_t fg_gray);
+// FastEPD's cached PCAL6416A write
+extern void bbepPCALDigitalWrite(uint8_t pin, uint8_t value);
+static void fastepd_inkplate_wakeup_off(void);
 
 class OdFastEPD : public FASTEPD {
 public:
@@ -278,6 +281,7 @@ bool fastepd_wait_refresh(int timeout_sec) {
 
 void fastepd_sleep_after_refresh(void) {
     g_epd.einkPower(0);
+    fastepd_inkplate_wakeup_off();
     g_epd.deInit();
 }
 
@@ -336,8 +340,19 @@ void fastepd_direct_refresh(int refresh_mode) {
     g_epd.backupPlane();
 }
 
+// FastEPD's Inkplate einkPower(0) drops the rails but leaves the TPS65186 WAKEUP
+// asserted, so the PMIC stays awake and the board idles high.
+static void fastepd_inkplate_wakeup_off(void) {
+    if (globalConfig.display_count < 1) return;
+    const uint16_t ic = globalConfig.displays[0].panel_ic_type;
+    if (ic != OD_PANEL_IC_INKPLATE5V2_1280X720 && ic != OD_PANEL_IC_INKPLATE10_1200X825) return;
+    FASTEPDSTATE* st = g_epd.state();
+    if (st) bbepPCALDigitalWrite(st->panelDef.ioShiftSTR, 0); // WAKEUP low -> PMIC shutdown
+}
+
 void fastepd_direct_sleep(void) {
     g_epd.einkPower(0);
+    fastepd_inkplate_wakeup_off();
     g_epd.deInit();
 }
 
