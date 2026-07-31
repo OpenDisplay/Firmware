@@ -900,6 +900,10 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             // advance, and each retransmission's still-higher counter would be
             // rejected further out than the last, until re-authentication. That is
             // a transient link fault promoted to a permanent session fault.
+            //
+            // This reverses Decision A of
+            // docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md, which specified a cap of
+            // 128; see "Reversal of Decision A" at the end of that file.
             handlePipeWriteData(data + 2, len - 2);
             break;
         case CMD_PIPE_WRITE_END:      // 0x0082

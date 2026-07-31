@@ -379,7 +379,14 @@ loss, not as an unrecoverable condition.
 
 **All five are settled.** Nothing blocks implementation.
 
-### Decision A — RESOLVED: forward cap **128**
+### Decision A — ~~RESOLVED: forward cap **128**~~ — **REVERSED 2026-07-31**
+
+> ⛔ **This decision no longer holds. There is no forward cap.** The constant was removed in
+> `aef3a6b` because the cap made a session permanently unrecoverable once a gap crossed it. See
+> [Reversal of Decision A](#reversal-of-decision-a--the-forward-cap-was-removed-2026-07-31) at the
+> end of this file. The analysis below is retained because its framing of *what the gap is* is
+> still correct and is what ultimately showed the cap could not be sized safely — but do not
+> implement from it.
 
 > **Revised after adversarial review** (`C1`, `M2` in
 > [`FINDINGS_PHASE1_PLAN_REVIEW_2026-07-26.md`](FINDINGS_PHASE1_PLAN_REVIEW_2026-07-26.md)).
@@ -975,3 +982,102 @@ Everything below is still open:
     does HA recover cleanly from that disconnect (as opposed to from the `0xFE` it would otherwise
     have seen)? Per the pipe-window arithmetic above this **will** happen with default settings.
   - Does `55a2478`'s `AUTH_REQUIRED` actually drive HA's reauth flow end to end?
+
+---
+
+# Reversal of Decision A — the forward cap was removed (2026-07-31)
+
+**Commit `aef3a6b`, on `fix/nonce-replay-window` (rebased onto the squashed `#132`/`#133`/`#134`
+`main`).** Decision A is reversed. `OD_NONCE_FORWARD_CAP` no longer exists, and comparison moved
+from modular to numeric ordering. Decisions B, C and D stand.
+
+## What the cap did
+
+The cap did not merely fail to help — it converted a transient link fault into a permanent session
+fault. Once a gap exceeded 128:
+
+1. `od_nonce_check()` returns `NONCE_OUT_OF_WINDOW`, so nothing commits.
+2. `last_seen_counter` therefore never advances — that is the D2 fix working as designed.
+3. The client re-encrypts every retransmission with a **fresh, higher** counter and never resends
+   the original ciphertext (`_write_pipe_frame`, `device.py:2683`), so the next frame is rejected at
+   a *greater* distance than the last.
+4. Every subsequent frame is rejected, forever. Only re-authentication recovers, and the client
+   deliberately does not re-authenticate mid-transfer (`device.py:778`). The transfer stalls until
+   the 15-minute stuck-transfer watchdog releases the panel.
+
+Step 4b's silent drop does not rescue this. Dropping silently avoids the immediate fatal teardown a
+`0x81` NACK would cause, but the transfer is dead either way.
+
+## Why the cap could not be sized
+
+Decision A's own framing was right and is what condemns it: the ceiling is the client's retransmit
+budget `max_retx = max(3*W, n/2)`, scaled by `blocks_per_ack`, a user-facing Home Assistant option
+in another repo. That is order thousands for a full-panel upload — and it **accumulates across
+aborted attempts**, because the client's counter keeps climbing while `last_seen` is frozen. With
+`W = 32` and `blocks_per_ack = 1`, 16 queued gap-ACKs at `PIPE_RETX_ACK_SPACING = 2` burn 128
+counters on repairs alone. No firmware-side number is defensible.
+
+## Why removing it costs nothing
+
+The cap was vestigial once D2 landed. All 8 counter bytes sit inside the CCM nonce, so a tampered
+counter changes the keystream and fails the tag; `nonceCommit()` runs only on the success arm; and
+passing the check mutates nothing. An attacker who cannot forge a tag could not advance `last_seen`
+at any distance, cap or no cap. Nor is it DoS protection: the session id is cleartext in every
+frame, so anyone able to flood CCM with a capped window could flood it without one.
+
+## What replaced it
+
+Numeric ordering, matching RFC 4303 Appendix A2, which likewise has no forward bound:
+
+```
+counter == last_seen            -> bit 0 set ? REPLAY : OK
+counter >  last_seen            -> OK          (any distance; the tag is the gate)
+counter <  last_seen, back<256  -> bit[back] set ? REPLAY : OK
+counter <  last_seen, back>=256 -> OUT_OF_WINDOW
+```
+
+Consequences worth recording:
+
+- **Modular arithmetic is gone.** It made a counter far behind indistinguishable from one far
+  ahead, which is what allowed an ancient counter to present as an enormous forward jump — the
+  "sharp edge" the old header admitted, where committing one would rewind `last_seen` and clear the
+  bitmap. That is now impossible by construction rather than by the caller's contract. **Do not**
+  reintroduce a bound as `cap = UINT64_MAX` or as "not-backward implies forward": either restores
+  the overlap. `test_far_behind_is_never_forward()` pins both.
+- **Counters no longer wrap**, per RFC 4303 §3.3.3. Reaching `UINT64_MAX` requires
+  re-authentication; wrapping would reuse a `(key, nonce)` pair. Unreachable in practice.
+- **`NONCE_OUT_OF_WINDOW` now means only "too far behind."** The rejection log computes direction
+  from the counters instead of inferring it from the reason, which would print an underflowed
+  20-digit distance.
+- **`OD_NONCE_BACKWARD_BITS` keeps its value but loses its old justification**, which was stated in
+  terms of the cap ("kept strictly greater than `OD_NONCE_FORWARD_CAP`"). It is now purely
+  out-of-order tolerance, and its exact value is not load-bearing: a backward rejection is
+  self-healing, because the retransmit carries a higher counter that is accepted unconditionally.
+
+## Effect on the rest of this document
+
+| Item | Status |
+|---|---|
+| **Decision A** | **Reversed.** No forward cap. |
+| **Decision B** — shifting bitmap, `uint64_t[4]`, IPsec/DTLS style | **Stands.** The representation is unchanged; only the arithmetic over it moved from modular to numeric. |
+| **Decision C** — file-static wrappers | **Stands**, including its as-built correction. |
+| **Decision D** — standalone host test + separate CI job | **Stands.** |
+| **Decision E** — no wire change | **Stands.** This reversal changes no byte on the wire: the accept set only grows, so no peer needs updating in lockstep. |
+| **Step 6** — "write the mechanism, not a number" | **Stands, and is now literal**: there is no number to write. The `communication.cpp` comment records why there cannot be one. |
+| **Step 5 hardware tests 1, 2, 2c** | **Obsolete as written.** They existed to validate the 128 figure. What replaces them is confirming a transfer survives a gap that *would* have crossed it. |
+| **"Unverified on hardware"** | Still accurate, and this reversal did not change it: the cap was condemned by analysis, not by the bench. |
+
+## Verification
+
+Host suite: **47445 checks** pass under `-Werror` with ASan+UBSan. The same suite run against the
+pre-change implementation fails **1635** checks, which is the evidence that the new tests
+discriminate rather than merely pass. Added `test_forward_gap_is_not_a_cliff()` (the defect as a
+*sequence*, since a point test at `last_seen+129` would also pass under `cap = UINT64_MAX`),
+`test_far_behind_is_never_forward()`, and `od_nonce_never_accepts_consumed()` — a sweep over every
+counter ever committed, which is the one assertion in the file that does not restate the code. The
+oracle no longer prunes its seen set; that pruning encoded the implementation's forgetting and so
+could only ever agree with it.
+
+Builds: `nrf52840custom`, `esp32-c3-N16`, `esp32-N4`.
+
+Still unverified on hardware, unchanged from the list above.

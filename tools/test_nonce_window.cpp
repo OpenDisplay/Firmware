@@ -7,7 +7,8 @@
 //   /tmp/test_nonce_window
 //
 // This file is as much a written-down statement of the intended semantics of the
-// anti-replay window as it is a test.
+// anti-replay window as it is a test. It discharges Decision D of
+// docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
 //
 // The representation under test (see the header):
 //   bit i of the bitmap == "counter (last_seen - i) has been consumed"

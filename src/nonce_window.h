@@ -7,10 +7,12 @@
 // firmware logging layer, and it touches no global state. Everything here
 // operates on plain values passed in by the caller, so the whole state machine
 // can be compiled and exercised on a host under UBSan/ASan by
-// tools/test_nonce_window.cpp.
+// tools/test_nonce_window.cpp. See Decision D in
+// docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
 //
 // Representation ("shifting" style, as opposed to the circular RFC 6479 /
-// WireGuard style):
+// WireGuard style -- Decision B in docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md,
+// which still stands; only the arithmetic over it moved from modular to numeric):
 //
 //   bit i of the bitmap == "counter (last_seen - i) has been consumed".
 //   bit 0 is last_seen itself.
@@ -100,6 +102,10 @@ static inline void od_nonce_bit_set(uint64_t* bm, uint64_t bit) {
 // gap exceeded the cap, nothing would commit, last_seen would never advance, and
 // every subsequent frame — each carrying a still higher counter — would be
 // rejected further out than the last, until re-authentication.
+//
+// This reverses Decision A of docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md, which
+// specified a cap of 128; that file's "Reversal of Decision A" section carries the
+// full argument and the arithmetic showing no cap could have been sized safely.
 //
 // The security invariant is "a consumed counter is never returned NONCE_OK
 // again", and it rests on last_seen being monotonically non-decreasing: only the

@@ -119,7 +119,7 @@ void deriveSessionId(const uint8_t* session_key, const uint8_t* client_nonce,
 // populated). In particular nonce_counter — the device's OWN outbound counter —
 // must keep being zeroed here: a device that carried it across a re-auth while
 // the client restarts at 0 would reproduce the [H2] keystream reuse against
-// itself.
+// itself. See docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md Step 1.
 static void resetNonceState(void) {
     encryptionSession.nonce_counter      = 0;   /* device's OWN outbound counter */
     encryptionSession.last_seen_counter  = 0;
