@@ -771,11 +771,13 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             // §5.2 already reserves NACKs for unrecoverable conditions, "not
             // ordinary packet loss", and §5.1 makes a 0x81 NACK unconditionally
             // fatal, so answering one here violates the spec as written. Send
-            // NOTHING: silence is a first-class signal on the pipe path. The seq
-            // is absent from the next SACK mask, the client retransmits it, and
-            // the transfer continues. Answering with the 3-byte NACK instead
-            // makes the client raise IntegrityCheckError, which its pipe send
-            // loop does not catch, killing the whole upload on the first
+            // NOTHING: silence is a first-class signal on the pipe path. For a
+            // rejection INSIDE the window the seq is absent from the next SACK
+            // mask, the client retransmits it, and the transfer continues. A gap
+            // beyond OD_NONCE_FORWARD_CAP is NOT repaired this way -- see the
+            // CMD_PIPE_WRITE_DATA note below. Answering with the 3-byte NACK
+            // instead makes the client raise IntegrityCheckError, which its pipe
+            // send loop does not catch, killing the whole upload on the first
             // rejected frame.
             //
             // Deliberately narrow:
@@ -884,10 +886,18 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             // OD_NONCE_FORWARD_CAP (src/nonce_window.h) is therefore a HEURISTIC
             // with headroom over the realistic worst case, not an invariant this
             // firmware can prove; a client-side blocks_per_ack change would
-            // silently falsify any specific number written here. A gap beyond
-            // the cap is no longer fatal: the frame is dropped silently (Step 4b
-            // above) and repaired by the normal SACK path. See Decision A / [C1]
-            // in docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
+            // silently falsify any specific number written here. The cap's job is
+            // to put overflow out of REACH, not to make it RECOVERABLE: once a
+            // frame is rejected for fwd > cap nothing commits, so last_seen never
+            // advances, and every retransmission -- which re-encrypts with a
+            // fresh, HIGHER counter (py-opendisplay _write_pipe_frame), never
+            // resending the original ciphertext -- is rejected at a greater
+            // distance still. The session cannot recover without
+            // re-authenticating. Dropping silently (Step 4b above) only avoids the
+            // immediate fatal teardown a 0x81 NACK would cause; the transfer then
+            // stalls until the stuck-transfer timeout (pipe-write-protocol.md
+            // §5.3) releases the panel. See Decision A / [C1] in
+            // docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
             handlePipeWriteData(data + 2, len - 2);
             break;
         case CMD_PIPE_WRITE_END:      // 0x0082
