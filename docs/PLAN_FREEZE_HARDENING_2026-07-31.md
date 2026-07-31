@@ -76,9 +76,26 @@ and R4's no-transfer-gate was reconciled in the previous revision.
 | # | Phase | Depends on | State today |
 |---|---|---|---|
 | 1 | Nonce / replay correctness | — | **Shipped** on this branch (`e2e95cd`…`19335e6`) |
-| 2 | BLE-HAL foundation: link-drop seam (with the R3a wait), instance identity + owner token, the instance table, callback-side filtering, activity clock, abort-to-known-state | — | Partially present (`serviceBleDisconnectCleanup`) |
-| 3 | Connection-exclusivity **policy** + idle drop | Phase 2 | Not started |
+| 2 | BLE-HAL foundation: link-drop seam (with the R3a wait), instance identity + owner token, the instance table, callback-side filtering, frame identity tags, activity clock, abort-to-known-state — **plus contender refusal, moved here from Phase 3** | — | **Implemented** on `feat/phase2-ble-hal-foundation` (`dbec776`, `bb7ad1d`); landed, not closed |
+| 3 | Idle drop + the remaining exclusivity policy | Phase 2 | Not started |
 | 4 | Auth-abuse disconnect | Phase 2, Phase 3 | Prototype exists off-branch, not here |
+
+> **Refusal moved from Phase 3 to Phase 2 during implementation.** Phase 2 is not
+> safely shippable without it, so the split as originally drawn was wrong rather
+> than merely inconvenient. Admission is decided once per instance and never
+> revisited (7a row 10), so a client that reconnects into a still-held slot — the
+> ordinary case when `loop()` was blocked in a refresh — becomes a permanent
+> contender; on nRF it occupies the only peripheral link and the device stops
+> accepting anyone until that client happens to leave. The two alternatives were
+> both worse and both were tried: releasing the token in the disconnect callback
+> admits a new owner while the departed session's transfer, crypto and TX ring are
+> still live, and skipping the refusal scan while the slot is unowned leaves a
+> decided loser attached forever.
+>
+> What stayed in Phase 3: the idle timeout and every other path that reclaims a
+> *held* slot. Refusal only makes the "decided once" rule true; it never evicts.
+> LAN accept also became refuse-not-evict here for the same reason (its eviction
+> path could strand the token until reboot).
 
 **Phase order note.** Phase 2 is the foundational layer: every transport/HAL
 *mechanism* the later phases stand on — the portable `disconnect()`, connection instance
