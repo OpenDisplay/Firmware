@@ -96,7 +96,14 @@ static mbedtls_ssl_config    tlsConf;
 static mbedtls_ctr_drbg_context tlsDrbg;
 static mbedtls_entropy_context  tlsEntropy;
 
-static uint32_t lastLanActivityMs = 0;  // for the OD_LAN_READ_TIMEOUT_S idle drop
+// lastLanActivityMs is GONE. LAN used to keep its own activity clock, stamped at
+// connect, handshake completion, raw bytes read and frame dispatch, and checked
+// inline in handleWiFiServer(). R4 requires the SAME definition of activity on
+// every transport -- a recognised command from the owner, excluding refresh -- and
+// two clocks implementing one rule is how they drift. The shared clock in
+// link_owner.cpp is now the only one; serviceIdleTimeout() in main.cpp enforces it
+// for both transports, with each keeping its own constant (BLE 120 s local,
+// LAN OD_LAN_READ_TIMEOUT_S 30 s from the wire header).
 // Epoch of the current LAN session's ownership claim, 0 when this session does not
 // own the slot. Kept so the release matches the FULL identity: releasing on
 // transport alone would let a stale LAN teardown free a slot a newer session (or a
@@ -885,6 +892,79 @@ static int lanReadIntoBuffer(void) {
     return (bytesRead > 0) ? bytesRead : 0;
 }
 
+// Decide a freshly accepted socket's fate: admit it as the owner, or refuse it.
+//
+// Split out of handleWiFiServer() so the caller can CONTINUE servicing an existing
+// session in the same pass whatever the outcome. When refusal returned early from
+// handleWiFiServer, a host reconnecting every pass starved the incumbent -- its TLS
+// handshake never advanced and its buffered frames were never dispatched, so the
+// shared activity clock stopped being stamped and the end-of-pass idle timeout
+// eventually dropped it with valid commands still unread. Refusal must be inert
+// (R3), and inbound traffic must be parsed before the idle check (R7d step 3 before
+// step 4); an early return broke both.
+static void admitOrRefuseLanClient(WiFiClient& incoming) {
+    // REFUSE while the slot is held -- never evict. Two reasons, both concrete:
+    //
+    //  - The eviction path this replaces closed the previous socket without
+    //    releasing its ownership epoch, and the replacement then lost its own
+    //    claim, so the departed session's identity became unreachable and the slot
+    //    stayed held until reboot.
+    //  - Eviction is unauthenticated by design: LAN-TLS bypasses app-layer auth, so
+    //    any host on the network could kill an in-flight display push by opening a
+    //    socket, with no credentials.
+    //
+    // The incumbent is untouched: no teardown, no crypto clear, no cleanup flag.
+    // That is R3's "refusal is inert", and it also removes a pre-existing bug in the
+    // eviction it replaces -- that path cleared TLS and crypto but never requested
+    // transfer cleanup, so an evicted client's in-flight transfer stayed live and
+    // the new client's frames (same ORIGIN_LAN, so frameOwnsSession could not tell
+    // them apart) landed in it.
+    const LinkId held = linkOwnerId();
+    if (held.who != OWNER_NONE) {
+        lanLog("LAN: refusing new client, slot held by " +
+               String(held.who == OWNER_BLE ? "BLE" : "LAN"));
+        incoming.stop();
+        return;
+    }
+
+    wifiClient = incoming;
+    // TCP_NODELAY: every LAN write is a complete, self-delimited frame, so there is
+    // never a following write for Nagle to coalesce it with -- it can only hold a
+    // small frame until the peer's delayed ACK fires (40-200 ms). With per-chunk
+    // direct-write ACKs that lands on every frame of a transfer.
+    wifiClient.setNoDelay(true);
+    wifiClient.setTimeout(30000);
+    tcpReceiveBufferPos = 0;
+    wifiServerConnected = true;
+
+    // Claim at TCP ACCEPT, before the TLS handshake (7a row 2): the handshake is
+    // driven incrementally across later passes, so deferring the claim until it
+    // completes would leave the slot free for a BLE connect or a second socket in
+    // the meantime. The accept is this transport's earliest hook, so it is the same
+    // "claim at the earliest hook" rule the BLE connect callback follows -- and the
+    // same CAS, which is what makes cross-transport arbitration the word itself
+    // rather than loop ordering.
+    //
+    // The slot was free a moment ago, so this normally wins. It can still lose to a
+    // BLE connect landing on the host task in between: the callback is the
+    // authoritative arbitration point, not this loop-side test (R7d).
+    s_lanEpoch = linkNextEpoch();
+    if (!linkClaim((LinkId){OWNER_LAN, 0, s_lanEpoch})) {
+        lanLog("LAN: refusing new client, slot claimed concurrently");
+        s_lanEpoch = 0;
+        incoming.stop();
+        wifiClient = WiFiClient();
+        wifiServerConnected = false;
+        return;
+    }
+
+    lanLog("LAN client connected from " + wifiClient.remoteIP().toString());
+    if (tlsMode && !tlsBeginSession()) {
+        lanLog("LAN: TLS session start failed, dropping");
+        disconnectWiFiServer();
+    }
+}
+
 void handleWiFiServer() {
     // Execute a queued roam (RSSI dropped below OD_LAN_ROAM_RSSI_THRESHOLD) before any
     // other work; it self-gates on idle, so this is a no-op mid-transfer.
@@ -906,74 +986,20 @@ void handleWiFiServer() {
         return;
     }
 
+    // Accept-side refusal must NOT return from this function. Everything below --
+    // driving the incumbent's TLS handshake, reading its socket, dispatching its
+    // frames -- is what stamps the shared activity clock, and the idle timeout is
+    // evaluated at the end of this same pass. An early return on refusal therefore
+    // lets a contender starve the incumbent: a host that reconnects every pass
+    // stops the incumbent being serviced at all, and after OD_LAN_READ_TIMEOUT_S
+    // the idle drop kills it -- with valid commands still sitting unread in its
+    // socket. That is both an R3 violation (refusal must be inert) and an R7d one
+    // (step 3 must precede step 4). So the refusal branch closes the contender and
+    // falls through.
     WiFiClient incoming = wifiServer.accept();
     if (incoming) {
-        // REFUSE while the slot is held -- do not evict. Same scope note as
-        // serviceContenderRefusal() in main.cpp: refusal belongs to Phase 3, but
-        // Phase 2 cannot ship the owner token without it. Two concrete reasons here:
-        //
-        //  - The old eviction path closed the previous socket without releasing its
-        //    ownership epoch, and the replacement then lost its own claim -- so the
-        //    departed session's identity became unreachable and the slot was held
-        //    until reboot. Refusing removes the path rather than patching it.
-        //  - Eviction is unauthenticated by design: LAN-TLS bypasses app-layer auth,
-        //    so today ANY host on the network can kill an in-flight display push
-        //    just by opening a socket, with no credentials.
-        //
-        // The incumbent is untouched: no teardown, no crypto clear, no cleanup flag.
-        // That is the whole of R3's "refusal is inert", and it also fixes a
-        // pre-existing bug in the eviction it replaces -- that path cleared TLS and
-        // crypto but never requested transfer cleanup, so an evicted client's
-        // in-flight transfer stayed live and the new client's frames (same
-        // ORIGIN_LAN, so frameOwnsSession could not tell them apart) landed in it.
-        const LinkId held = linkOwnerId();
-        if (held.who != OWNER_NONE) {
-            lanLog("LAN: refusing new client, slot held by " +
-                   String(held.who == OWNER_BLE ? "BLE" : "LAN"));
-            incoming.stop();
-            return;
-        }
-        wifiClient = incoming;
-        // TCP_NODELAY: every LAN write is a complete, self-delimited frame, so there
-        // is never a following write for Nagle to coalesce it with -- it can only
-        // hold a small frame until the peer's delayed ACK fires (40-200 ms). With
-        // per-chunk direct-write ACKs that lands on every frame of a transfer.
-        wifiClient.setNoDelay(true);
-        wifiClient.setTimeout(30000);
-        tcpReceiveBufferPos = 0;
-        wifiServerConnected = true;
-        lastLanActivityMs = millis();
-        // Claim the slot at TCP ACCEPT, before the TLS handshake (7a row 2). The
-        // handshake is driven incrementally across later loop passes, so deferring
-        // the claim until it completes would leave the slot free for a BLE connect
-        // or a second socket in the meantime.
-        //
-        // The accept is the LAN transport's earliest hook, so this is the same
-        // "claim at the earliest hook" rule the BLE connect callback follows, and
-        // the same CAS -- which is what makes cross-transport arbitration the word
-        // itself rather than loop ordering.
-        //
-        // The slot was free at the check above, so this claim normally wins. It can
-        // still lose to a BLE connect landing on the host task in between -- the
-        // callback is the authoritative arbitration point, not this loop-side test
-        // (R7d) -- in which case the socket is refused for the same reason.
-        s_lanEpoch = linkNextEpoch();
-        if (!linkClaim((LinkId){OWNER_LAN, 0, s_lanEpoch})) {
-            lanLog("LAN: refusing new client, slot claimed concurrently");
-            s_lanEpoch = 0;
-            incoming.stop();
-            wifiClient = WiFiClient();
-            wifiServerConnected = false;
-            return;
-        }
-        lanLog("LAN client connected from " + wifiClient.remoteIP().toString());
-        if (tlsMode) {
-            if (!tlsBeginSession()) {
-                lanLog("LAN: TLS session start failed, dropping");
-                disconnectWiFiServer();
-                return;
-            }
-        }
+        admitOrRefuseLanClient(incoming);
+        // Deliberately no return here on either outcome -- see the note above.
     }
 
     if (!wifiServerConnected || !wifiClient.connected()) {
@@ -989,7 +1015,12 @@ void handleWiFiServer() {
         int hs = mbedtls_ssl_handshake(&tlsSsl);
         if (hs == 0) {
             tlsHandshakeDone = true;
-            lastLanActivityMs = millis();
+            // The idle baseline starts HERE, not at TCP accept: handshake traffic
+            // is not a command (R4/7a). A handshake that never completes therefore
+            // leaves the clock at its accept-time stamp and the ordinary 30 s drop
+            // reclaims the socket -- which is why no separate handshake deadline is
+            // needed.
+            linkStampOwnerCommand();
             lanLog("LAN: TLS handshake complete");
         } else if (hs == MBEDTLS_ERR_SSL_WANT_READ || hs == MBEDTLS_ERR_SSL_WANT_WRITE) {
             // still handshaking; but honor the idle timeout below
@@ -1035,13 +1066,10 @@ void handleWiFiServer() {
             // site below, which is reached only by a framed, recognised command.
             drainedBytes += (uint32_t)got;
         } else if (drainedBytes == 0) {
-            // No traffic at all this tick: drop only after OD_LAN_READ_TIMEOUT_S
-            // of silence (persistent client is otherwise kept). Any valid frame
-            // below resets the timer.
-            if ((millis() - lastLanActivityMs) > (uint32_t)OD_LAN_READ_TIMEOUT_S * 1000UL) {
-                lanLog("LAN: idle timeout, dropping client");
-                disconnectWiFiServer();
-            }
+            // Nothing to read this tick. The idle DROP is not decided here any
+            // more: serviceIdleTimeout() owns it for both transports, and it must
+            // run after inbound traffic has been parsed (7d step 4) or a LAN client
+            // is dropped with its command already sitting in the buffer.
             return;
         }
 
@@ -1068,7 +1096,9 @@ void handleWiFiServer() {
                 const LinkId lanOwner = linkOwnerId();
                 g_commandInstance = (lanOwner.who == OWNER_LAN) ? linkIdWord(lanOwner) : 0;
             }
-            lastLanActivityMs = millis();
+            // No stamp here: imageDataWritten() stamps the shared clock itself,
+            // and only for a RECOGNISED command from the owner -- which is the
+            // whole of R4's definition and what this site could not enforce.
             imageDataWritten(NULL, NULL, tcpReceiveBuffer + 2, flen);
             g_commandInstance = 0;
             g_commandOrigin = ORIGIN_BLE;   // restore default for any subsequent BLE drain

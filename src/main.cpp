@@ -627,6 +627,80 @@ static void serviceContenderRefusal() {
     }
 }
 
+// How long an ADMITTED client may stay silent before its link is dropped and the
+// slot reclaimed (CONNECTION_POLICY R4, 7c row 1).
+//
+// CLIENT BEHAVIOUR THIS ASSUMES: py-opendisplay authenticates within one exchange
+// of connecting and, during a transfer, never leaves more than a few seconds
+// between frames. 120 s is therefore two orders of magnitude above any legitimate
+// inter-command gap. If a client change ever pushes real silence toward this
+// value, the assertion in py-opendisplay's suite is what should fail first, not a
+// field report.
+//
+// WHY SO GENEROUS -- the direction of the error inverted when R4 landed, so this
+// is not an oversight in the other direction:
+//   - While the drop was gated on !transferActive(), a short timeout could only
+//     ever kill an idle session, so erring short was cheap.
+//   - R4 removed that gate. This can now terminate an in-progress UPLOAD whose
+//     client went quiet, so erring short costs a legitimate transfer.
+// The accepted cost is bounded and lands on one case: a returning client waits up
+// to 120 s behind a stale-but-ALIVE incumbent. A client that is genuinely gone is
+// reaped by the link layer in ~4-6 s (this firmware requests no supervision
+// timeout, so the central's negotiated value applies), so the lockout never
+// applies to a crashed or out-of-range peer.
+//
+// Firmware-local rather than a wire field, unlike its LAN cousin: OD_LAN_READ_TIMEOUT_S
+// lives in opendisplay_protocol.h because it is a documented client-visible
+// contract, and this plan may not touch that header. The asymmetry is deliberate.
+#ifndef OD_BLE_IDLE_TIMEOUT_MS
+#define OD_BLE_IDLE_TIMEOUT_MS 120000UL
+#endif
+
+// Reclaim a slot held by a client that has gone silent (7c). This is the ONLY way
+// a held slot is ever released short of the client leaving, because admission
+// never evicts -- refusal and reclaim are deliberately independent mechanisms, so
+// an incumbent's fate never depends on whether someone else happened to knock.
+//
+// Runs LAST in the pass (7d step 4) so traffic parsed earlier this pass counts.
+// That ordering is load-bearing for LAN, where inbound bytes can be sitting in the
+// socket when the deadline is evaluated.
+static void serviceIdleTimeout() {
+    // 7c row 3: a refresh is not idleness. loop() does not run for its duration
+    // while wall-clock time passes, so this would otherwise fire the instant a
+    // long refresh ended. endRefresh() re-stamps the clock at the transition; this
+    // guard covers the pass in which the refresh is still running.
+    if (epdRefreshInProgress) return;
+    const LinkId owner = linkOwnerId();
+    // 7c row 4: no owner, no timer. Also excludes OWNER_TERMINAL, where the device
+    // is on its way into deep sleep and there is nothing left to reclaim.
+    if (owner.who != OWNER_BLE && owner.who != OWNER_LAN) return;
+
+    // R4's "each transport enforces its own timer and constant" is satisfied by the
+    // CONSTANTS differing, not by duplicating the clock -- one clock is what keeps
+    // the two from drifting apart in what they consider activity.
+    uint32_t limitMs = OD_BLE_IDLE_TIMEOUT_MS;
+#ifdef OPENDISPLAY_HAS_WIFI
+    if (owner.who == OWNER_LAN) limitMs = (uint32_t)OD_LAN_READ_TIMEOUT_S * 1000UL;
+#endif
+
+    const uint32_t idleMs = linkMsSinceOwnerCommand();
+    if (idleMs <= limitMs) return;   // 7c row 2
+
+    // NO transferActive() GATE, and that is the whole point of R4. A client that
+    // goes silent DURING an upload is precisely the case that wedges the device,
+    // and a transfer gate would exempt exactly it. The partial transfer is
+    // discarded by the abort; partial upload state is never preserved across a
+    // drop. What remains uncaught is narrower -- a client that keeps sending
+    // recognised commands while its transfer never completes -- and that is still
+    // bounded only by the from-START transfer watchdog.
+    //
+    // WARN with the measured value, so field tuning has data rather than guesses.
+    od_log_warn("Idle timeout: %s owner silent %u ms (limit %u ms) - dropping",
+                owner.who == OWNER_BLE ? "BLE" : "LAN",
+                (unsigned)idleMs, (unsigned)limitMs);
+    abortToKnownState("idle timeout", true, owner);
+}
+
 // Bounded drain: service up to COMMAND_QUEUE_SIZE commands per pass so a
 // sustained W-deep PIPE_WRITE window burst isn't starved at one-per-loop, while
 // the rest of loop() still runs each pass. Responses are flushed BETWEEN
@@ -848,6 +922,13 @@ void loop() {
     #else
     const bool wifiLanSession = false;
     #endif
+
+    // 7d step 4, and it must stay LAST of the four. Traffic parsed earlier in this
+    // pass -- BLE in serviceBleRx(), LAN in handleWiFiServer() just above -- has
+    // already stamped the activity clock, so a client whose command arrived this
+    // pass is never judged idle on the strength of it not having been read yet.
+    // Moving this above handleWiFiServer() would reintroduce exactly that for LAN.
+    serviceIdleTimeout();
 
     // Work in flight *this iteration* only. Every term is transient and most are
     // cleared earlier in this same pass, so this must never be the sole gate on
