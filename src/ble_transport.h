@@ -58,6 +58,20 @@ public:
     // Phase 3's admission scan walks these to find contenders (any live instance
     // that is not the owner); Phase 2 only needs it for diagnostics and the wait.
     uint32_t instanceWordAt(uint8_t index) const;
+    // 0 while this entry's ownership claim is still in flight; otherwise the
+    // IDENTITY WORD the claim was decided for. Published with release ordering after
+    // the claim CAS.
+    //
+    // Why the identity and not a bool: the loop-side scan reads the entry word, the
+    // disposition and the owner word separately and cannot get them atomically. A
+    // bare flag lets it pair one entry's identity with another's disposition after a
+    // slot is retired and reused (ABA). Requiring decidedWord == the entry word
+    // proves the disposition belongs to THIS instance.
+    //
+    // The distinction is load-bearing either way: refusing an in-flight instance can
+    // disconnect the connection that is winning the slot, while never refusing one
+    // leaves a decided loser attached forever -- on nRF, holding the only link.
+    uint32_t instanceClaimDecidedWordAt(uint8_t index) const;
     static uint8_t instanceCapacity();
 
     // --- link drop (CONNECTION_POLICY R3a) ---
@@ -76,7 +90,18 @@ public:
     //
     // Loop task only. A callback that severs its own link mid-dispatch is exactly
     // the class of bug the unified-loop work removed.
-    bool disconnect(uint16_t handle);
+    // Takes the full instance identity, not just a handle: the transport
+    // re-validates that (handle, epoch) is still the live instance immediately
+    // before asking the stack, so a caller acting on a slightly stale scan cannot
+    // disconnect whoever inherited the numeric handle in the meantime.
+    //
+    // RESIDUAL, stated rather than implied: this narrows that window to a few
+    // instructions but cannot close it, because the stack API is handle-addressed
+    // and the host task can retire and reassign a handle at any point. Closing it
+    // fully would need the validate-and-disconnect pair to run on the host task
+    // itself. The exposure is a spuriously dropped client that reconnects -- not
+    // stranded ownership.
+    bool disconnect(uint16_t handle, uint16_t epoch);
 
     // Negotiated connection interval in ms for `handle`, 0 when unknown. The
     // central chooses it; this firmware requests none. Phase 4's TX-flush dwell

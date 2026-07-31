@@ -53,6 +53,10 @@ static volatile uint32_t s_disconnectedWord = 0;
 // what the tag protects against.
 static volatile uint32_t s_instanceWord = 0;
 static volatile bool     s_instanceSubscribed = false;
+// Claim disposition: 0 while the claim is in flight, otherwise the identity word
+// the claim was decided for. See the matching field in ble_transport_esp32.cpp for
+// why it carries the identity rather than a bare flag.
+static volatile uint32_t s_instanceDecidedWord = 0;
 
 // --- advertising interval policy --------------------------------------------
 static uint32_t s_advBoostUntil = 0;
@@ -139,10 +143,14 @@ static void onConnectCb(uint16_t conn_handle) {
     // Same normative order as ESP32 (R2): epoch, then table entry, then claim.
     const uint16_t epoch = linkNextEpoch();
     const uint32_t word = linkPackWord(OWNER_BLE, conn_handle, epoch);
+    __atomic_store_n(&s_instanceDecidedWord, (uint32_t)0, __ATOMIC_RELAXED);
     __atomic_store_n(&s_instanceWord, word, __ATOMIC_RELEASE);
     s_instanceSubscribed = false;
     const LinkId id = { OWNER_BLE, conn_handle, epoch };
     const bool admitted = linkClaim(id);
+    // Publish the identity the claim resolved FOR, so the loop-side refusal scan
+    // can bind the disposition to this exact instance.
+    __atomic_store_n(&s_instanceDecidedWord, word, __ATOMIC_RELEASE);
     od_log_info("=== BLE CLIENT CONNECTED (nRF) h=%u e=%u %s ===",
                 (unsigned)conn_handle, (unsigned)epoch,
                 admitted ? "[owner]" : "[contender - refused service]");
@@ -161,6 +169,7 @@ static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
     // the R3a wait and for the loop's owner comparison. No RX-boundary capture --
     // frames carry their writer's identity instead (CommandQueueItem::tag).
     s_instanceSubscribed = false;
+    __atomic_store_n(&s_instanceDecidedWord, (uint32_t)0, __ATOMIC_RELAXED);
     __atomic_store_n(&s_instanceWord, (uint32_t)0, __ATOMIC_RELEASE);
     // The token is deliberately NOT released here. An intermediate version did
     // release it on this callback, to let a fast reconnect win a fresh claim -- but
@@ -318,9 +327,16 @@ uint32_t BleTransport::instanceWordAt(uint8_t index) const {
     return __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE);
 }
 
+uint32_t BleTransport::instanceClaimDecidedWordAt(uint8_t index) const {
+    if (index != 0) return 0;
+    return __atomic_load_n(&s_instanceDecidedWord, __ATOMIC_ACQUIRE);
+}
+
 uint8_t BleTransport::instanceCapacity() { return 1; }
 
-bool BleTransport::disconnect(uint16_t handle) {
+bool BleTransport::disconnect(uint16_t handle, uint16_t epoch) {
+    // Re-validate as late as possible; see the ESP32 twin and the header note.
+    if (!instanceLive(handle, epoch)) return true;   // already gone, or reassigned
     // Bluefruit takes ONLY a handle: BLEConnection::disconnect() calls
     // sd_ble_gap_disconnect(_conn_hdl, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION),
     // so 0x13 is sent and there is no reason argument to pass -- which is why the

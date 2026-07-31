@@ -62,6 +62,20 @@ struct BleInstance {
     // through __atomic_*: `volatile` orders nothing and does not make a concurrent
     // read/write anything but a data race in C++.
     volatile uint8_t  subscribed;
+    // Claim disposition, published with RELEASE after the CAS resolves: 0 while the
+    // claim is in flight, otherwise the IDENTITY WORD the claim was decided for.
+    //
+    // It carries the identity rather than a bare flag because the loop-side scan
+    // reads several fields and cannot get them atomically. A boolean lets two
+    // distinct hazards through: the scan could pair entry w1 with a disposition that
+    // actually belongs to w2 after the slot was retired and reused (ABA), and it
+    // could not tell "resolved for THIS instance" from "resolved for whoever holds
+    // this slot now". Matching decidedWord against the entry word proves both.
+    //
+    // The distinction itself is load-bearing: refusing an in-flight instance can
+    // disconnect the connection that is winning the slot, while never refusing one
+    // leaves a decided loser attached forever -- on nRF, holding the only link.
+    volatile uint32_t decidedWord;
 };
 static BleInstance s_instances[OD_BLE_MAX_INSTANCES];
 
@@ -84,6 +98,7 @@ static uint32_t instancePublish(uint16_t handle, uint16_t epoch) {
         if (__atomic_compare_exchange_n(&s_instances[i].word, &expected, w,
                                         false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
             __atomic_store_n(&s_instances[i].subscribed, (uint8_t)0, __ATOMIC_RELAXED);
+            __atomic_store_n(&s_instances[i].decidedWord, (uint32_t)0, __ATOMIC_RELEASE);
             return w;
         }
     }
@@ -97,12 +112,14 @@ static void instanceRetire(uint16_t handle) {
     const int i = instanceIndexOf(handle);
     if (i < 0) return;
     __atomic_store_n(&s_instances[i].subscribed, (uint8_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_instances[i].decidedWord, (uint32_t)0, __ATOMIC_RELAXED);
     __atomic_store_n(&s_instances[i].word, (uint32_t)0, __ATOMIC_RELEASE);
 }
 
 static void instancesClear() {
     for (int i = 0; i < OD_BLE_MAX_INSTANCES; i++) {
         __atomic_store_n(&s_instances[i].subscribed, (uint8_t)0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_instances[i].decidedWord, (uint32_t)0, __ATOMIC_RELAXED);
         __atomic_store_n(&s_instances[i].word, (uint32_t)0, __ATOMIC_RELEASE);
     }
 }
@@ -167,6 +184,15 @@ class OdServerCallbacks : public BLEServerCallbacks {
         // that actively disconnects it.
         const LinkId id = { OWNER_BLE, handle, epoch };
         const bool admitted = (word != 0) && linkClaim(id);
+        // The claim has resolved; publish that fact so the loop-side refusal scan
+        // can tell this instance from one whose CAS has not run yet.
+        {
+            const int di = instanceIndexOf(handle);
+            // Publish the identity the claim resolved FOR, not merely that it
+            // resolved. NimBLE serialises host callbacks, so this handle cannot be
+            // retired and reused underneath us here.
+            if (di >= 0) __atomic_store_n(&s_instances[di].decidedWord, word, __ATOMIC_RELEASE);
+        }
         od_log_info("=== BLE CLIENT CONNECTED (ESP32) h=%u e=%u %s ===",
                     (unsigned)handle, (unsigned)epoch,
                     admitted ? "[owner]" : "[contender - refused service]");
@@ -460,10 +486,19 @@ uint32_t BleTransport::instanceWordAt(uint8_t index) const {
     return __atomic_load_n(&s_instances[index].word, __ATOMIC_ACQUIRE);
 }
 
+uint32_t BleTransport::instanceClaimDecidedWordAt(uint8_t index) const {
+    if (index >= OD_BLE_MAX_INSTANCES) return 0;
+    return __atomic_load_n(&s_instances[index].decidedWord, __ATOMIC_ACQUIRE);
+}
+
 uint8_t BleTransport::instanceCapacity() { return OD_BLE_MAX_INSTANCES; }
 
-bool BleTransport::disconnect(uint16_t handle) {
+bool BleTransport::disconnect(uint16_t handle, uint16_t epoch) {
     if (s_server == nullptr) return false;
+    // Re-validate the identity as late as possible: the caller's decision to drop
+    // this link may have been made a few loads ago, and a numeric handle alone does
+    // not identify a connection over time.
+    if (!instanceLive(handle, epoch)) return true;   // already gone, or reassigned
     // BLE_ERR_REM_USER_CONN_TERM (0x13) is what NimBLE defaults to and the only
     // reason this seam ever sends; see the header for why 0x09 must not be used.
     const bool ok = s_server->disconnect(handle, BLE_ERR_REM_USER_CONN_TERM);

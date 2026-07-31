@@ -523,7 +523,27 @@ static void serviceBleEvents() {
         // refresh is mid-flight and checks whether LAN still owns the transfer.
         // Doing it inline would reintroduce the mid-refresh SPI teardown that
         // moving nRF off the callback task was meant to eliminate.
-        s_disconnectCleanupPending = true;
+        //
+        // Raised on OWNER DEPARTURE, not on any disconnect event. R3 requires a
+        // refused contender's disconnect to be inert, and refusal now produces a
+        // real disconnect event of its own -- so an unconditional raise here would
+        // make every refusal schedule a session teardown. That teardown is skipped
+        // a pass later by the live-owner guard, but "correct because something
+        // downstream catches it" is exactly the coupling R3 forbids.
+        //
+        // The test is state, not the event's identity, so it survives coalescing:
+        // if the token's BLE owner no longer has a live table entry, the owner is
+        // gone however many edges were lost. A LAN owner's departure raises the
+        // same flag from its own path (requestTransferSessionCleanup).
+        const LinkId tokenOwner = linkOwnerId();
+        const bool ownerDeparted =
+            (tokenOwner.who == OWNER_BLE &&
+             !ble.instanceLive(tokenOwner.handle, tokenOwner.epoch));
+        if (ownerDeparted) {
+            s_disconnectCleanupPending = true;
+        } else {
+            od_log_debug("Disconnect event from a non-owner instance; no cleanup scheduled");
+        }
         // Raised unconditionally: serviceBleAdvertisingRestart() owns the
         // capability decision, so this site does not need to know whether the
         // stack re-arms the radio by itself. On such a target the flag is simply
@@ -560,15 +580,50 @@ static void serviceBleEvents() {
 // observe that a contender arrived, which is why this is a separate helper rather
 // than a branch inside the disconnect path it would otherwise resemble.
 static void serviceContenderRefusal() {
-    const uint32_t owner = linkOwnerWord();
+    // Refuse an entry only once its claim has been DECIDED and it is not the owner.
+    //
+    // Both halves of that test are load-bearing, and each replaces a wrong rule:
+    //
+    //  - Testing ownership alone would disconnect the winner. The connect callback
+    //    publishes its table entry BEFORE attempting the claim (R2's normative
+    //    order), so an entry can be visible while its CAS has not run; comparing it
+    //    against an owner word snapshotted moments earlier can refuse the very
+    //    connection that is taking the slot.
+    //  - Skipping the scan whenever the slot is unowned -- an intermediate fix --
+    //    leaves a decided loser attached forever. That is exactly the sequence this
+    //    whole helper exists for: the owner departs, the abort releases the token,
+    //    and the client that reconnected and lost its one-shot claim is then never
+    //    reaped, because by the time anyone looks the slot is free. On nRF it holds
+    //    the only peripheral link, so the device stops accepting clients entirely.
+    //
+    // An undecided entry is simply skipped; the next pass sees it resolved. That is
+    // safe because refusal has no deadline -- a contender's writes are already
+    // filtered and its frames already fail the dispatch tag check.
+    // ORDER OF THE THREE LOADS IS THE CORRECTNESS ARGUMENT. They cannot be taken
+    // atomically, so each is re-derived in the order that makes a stale read safe:
+    //
+    //   1. the entry word          -- the candidate's identity
+    //   2. its decided-for word    -- must EQUAL (1), which proves the claim
+    //                                 resolved for this exact instance and that the
+    //                                 slot was not retired and reused underneath us
+    //   3. the owner word, read FRESH and last -- if the candidate just won, this
+    //                                 now names it and the entry is skipped
+    //
+    // Reading the owner once up front (as an earlier version did) is the bug: an
+    // entry can publish, win its claim and resolve between that snapshot and the
+    // per-entry loads, and would then be refused despite being the new owner. After
+    // step 3 the candidate can no longer become owner, because each instance
+    // attempts its claim exactly once and step 2 proved that attempt is over.
     const uint8_t cap = BleTransport::instanceCapacity();
     for (uint8_t i = 0; i < cap; i++) {
         const uint32_t w = ble.instanceWordAt(i);
-        if (w == 0 || w == owner) continue;
+        if (w == 0) continue;
+        if (ble.instanceClaimDecidedWordAt(i) != w) continue;   // in flight, or slot reused
+        if (w == linkOwnerWord()) continue;                     // it won; not a contender
         const LinkId id = linkUnpackWord(w);
         od_log_info("Refusing contender h=%u e=%u (slot held)", (unsigned)id.handle,
                     (unsigned)id.epoch);
-        (void)ble.disconnect(id.handle);
+        (void)ble.disconnect(id.handle, id.epoch);
     }
 }
 
@@ -628,7 +683,16 @@ static bool platformLoopPrologue() {
     pollActivity();
     // THIS IS THE MAIN (FIRST) LOOP FOR A DEEP SLEEP ENABLED ESP32
     if (woke_from_deep_sleep && advertising_timeout_active) {
-        if (ble.isConnected()) {
+        // An ADMITTED client, not merely a physical link. ble.isConnected() is the
+        // stack's aggregate peer count, so a contender -- including a client that
+        // reconnected into a still-held slot and lost its claim -- would trip this
+        // branch, run fullSetupAfterConnection(), close the wake window and return
+        // before the refusal scan ever gets to reap it. Application-visible setup
+        // work and a changed sleep decision, both driven by a connection that is
+        // never going to be serviced.
+        const LinkId prologueOwner = linkOwnerId();
+        if (prologueOwner.who == OWNER_BLE &&
+            ble.instanceLive(prologueOwner.handle, prologueOwner.epoch)) {
             od_log_info("BLE connection established - switching to full mode");
             advertising_timeout_active = false;
             fullSetupAfterConnection();
@@ -638,6 +702,7 @@ static bool platformLoopPrologue() {
         // A connect+drop entirely inside one poll gap leaves the radio dark for the
         // rest of the window; the flags are otherwise only serviced past this return.
         serviceBleDisconnectCleanup();   // tear down before re-advertising
+        serviceContenderRefusal();       // reap a contender rather than idling behind it
         serviceBleAdvertisingRestart();
         uint32_t advertising_timeout_ms = globalConfig.power_option.sleep_timeout_ms;
         if (advertising_timeout_ms == 0) {

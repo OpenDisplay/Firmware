@@ -828,14 +828,18 @@ void disconnectWiFiServer() {
     }
     wifiServerConnected = false;
     tcpReceiveBufferPos = 0;
-    // Release the slot if this session held it -- the LAN analogue of the BLE
-    // disconnect callback's release. The link is already closed above, so R3a's
-    // ordering holds. Full-identity release: a stale teardown whose epoch no longer
-    // matches cannot free a slot that a newer session has since claimed.
-    if (s_lanEpoch != 0) {
-        linkRelease((LinkId){OWNER_LAN, 0, s_lanEpoch});
-        s_lanEpoch = 0;
-    }
+    // The token is deliberately NOT released here, for the same reason the BLE
+    // disconnect callbacks do not release: the socket is closed but this session's
+    // transfer state is still live, and its teardown is DEFERRED to the loop below
+    // (requestTransferSessionCleanup). Releasing now would let a BLE connect claim
+    // the slot before that teardown runs -- and serviceBleDisconnectCleanup would
+    // then see the new BLE owner live, skip the abort entirely, and leave the new
+    // owner's frames executing against the departed LAN session's transfer state.
+    //
+    // Release stays the abort's final step (R3a), reached via the cleanup flag
+    // raised below. s_lanEpoch is left intact so the identity remains valid until
+    // then; a new accept cannot use it, because accept refuses while the slot is
+    // held.
     // F4: abort any in-flight direct-write / pipe / partial transfer + tear down a
     // mid-transfer panel session, DEFERRED to loop() so cleanup never races an
     // in-progress EPD refresh. Shared with the BLE disconnect path -- main.cpp

@@ -41,7 +41,7 @@ extern chunked_write_state_t chunkedWriteState;
 
 bool bleDropAndWait(uint16_t handle, uint16_t epoch) {
     if (!ble.instanceLive(handle, epoch)) return true;   // already down
-    ble.disconnect(handle);
+    ble.disconnect(handle, epoch);
     const uint32_t deadline = millis() + OD_BLE_LINK_DOWN_WAIT_MS;
     while ((int32_t)(millis() - deadline) < 0) {
         // Per-handle, so a refused contender still attached cannot mask the owner's
