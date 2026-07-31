@@ -7,14 +7,13 @@
 //   /tmp/test_nonce_window
 //
 // This file is as much a written-down statement of the intended semantics of the
-// anti-replay window as it is a test. Each block names the coverage item from
-// docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md, Decision D, that it discharges.
+// anti-replay window as it is a test.
 //
 // The representation under test (see the header):
 //   bit i of the bitmap == "counter (last_seen - i) has been consumed"
 //   bit 0 == last_seen itself
-// so the backward window is OD_NONCE_BACKWARD_BITS wide (indices 0..255) and the
-// forward acceptance window is OD_NONCE_FORWARD_CAP wide.
+// so the backward window is OD_NONCE_BACKWARD_BITS wide (indices 0..255). There
+// is no forward window: a counter ahead of last_seen is accepted at any distance.
 
 #include "../src/nonce_window.h"
 
@@ -173,13 +172,30 @@ static void test_fresh_session(void) {
     // Counter 1 is one ahead and cannot have been seen.
     CHECK_RES(check(&s, 1), NONCE_OK);
 
-    // Counter UINT64_MAX is one *behind* 0 under modular arithmetic (back == 1),
-    // inside the backward window, and its bit is clear.
+    // The no-wrap contract, stated deliberately rather than inherited.
+    //
+    // Ordering is numeric, so with last_seen == 0 there is nothing "behind": every
+    // other counter is ahead and accepted at any distance. These three were
+    // previously read as modular distances behind zero (back == 1, 255, 256) and
+    // answered OK / OK / OUT_OF_WINDOW. They are all OK now, and for the opposite
+    // reason.
     CHECK_RES(check(&s, UINT64_MAX), NONCE_OK);
-
-    // ...and 256 behind is off the end of the window.
-    CHECK_RES(check(&s, 0u - (uint64_t)OD_NONCE_BACKWARD_BITS), NONCE_OUT_OF_WINDOW);
+    CHECK_RES(check(&s, 0u - (uint64_t)OD_NONCE_BACKWARD_BITS), NONCE_OK);
     CHECK_RES(check(&s, 0u - (uint64_t)(OD_NONCE_BACKWARD_BITS - 1)), NONCE_OK);
+
+    // The state effect is what actually differs, and it is why wrap is not
+    // supported: accepting UINT64_MAX drives last_seen to the top of the range,
+    // after which nothing below it can ever be accepted again and the session must
+    // re-authenticate. Only a key holder can reach this (commit is post-CCM), so
+    // it is a contract, not a vulnerability.
+    {
+        NonceState t;
+        state_reset(&t, 0);
+        commit(&t, UINT64_MAX);
+        CHECK(t.last_seen == UINT64_MAX);
+        CHECK_RES(check(&t, UINT64_MAX), NONCE_REPLAY);
+        CHECK_RES(check(&t, 0), NONCE_OUT_OF_WINDOW);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,15 +276,21 @@ static void test_check_is_pure(void) {
         const char* what;
     };
     const Case cases[] = {
-        {base, NONCE_REPLAY, "fwd == 0, bit 0 set -> REPLAY"},
+        {base, NONCE_REPLAY, "equal, bit 0 set -> REPLAY"},
         {base + 1, NONCE_OK, "forward by 1 -> OK"},
-        {base + OD_NONCE_FORWARD_CAP, NONCE_OK, "forward at the cap -> OK"},
         {base - 3, NONCE_OK, "backward, unseen -> OK"},
         {base - 64, NONCE_REPLAY, "backward, seen -> REPLAY"},
-        {base + OD_NONCE_FORWARD_CAP + 1, NONCE_OUT_OF_WINDOW, "past the forward cap"},
         {base - OD_NONCE_BACKWARD_BITS, NONCE_OUT_OF_WINDOW, "past the backward window"},
-        {base + (1ull << 62), NONCE_OUT_OF_WINDOW, "far ahead"},
-        {base - (1ull << 62), NONCE_OUT_OF_WINDOW, "far behind"},
+        // Forward is unbounded: these are the distances a forward cap would have
+        // rejected, and every one of them must be OK.
+        {base + 129, NONCE_OK, "just past where the old cap sat"},
+        {base + 5000, NONCE_OK, "far ahead"},
+        {base + (1ull << 32), NONCE_OK, "very far ahead"},
+        {base + (1ull << 62), NONCE_OK, "absurdly far ahead"},
+        // Genuinely behind: the distance must not exceed `base`, or the
+        // subtraction underflows and the counter is numerically AHEAD -- which is
+        // exactly the modular confusion this ordering removes.
+        {base - 100000, NONCE_OUT_OF_WINDOW, "far behind"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         set_context("purity case: %s", cases[i].what);
@@ -306,10 +328,11 @@ static void test_check_is_pure(void) {
 //   - every seeded counter whose new distance is >= OD_NONCE_BACKWARD_BITS is
 //     reported OUT_OF_WINDOW, never REPLAY.
 //
-// d = 0, 1, 63, 64, 65, 127, 128 are reachable through od_nonce_check (capped by
-// OD_NONCE_FORWARD_CAP). d = 129, 191, 192, 255, 256, 257 are driven directly
-// against od_nonce_commit to cover the word boundaries and the wholesale-clear
-// guard, which no reachable input can hit while the cap stays below the width.
+// EVERY delta is driven through od_nonce_check, including the ones at and past
+// the bitmap width. Forward acceptance is unbounded, so the wholesale-clear path
+// is now reached the way production reaches it rather than by calling commit
+// directly — which matters, because that path stopped being an unreachable guard
+// and became the case this design exists to accept.
 // ---------------------------------------------------------------------------
 
 static const uint64_t kSeedOffsets[] = {0, 1, 2, 63, 64, 65, 127, 128, 129, 191, 192, 254, 255};
@@ -327,22 +350,17 @@ static void seed_window(NonceState* s, uint64_t base) {
     CHECK(s->last_seen == base);
 }
 
-static void run_shift_edge(uint64_t d, bool reachable_through_check) {
+static void run_shift_edge(uint64_t d) {
     const uint64_t base = 1000000u;
     NonceState s;
     seed_window(&s, base);
 
     set_context("shift edge d=%" PRIu64, d);
 
-    if (reachable_through_check) {
-        // d == 0 lands on the fwd == 0 branch, whose bit is already set by the seed.
-        CHECK_RES(check(&s, base + d), d == 0 ? NONCE_REPLAY : NONCE_OK);
-        commit(&s, base + d);
-    } else {
-        // Beyond the forward cap: od_nonce_check rejects it, so drive commit directly.
-        CHECK_RES(check(&s, base + d), NONCE_OUT_OF_WINDOW);
-        commit(&s, base + d);
-    }
+    // d == 0 lands on the equality branch, whose bit is already set by the seed.
+    // Every other d is forward and accepted at any distance.
+    CHECK_RES(check(&s, base + d), d == 0 ? NONCE_REPLAY : NONCE_OK);
+    commit(&s, base + d);
 
     CHECK(s.last_seen == base + d);
     // The newly committed counter is always recorded.
@@ -385,13 +403,13 @@ static void run_shift_edge(uint64_t d, bool reachable_through_check) {
 }
 
 static void test_shift_edges(void) {
-    const uint64_t reachable[] = {0, 1, 63, 64, 65, 127, 128};
-    for (size_t i = 0; i < sizeof(reachable) / sizeof(reachable[0]); ++i) {
-        run_shift_edge(reachable[i], true);
-    }
-    const uint64_t direct[] = {129, 191, 192, 255, 256, 257};
-    for (size_t i = 0; i < sizeof(direct) / sizeof(direct[0]); ++i) {
-        run_shift_edge(direct[i], false);
+    // Word boundaries, the exact width boundary (255 / 256, the shift-vs-clear
+    // pair), and jumps far past it — all through od_nonce_check.
+    const uint64_t deltas[] = {0,   1,    63,   64,     65,        127, 128, 129,
+                               191, 192,  255,  256,    257,       300,
+                               4096, (1ull << 32)};
+    for (size_t i = 0; i < sizeof(deltas) / sizeof(deltas[0]); ++i) {
+        run_shift_edge(deltas[i]);
     }
 }
 
@@ -478,13 +496,13 @@ static void test_bit_indices_after_shift(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Decision D coverage: counter arithmetic [M1]
+// Counter arithmetic at the extremes [M1]
 //
-// Expectations here are derived from the modular definition in the header, not
-// from intuition about "before" and "after":
-//   fwd  = counter - last_seen  (mod 2^64)
-//   back = last_seen - counter  (mod 2^64)
-// and the ordered tests fwd == 0, fwd <= CAP, back < BITS, else OUT_OF_WINDOW.
+// Expectations are derived from the numeric definition in the header, not from
+// intuition: counters are plain monotonically increasing uint64_t values that do
+// NOT wrap, and the ordered tests are counter == last_seen, counter > last_seen,
+// back < BITS, else OUT_OF_WINDOW.
+//
 // UBSan makes the whole file self-checking against the signed formulation, in
 // which these same inputs are undefined (int64_t conversion of values >= 2^63,
 // signed overflow, negating INT64_MIN).
@@ -493,131 +511,131 @@ static void test_bit_indices_after_shift(void) {
 static void test_counter_arithmetic_extremes(void) {
     const uint64_t two63 = 1ull << 63;
 
-    // counter = 2^63, last_seen = 1. The input that makes the signed form UB.
-    //   fwd  = 2^63 - 1  -> > CAP
-    //   back = 1 - 2^63  = 2^63 + 1 -> >= BITS
-    // so it is out of the window in both directions, which is the only sane
-    // answer for a counter half the space away.
+    // counter = 2^63, last_seen = 1. The input that makes the signed form UB, and
+    // the one whose answer INVERTED when ordering stopped being modular: it used
+    // to be "out of window in both directions", because the modular fwd and back
+    // were both enormous. Numerically it is simply ahead, so it is accepted --
+    // and gated by the CCM tag, not by distance.
     {
         NonceState s;
         state_reset(&s, 1);
-        CHECK(two63 - 1u > (uint64_t)OD_NONCE_FORWARD_CAP);
-        CHECK(1u - two63 == two63 + 1u);
-        CHECK_RES(check(&s, two63), NONCE_OUT_OF_WINDOW);
+        CHECK(two63 > 1u);
+        CHECK_RES(check(&s, two63), NONCE_OK);
     }
-    // The mirror image: last_seen = 2^63, counter = 1.
+    // The mirror image is unchanged: last_seen = 2^63, counter = 1 is behind, far
+    // past the width.
     {
         NonceState s;
         state_reset(&s, two63);
         CHECK_RES(check(&s, 1), NONCE_OUT_OF_WINDOW);
+        CHECK_RES(check(&s, 0), NONCE_OUT_OF_WINDOW);
     }
-    // And 2^63 apart in the other direction, from a high last_seen.
+    // From the very top of the range, everything is behind.
     {
         NonceState s;
         state_reset(&s, UINT64_MAX);
-        CHECK_RES(check(&s, UINT64_MAX + two63), NONCE_OUT_OF_WINDOW);
         CHECK_RES(check(&s, UINT64_MAX - two63), NONCE_OUT_OF_WINDOW);
+        CHECK_RES(check(&s, UINT64_MAX - (uint64_t)OD_NONCE_BACKWARD_BITS), NONCE_OUT_OF_WINDOW);
+        CHECK_RES(check(&s, UINT64_MAX - (uint64_t)(OD_NONCE_BACKWARD_BITS - 1)), NONCE_OK);
+        CHECK_RES(check(&s, UINT64_MAX), NONCE_OK);  // equal, bit 0 clear
     }
 
-    // Near UINT64_MAX, including the wrap past it. last_seen = UINT64_MAX - 2.
+    // Near UINT64_MAX. last_seen = UINT64_MAX - 2.
+    //
+    // This block used to assert that the window WRAPS -- that counter 0 is three
+    // ahead of UINT64_MAX - 2 and acceptable. It no longer does, and that is the
+    // deliberate contract: wrapping would reuse a (key, nonce) pair. Counters at
+    // the low end of the range are simply behind, and the session must
+    // re-authenticate rather than cycle.
     {
         const uint64_t L = UINT64_MAX - 2u;
         NonceState s;
         state_reset(&s, L);
 
-        CHECK_RES(check(&s, L), NONCE_OK);  // fwd == 0, bit 0 clear
+        CHECK_RES(check(&s, L), NONCE_OK);  // equal, bit 0 clear
         commit(&s, L);
         CHECK_RES(check(&s, L), NONCE_REPLAY);
 
-        // Forward, no wrap yet.
-        CHECK_RES(check(&s, UINT64_MAX - 1u), NONCE_OK);  // fwd == 1
-        CHECK_RES(check(&s, UINT64_MAX), NONCE_OK);       // fwd == 2
-        // Forward, wrapping past UINT64_MAX. fwd = 0 - (2^64 - 3) = 3.
-        CHECK(0u - L == 3u);
-        CHECK_RES(check(&s, 0), NONCE_OK);
-        CHECK(1u - L == 4u);
-        CHECK_RES(check(&s, 1), NONCE_OK);
-        // Still forward at the cap, wrapped.
-        CHECK_RES(check(&s, L + (uint64_t)OD_NONCE_FORWARD_CAP), NONCE_OK);
-        CHECK_RES(check(&s, L + (uint64_t)OD_NONCE_FORWARD_CAP + 1u), NONCE_OUT_OF_WINDOW);
-        // Backward across the low end of the space: L - 1 == UINT64_MAX - 3.
+        // Forward, no wrap available: only two counters remain in the range.
+        CHECK_RES(check(&s, UINT64_MAX - 1u), NONCE_OK);
+        CHECK_RES(check(&s, UINT64_MAX), NONCE_OK);
+
+        // Past the top there is nothing. 0 and 1 are far BEHIND, not ahead.
+        CHECK_RES(check(&s, 0), NONCE_OUT_OF_WINDOW);
+        CHECK_RES(check(&s, 1), NONCE_OUT_OF_WINDOW);
+
+        // Backward across the top of the space behaves normally.
         CHECK_RES(check(&s, L - 1u), NONCE_OK);
         CHECK_RES(check(&s, L - (uint64_t)(OD_NONCE_BACKWARD_BITS - 1)), NONCE_OK);
         CHECK_RES(check(&s, L - (uint64_t)OD_NONCE_BACKWARD_BITS), NONCE_OUT_OF_WINDOW);
 
-        // Accept a wrapped counter and slide the window across the wrap point.
-        CHECK_RES(check_and_commit(&s, 1), NONCE_OK);
-        CHECK(s.last_seen == 1u);
-
-        // The pre-wrap counter L is now back = 1 - L = 4 behind, and is recorded.
-        CHECK(1u - L == 4u);
-        CHECK_RES(check(&s, L), NONCE_REPLAY);
-        // Its never-committed neighbours across the wrap are unseen.
-        CHECK_RES(check(&s, UINT64_MAX - 1u), NONCE_OK);  // back == 3
-        CHECK_RES(check(&s, UINT64_MAX), NONCE_OK);       // back == 2
-        CHECK_RES(check(&s, 0), NONCE_OK);                // back == 1
-        CHECK_RES(check(&s, 1), NONCE_REPLAY);            // fwd == 0, committed
-
-        // The backward window reaches BITS-1 below zero and stops there.
-        CHECK_RES(check(&s, 1u - (uint64_t)(OD_NONCE_BACKWARD_BITS - 1)), NONCE_OK);
-        CHECK_RES(check(&s, 1u - (uint64_t)OD_NONCE_BACKWARD_BITS), NONCE_OUT_OF_WINDOW);
-
-        // Commit a backward, wrapped counter and read it back.
+        // Consume the last counter in the range; the session is now exhausted.
         CHECK_RES(check_and_commit(&s, UINT64_MAX), NONCE_OK);
-        CHECK(s.last_seen == 1u);  // backward commits do not move last_seen
+        CHECK(s.last_seen == UINT64_MAX);
         CHECK_RES(check(&s, UINT64_MAX), NONCE_REPLAY);
-        CHECK_RES(check(&s, UINT64_MAX - 1u), NONCE_OK);
+        CHECK_RES(check(&s, 0), NONCE_OUT_OF_WINDOW);
+        // Everything below is either recorded or off the end -- never OK again.
+        CHECK_RES(check(&s, L), NONCE_REPLAY);
+        CHECK_RES(check(&s, UINT64_MAX - 1u), NONCE_OK);  // never committed, in window
+
+        // Backward commits still do not move last_seen.
+        CHECK_RES(check_and_commit(&s, UINT64_MAX - 1u), NONCE_OK);
+        CHECK(s.last_seen == UINT64_MAX);
+        CHECK_RES(check(&s, UINT64_MAX - 1u), NONCE_REPLAY);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Decision D coverage: differential / property test against a naive oracle
+// Differential / property test against a naive oracle
 //
-// The oracle is the obvious-but-unshippable implementation: the exact set of
-// counters consumed, plus last_seen. It reproduces od_nonce_check's decision
-// directly from the definition, and prunes counters that have fallen out of the
-// backward window when last_seen advances — that pruning is what makes it agree
-// on REPLAY versus OUT_OF_WINDOW rather than only on accept versus reject.
+// The oracle keeps the UNPRUNED set of every counter it has ever committed. That
+// is the point: the previous version pruned counters as they fell out of the
+// backward window, which meant it encoded the implementation's forgetting and
+// could only ever agree with it. An unpruned set lets the oracle be written from
+// the specification instead --
 //
-// Counters stay far from 0 and from 2^64 so the oracle needs no wrap handling;
-// the wrap cases are covered exhaustively by test_counter_arithmetic_extremes().
+//   a counter is acceptable iff it has never been committed AND it is either
+//   ahead of last_seen or within OD_NONCE_BACKWARD_BITS of it
+//
+// -- and it is what makes od_nonce_never_accepts_consumed() below possible, which
+// is the one assertion in this file that does not restate the code.
+//
+// Counters stay clear of 0 and 2^64 so the walk never runs out of range; the
+// extremes are covered by test_counter_arithmetic_extremes().
 // ---------------------------------------------------------------------------
 
 struct Oracle {
-    std::set<uint64_t> seen;
+    std::set<uint64_t> ever_committed;   // never pruned
     uint64_t last_seen;
 };
 
 static NonceResult oracle_check(const Oracle& o, uint64_t counter) {
-    const uint64_t fwd = counter - o.last_seen;
+    const bool consumed = o.ever_committed.count(counter) != 0;
+    if (counter > o.last_seen) return NONCE_OK;   // ahead: cannot have been consumed
+    if (counter == o.last_seen) return consumed ? NONCE_REPLAY : NONCE_OK;
     const uint64_t back = o.last_seen - counter;
-    if (fwd == 0u) return o.seen.count(counter) ? NONCE_REPLAY : NONCE_OK;
-    if (fwd <= (uint64_t)OD_NONCE_FORWARD_CAP) return NONCE_OK;
-    if (back < (uint64_t)OD_NONCE_BACKWARD_BITS) {
-        return o.seen.count(counter) ? NONCE_REPLAY : NONCE_OK;
-    }
-    return NONCE_OUT_OF_WINDOW;
+    if (back >= (uint64_t)OD_NONCE_BACKWARD_BITS) return NONCE_OUT_OF_WINDOW;
+    return consumed ? NONCE_REPLAY : NONCE_OK;
 }
 
 static void oracle_commit(Oracle* o, uint64_t counter) {
-    const uint64_t fwd = counter - o->last_seen;
-    const uint64_t back = o->last_seen - counter;
-    if (fwd == 0u) {
-        o->seen.insert(counter);
-        return;
+    o->ever_committed.insert(counter);
+    if (counter > o->last_seen) o->last_seen = counter;   // only ever upward
+}
+
+// THE security property, asserted directly and independently of how the window is
+// represented: no counter that was ever consumed may be accepted again, at any
+// distance, by any route. A regression that reintroduced modular overlap -- or a
+// commit that rewound last_seen -- shows up here as an OK on a member of the set,
+// whatever the bitmap happens to contain.
+static void od_nonce_never_accepts_consumed(const NonceState* s, const Oracle& o) {
+    for (std::set<uint64_t>::const_iterator it = o.ever_committed.begin();
+         it != o.ever_committed.end(); ++it) {
+        set_context("consumed counter %" PRIu64 " must never be OK (last_seen=%" PRIu64 ")",
+                    *it, s->last_seen);
+        CHECK(check(s, *it) != NONCE_OK);
     }
-    if (back < (uint64_t)OD_NONCE_BACKWARD_BITS) {
-        o->seen.insert(counter);
-        return;
-    }
-    // Forward: the window slides, and everything now at or past the far edge is
-    // forgotten — exactly the bits the shift pushes off the end of the bitmap.
-    o->last_seen = counter;
-    o->seen.insert(counter);
-    while (!o->seen.empty() &&
-           (o->last_seen - *o->seen.begin()) >= (uint64_t)OD_NONCE_BACKWARD_BITS) {
-        o->seen.erase(o->seen.begin());
-    }
+    clear_context();
 }
 
 static void test_differential_against_oracle(void) {
@@ -638,12 +656,13 @@ static void test_differential_against_oracle(void) {
             const unsigned bucket = (unsigned)(rng() % 100u);
             uint64_t counter;
             if (bucket < 40u) {
-                // Forward inside the cap, including fwd == 0 (a replay probe).
-                counter = s.last_seen + (rng() % (uint64_t)(OD_NONCE_FORWARD_CAP + 1));
+                // Forward by a small step, including 0 (a replay probe).
+                counter = s.last_seen + (rng() % 129u);
             } else if (bucket < 60u) {
-                // Forward past the cap: a gap too large to accept.
-                counter = s.last_seen + (uint64_t)OD_NONCE_FORWARD_CAP + 1u +
-                          (rng() % 1000u);
+                // Forward by a large jump -- the case a forward cap used to reject
+                // and which must now be accepted, including jumps wide enough to
+                // clear the bitmap wholesale.
+                counter = s.last_seen + 129u + (rng() % 100000u);
             } else if (bucket < 90u) {
                 // Backward inside or just outside the window.
                 counter = s.last_seen - (1u + rng() % (uint64_t)(OD_NONCE_BACKWARD_BITS + 64));
@@ -677,6 +696,98 @@ static void test_differential_against_oracle(void) {
             set_context("differential sweep seq=%d back=%" PRIu64, seq, back);
             CHECK_RES(check(&s, counter), oracle_check(o, counter));
         }
+
+        // ...and the security property over every counter this sequence consumed,
+        // not just the ones still inside the window.
+        od_nonce_never_accepts_consumed(&s, o);
+    }
+    clear_context();
+}
+
+// ---------------------------------------------------------------------------
+// The cliff, as a regression test.
+//
+// A forward cap made this sequence unrecoverable: nothing commits, so last_seen
+// never advances, and each retransmission's higher counter is rejected further
+// out than the last. Asserted as a SEQUENCE rather than a point, because a point
+// test at last_seen+129 would also pass under "cap = UINT64_MAX" -- one of the two
+// shortcuts the header warns against.
+// ---------------------------------------------------------------------------
+
+static void test_forward_gap_is_not_a_cliff(void) {
+    const uint64_t L = 1000u;
+
+    // Distances that a cap would have rejected, each from a clean state.
+    const uint64_t jumps[] = {129u, 300u, 5000u, 100000u, (1ull << 32), (1ull << 63)};
+    for (size_t i = 0; i < sizeof(jumps) / sizeof(jumps[0]); ++i) {
+        NonceState s;
+        state_reset(&s, L);
+        commit(&s, L);
+        set_context("forward jump %" PRIu64, jumps[i]);
+
+        CHECK_RES(check(&s, L + jumps[i]), NONCE_OK);
+        commit(&s, L + jumps[i]);
+        CHECK(s.last_seen == L + jumps[i]);
+        CHECK_RES(check(&s, L + jumps[i]), NONCE_REPLAY);
+
+        // The stream must KEEP flowing afterwards -- this is what a cap broke.
+        for (uint64_t k = 1; k <= 8u; ++k) {
+            CHECK_RES(check_and_commit(&s, L + jumps[i] + k), NONCE_OK);
+        }
+        CHECK(s.last_seen == L + jumps[i] + 8u);
+    }
+    clear_context();
+
+    // The client's actual failure mode: escalating retransmissions. Nothing is
+    // committed until the frame authenticates, so a run of checks at ever greater
+    // distance must leave the state untouched AND stay acceptable.
+    {
+        NonceState s;
+        state_reset(&s, L);
+        commit(&s, L);
+        unsigned char snapshot[sizeof(NonceState)];
+        std::memcpy(snapshot, &s, sizeof(snapshot));
+
+        uint64_t c = L + 129u;
+        for (int i = 0; i < 32; ++i) {
+            set_context("escalating retransmit %d counter=%" PRIu64, i, c);
+            CHECK_RES(check(&s, c), NONCE_OK);
+            CHECK(std::memcmp(snapshot, &s, sizeof(snapshot)) == 0);
+            c += 1000u;
+        }
+        // The one that finally authenticates advances the window normally.
+        CHECK_RES(check_and_commit(&s, c), NONCE_OK);
+        CHECK(s.last_seen == c);
+        clear_context();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two shortcuts the header forbids.
+//
+// Setting a cap to UINT64_MAX, or treating "not within the backward window" as
+// forward, both keep modular overlap: an ancient counter presents as an enormous
+// forward jump and is accepted. Under numeric ordering it must be OUT_OF_WINDOW.
+// This is the test that distinguishes the real fix from either shortcut.
+// ---------------------------------------------------------------------------
+
+static void test_far_behind_is_never_forward(void) {
+    const uint64_t L = 1ull << 40;
+    NonceState s;
+    state_reset(&s, L);
+    commit(&s, L);
+
+    const uint64_t behind[] = {300u, 4096u, 100000u, (1ull << 32), (1ull << 39)};
+    for (size_t i = 0; i < sizeof(behind) / sizeof(behind[0]); ++i) {
+        set_context("far behind by %" PRIu64, behind[i]);
+        CHECK_RES(check(&s, L - behind[i]), NONCE_OUT_OF_WINDOW);
+
+        // And committing one anyway (the primitive is callable directly) must not
+        // rewind last_seen or clear the bitmap -- the old sharp edge.
+        NonceState t = s;
+        commit(&t, L - behind[i]);
+        CHECK(t.last_seen == L);
+        CHECK(std::memcmp(&t, &s, sizeof(NonceState)) == 0);
     }
     clear_context();
 }
@@ -691,6 +802,8 @@ int main(void) {
     test_wholesale_slide();
     test_bit_indices_after_shift();
     test_counter_arithmetic_extremes();
+    test_forward_gap_is_not_a_cliff();
+    test_far_behind_is_never_forward();
     test_differential_against_oracle();
 
     if (g_failures != 0u) {

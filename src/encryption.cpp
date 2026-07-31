@@ -119,7 +119,7 @@ void deriveSessionId(const uint8_t* session_key, const uint8_t* client_nonce,
 // populated). In particular nonce_counter — the device's OWN outbound counter —
 // must keep being zeroed here: a device that carried it across a re-auth while
 // the client restarts at 0 would reproduce the [H2] keystream reuse against
-// itself. See docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md Step 1.
+// itself.
 static void resetNonceState(void) {
     encryptionSession.nonce_counter      = 0;   /* device's OWN outbound counter */
     encryptionSession.last_seen_counter  = 0;
@@ -743,11 +743,15 @@ bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plain
     if (nr != NONCE_OK) {
         if (reason_out != nullptr) *reason_out = nr;
         if (nr != NONCE_BAD_SESSION && nonceLogAllowed(&nonce_log_window_ms)) {
-            // A replayed counter is normally BEHIND last_seen, where the wrapping
-            // fwd delta prints as a 20-digit number. Report the distance in the
-            // direction that is actually small, so the line is readable in the
-            // case it fires in.
-            const bool behind = (nr == NONCE_REPLAY);
+            // Direction comes from the COUNTERS, not from `nr`. Under numeric
+            // ordering every rejection is at or behind last_seen: anything ahead
+            // is accepted at any distance, so NONCE_OUT_OF_WINDOW now means only
+            // "more than OD_NONCE_BACKWARD_BITS behind". Inferring the direction
+            // from the reason would pick the wrong subtraction, underflow, and
+            // print a 20-digit number -- the exact unreadability this guards
+            // against. Computed rather than assumed so the line survives a future
+            // rule change.
+            const bool behind = (nonce_counter <= encryptionSession.last_seen_counter);
             od_log_warn("Nonce %s (counter=%llu last_seen=%llu %s=%llu) - frame dropped, session kept",
                         behind ? "replay" : "out-of-window",
                         (unsigned long long)nonce_counter,

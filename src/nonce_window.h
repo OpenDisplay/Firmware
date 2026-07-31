@@ -7,11 +7,10 @@
 // firmware logging layer, and it touches no global state. Everything here
 // operates on plain values passed in by the caller, so the whole state machine
 // can be compiled and exercised on a host under UBSan/ASan by
-// tools/test_nonce_window.cpp. See docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md
-// Decision D.
+// tools/test_nonce_window.cpp.
 //
-// Representation (RFC 4303 / RFC 6347 "shifting" style, as opposed to the
-// circular RFC 6479 / WireGuard style — see Decision B):
+// Representation ("shifting" style, as opposed to the circular RFC 6479 /
+// WireGuard style):
 //
 //   bit i of the bitmap == "counter (last_seen - i) has been consumed".
 //   bit 0 is last_seen itself.
@@ -21,23 +20,57 @@
 // reset. "Not seen" is a clear bit rather than a reserved sentinel value, so a
 // fresh session (last_seen = 0, all-zero bitmap) accepts counter 0 exactly once
 // with no has_seen_counter flag.
+//
+// --- relationship to RFC 4303 -----------------------------------------------
+//
+// The decision rule is RFC 4303 Appendix A2's anti-replay window, and the three
+// cases map one-to-one: right of the window -> authenticate, then slide (clearing
+// wholesale when the jump exceeds the width); inside the window -> consult the
+// bitmap; left of the window -> discard. So does the ordering that makes it safe,
+// "if the MAC is valid, the window is updated" — here od_nonce_check() decides,
+// CCM verifies, and only then does od_nonce_commit() run.
+//
+// Three deliberate departures, none of them semantic:
+//
+//   - Counters are 0-based. RFC 4303 §3.3.3 starts sequence numbers at 1; this
+//     protocol's client sends counter 0 as its first command, so a 1-based rule
+//     would reject every client's first frame.
+//   - The full 64-bit counter is on the wire, so there is no ESN high-order-bit
+//     inference to do. That machinery would be complexity with no function.
+//   - The window is 256 bits rather than the RFC's 32 minimum / 64 default,
+//     which §3.4.3 explicitly permits.
+//
+// Following §3.3.3, the counter does NOT wrap: it is treated as a plain
+// monotonically increasing uint64_t, and a session that reached UINT64_MAX would
+// have to re-authenticate rather than cycle. Wrapping would reuse a (key, nonce)
+// pair, which is the precise CCM failure this file exists to prevent. Exhausting
+// 2^64 counters inside one session is not reachable in practice.
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-// Width of the backward (out-of-order tolerance) window, in bits.
-// uint64_t[4] = 32 B. Kept strictly greater than OD_NONCE_FORWARD_CAP so that a
-// legal forward slide can never exceed the bitmap width — that keeps the
-// wholesale-clear branch in od_nonce_commit() off the normal path.
+// Width of the backward (out-of-order / duplicate arrival) window, in bits.
+// uint64_t[4] = 32 B.
+//
+// This width is ONLY reordering tolerance. Replay protection does not depend on
+// it: a counter at or below last_seen is either caught by the bitmap (within the
+// width) or rejected on width, and only counters above last_seen are ever
+// accepted — and those, by the monotonicity argument on od_nonce_check(), were
+// never consumed. Narrowing or widening it cannot create a replay hole.
+//
+// Nor is it a correctness cliff, because a backward rejection is self-healing:
+// the client re-encrypts every retransmission with a fresh, HIGHER counter (it
+// never resends the original ciphertext), and a higher counter is accepted
+// unconditionally. A frame rejected here is re-sent under a counter that is not.
+//
+// So the exact value is not load-bearing, and there is deliberately no attempt to
+// derive it from the client's pipe window, blocks_per_ack or retransmit budget —
+// none of those bear on it. 256 is a generous margin over the zero reordering the
+// transport actually produces (the client assigns counters synchronously
+// immediately before each write, ATT preserves order, and both targets consume
+// their RX rings FIFO), at a cost of 32 bytes per session.
 #define OD_NONCE_BACKWARD_BITS 256
-
-// Largest forward jump that is accepted. This is a HEURISTIC, not an invariant
-// firmware can prove: the real bound lives in the client's retransmit budget
-// (max_retx = max(3*W, n/2)) and its blocks_per_ack setting, both of which live
-// in another repo and one of which is a user-facing Home Assistant option. See
-// Decision A in docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
-#define OD_NONCE_FORWARD_CAP 128
 
 #define OD_NONCE_BITMAP_WORDS (OD_NONCE_BACKWARD_BITS / 64)
 
@@ -58,25 +91,46 @@ static inline void od_nonce_bit_set(uint64_t* bm, uint64_t bit) {
 
 // Pure: decides whether `counter` may be accepted. Writes nothing.
 //
-// The four tests are ORDERED and the order is load-bearing. fwd and back sum to
-// zero mod 2^64, so they cannot both be small: with the current constants
-// fwd <= 128 && back < 256 would require fwd + back <= 384 == 0 (mod 2^64),
-// true only when both are zero — the case the first test already consumed. A
-// counter far from the window in either direction leaves both huge and falls
-// through to NONCE_OUT_OF_WINDOW. Do not reorder.
+// There is NO forward bound, and its absence is the point. A counter above
+// last_seen is accepted at any distance, exactly as RFC 4303 does, because the
+// sender may legitimately have burned counters this receiver never saw — every
+// PIPE retransmission spends a fresh one. A forward cap here would not bound an
+// attacker (see the commit contract below: passing this check mutates nothing,
+// and only a verified CCM tag commits), but it WOULD strand the session: once a
+// gap exceeded the cap, nothing would commit, last_seen would never advance, and
+// every subsequent frame — each carrying a still higher counter — would be
+// rejected further out than the last, until re-authentication.
 //
-// Unsigned wrapping arithmetic only: the counter is parsed off the wire BEFORE
-// the CCM tag is verified, so an unauthenticated attacker controls both
-// operands. Converting a uint64_t >= 2^63 to int64_t is implementation-defined
-// before C++20, the signed subtraction can overflow, and negating INT64_MIN is
-// UB — three ways to be undefined on attacker-chosen input. Unsigned overflow
-// is defined as modular arithmetic, making this total over all 2^64 inputs.
+// The security invariant is "a consumed counter is never returned NONCE_OK
+// again", and it rests on last_seen being monotonically non-decreasing: only the
+// forward branch of od_nonce_commit() assigns it, and only upward. Every consumed
+// counter is therefore <= last_seen forever, so the `counter > last_seen` arm
+// cannot re-accept one. Below that, a consumed counter is bitmap-caught while it
+// is represented and rejected on width once it is not — the region below the
+// window is closed, never waved through.
+//
+// Comparison is plain numeric, NOT modular. Modular arithmetic makes a counter
+// far behind indistinguishable from one far ahead (the two differences are
+// complements mod 2^64), which is what allowed an ancient counter to present as
+// an enormous forward jump. Numeric ordering removes that overlap structurally
+// rather than relying on the caller to check before committing. For the same
+// reason, do not reintroduce a bound by setting a cap to UINT64_MAX or by
+// treating "not within the backward window" as forward — either restores the
+// overlap this ordering exists to eliminate.
+//
+// Total over all 2^64 inputs and never UB: the counter is parsed off the wire
+// BEFORE the CCM tag is verified, so an unauthenticated attacker controls both
+// operands. Only unsigned comparison and one unsigned subtraction are used, and
+// that subtraction is evaluated solely on the branch where counter < last_seen,
+// so it cannot wrap. Converting a uint64_t >= 2^63 to int64_t is
+// implementation-defined before C++20, the signed subtraction can overflow, and
+// negating INT64_MIN is UB — three ways to be undefined on attacker-chosen input,
+// all avoided.
 static inline NonceResult od_nonce_check(const uint64_t* bm, uint64_t last_seen, uint64_t counter) {
-    const uint64_t fwd = counter - last_seen;   /* wraps; 0 when equal             */
-    const uint64_t back = last_seen - counter;  /* wraps; fwd + back == 0 mod 2^64 */
+    if (counter == last_seen) return od_nonce_bit_test(bm, 0) ? NONCE_REPLAY : NONCE_OK;
+    if (counter > last_seen) return NONCE_OK;   /* ahead: never consumed, see above */
 
-    if (fwd == 0u) return od_nonce_bit_test(bm, 0) ? NONCE_REPLAY : NONCE_OK;
-    if (fwd <= OD_NONCE_FORWARD_CAP) return NONCE_OK; /* ahead: cannot have been seen */
+    const uint64_t back = last_seen - counter;  /* counter < last_seen, so no wrap */
     if (back < OD_NONCE_BACKWARD_BITS) return od_nonce_bit_test(bm, back) ? NONCE_REPLAY : NONCE_OK;
     return NONCE_OUT_OF_WINDOW;
 }
@@ -104,42 +158,41 @@ static inline void od_nonce_bitmap_shift_left(uint64_t* bm, uint64_t shift) {
     }
 }
 
-// Records `counter` as consumed. MUST only be called after the frame carrying
-// it has been authenticated (CCM tag verified) — that is the D2 fix.
+// Records `counter` as consumed. MUST only be called after the frame carrying it
+// has been authenticated (CCM tag verified) — that is the D2 fix, and it is what
+// makes the unbounded forward arm of od_nonce_check() safe. All 8 counter bytes
+// sit inside the CCM nonce, so a tampered counter changes the keystream and fails
+// the tag: a committed counter is always exactly the one the key holder emitted.
+//
+// last_seen moves only upward, which is the whole security argument above. The
+// wholesale-clear inside the shift is now an ORDINARY path, not an off-normal
+// one: it fires whenever an authenticated frame lands more than
+// OD_NONCE_BACKWARD_BITS ahead, which is the case this design exists to accept.
+// It stays correct when it does, because every counter it discards is then at
+// least OD_NONCE_BACKWARD_BITS behind the new last_seen and is rejected on width
+// — never mis-reported as unseen.
 //
 // Defined (never UB) for every input, including inputs od_nonce_check() would
-// have rejected: the host test calls it directly, and a future
-// OD_NONCE_FORWARD_CAP increase must not be able to produce an over-wide shift.
-// The wholesale-clear path is unreachable through od_nonce_check() today (cap
-// 128 < 256 bits) but is still correct when it fires on a FORWARD jump: every
-// counter it discards is then >= 256 behind and is rejected on width, never
-// mis-reported as unseen.
-//
-// Sharp edge, stated rather than hidden: a counter more than
-// OD_NONCE_BACKWARD_BITS *behind* last_seen also lands in the forward branch
-// (fwd and back are complements, so its fwd is enormous), clearing the bitmap
-// and RE-WINDING last_seen to that counter — un-seeing everything. That is
-// unreachable through od_nonce_check(), which returns NONCE_OUT_OF_WINDOW for
-// such a counter so it is never committed, and the contract above is that
-// commit runs only for frames that both checked OK and authenticated. It is the
-// edge to watch if a future caller ever commits without checking first.
+// have rejected, because the host test calls it directly. A counter further than
+// OD_NONCE_BACKWARD_BITS behind is a deliberate no-op rather than a shift: under
+// numeric ordering it can no longer masquerade as a forward jump, so the old
+// hazard of such a counter rewinding last_seen and un-seeing the bitmap cannot
+// arise — by construction, not by contract.
 static inline void od_nonce_commit(uint64_t* bm, uint64_t* last_seen, uint64_t counter) {
-    const uint64_t fwd = counter - *last_seen;
-    const uint64_t back = *last_seen - counter;
-
-    if (fwd == 0u) {
+    if (counter == *last_seen) {
         od_nonce_bit_set(bm, 0);
         return;
     }
-    if (back < OD_NONCE_BACKWARD_BITS) {
-        /* backward, inside the window: last_seen does not move.
-           Unambiguous: fwd and back are complements mod 2^64, so back < 256
-           forces fwd >= 2^64 - 255 — they can never both be small. */
-        od_nonce_bit_set(bm, back);
+    if (counter < *last_seen) {
+        /* backward: last_seen does not move. Outside the width there is nowhere
+           to record it, and nothing needs recording — od_nonce_check() already
+           rejects everything that far behind. */
+        const uint64_t back = *last_seen - counter;
+        if (back < OD_NONCE_BACKWARD_BITS) od_nonce_bit_set(bm, back);
         return;
     }
     /* forward */
-    od_nonce_bitmap_shift_left(bm, fwd);
+    od_nonce_bitmap_shift_left(bm, counter - *last_seen);
     *last_seen = counter;
     od_nonce_bit_set(bm, 0);
 }

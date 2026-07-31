@@ -771,14 +771,18 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             // §5.2 already reserves NACKs for unrecoverable conditions, "not
             // ordinary packet loss", and §5.1 makes a 0x81 NACK unconditionally
             // fatal, so answering one here violates the spec as written. Send
-            // NOTHING: silence is a first-class signal on the pipe path. For a
-            // rejection INSIDE the window the seq is absent from the next SACK
-            // mask, the client retransmits it, and the transfer continues. A gap
-            // beyond OD_NONCE_FORWARD_CAP is NOT repaired this way -- see the
-            // CMD_PIPE_WRITE_DATA note below. Answering with the 3-byte NACK
-            // instead makes the client raise IntegrityCheckError, which its pipe
-            // send loop does not catch, killing the whole upload on the first
-            // rejected frame.
+            // NOTHING: silence is a first-class signal on the pipe path. The seq
+            // is absent from the next SACK mask, the client retransmits it under a
+            // FRESH, higher counter, and that counter is accepted unconditionally
+            // (nonce_window.h has no forward bound), so the transfer continues.
+            // Answering with the 3-byte NACK instead makes the client raise
+            // IntegrityCheckError, which its pipe send loop does not catch,
+            // killing the whole upload on the first rejected frame.
+            //
+            // Rare by construction now: the only surviving nonce rejections are a
+            // duplicate delivery and a counter more than OD_NONCE_BACKWARD_BITS
+            // behind, neither of which this transport produces. It stays because
+            // being wrong here costs the whole upload.
             //
             // Deliberately narrow:
             //  - TAG failures keep the NACK. They are tamper evidence, not loss.
@@ -876,28 +880,26 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             // that authenticates — including ones this handler then queues or
             // discards — so drops/dupes never desync it.
             //
-            // What bounds the forward gap is NOT a firmware constant. The client
-            // burns a nonce counter per *transmission*, landed or not, and its
-            // three transmit sites are new sends (window-credit-limited), PTO
-            // probes, and selective repair — and selective repair spends no
-            // window credit at all. The only ceiling is the client's retransmit
-            // budget max_retx = max(3*W, n/2), scaled by blocks_per_ack, which
-            // is a user-facing Home Assistant option (1..32) in another repo.
-            // OD_NONCE_FORWARD_CAP (src/nonce_window.h) is therefore a HEURISTIC
-            // with headroom over the realistic worst case, not an invariant this
-            // firmware can prove; a client-side blocks_per_ack change would
-            // silently falsify any specific number written here. The cap's job is
-            // to put overflow out of REACH, not to make it RECOVERABLE: once a
-            // frame is rejected for fwd > cap nothing commits, so last_seen never
-            // advances, and every retransmission -- which re-encrypts with a
-            // fresh, HIGHER counter (py-opendisplay _write_pipe_frame), never
-            // resending the original ciphertext -- is rejected at a greater
-            // distance still. The session cannot recover without
-            // re-authenticating. Dropping silently (Step 4b above) only avoids the
-            // immediate fatal teardown a 0x81 NACK would cause; the transfer then
-            // stalls until the stuck-transfer timeout (pipe-write-protocol.md
-            // §5.3) releases the panel. See Decision A / [C1] in
-            // docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
+            // The forward gap is deliberately UNBOUNDED, and it has to be. The
+            // client burns a nonce counter per *transmission*, landed or not, and
+            // its three transmit sites are new sends (window-credit-limited), PTO
+            // probes, and selective repair — and selective repair spends no window
+            // credit at all. The ceiling is the client's retransmit budget
+            // max_retx = max(3*W, n/2), scaled by blocks_per_ack, a user-facing
+            // Home Assistant option (1..32) in another repo: order thousands for a
+            // full-panel upload, and it accumulates ACROSS aborted attempts
+            // because the client never re-authenticates mid-transfer. Any firmware
+            // constant placed here would be a number this repo cannot prove and a
+            // client-side setting could silently falsify.
+            //
+            // So there is no such constant. A counter ahead of last_seen is
+            // accepted at any distance and gated by the CCM tag instead
+            // (src/nonce_window.h). A forward cap would not bound an attacker —
+            // checking commits nothing — but it would strand the session, because
+            // once a gap exceeded it nothing would commit, last_seen would never
+            // advance, and each retransmission's still-higher counter would be
+            // rejected further out than the last, until re-authentication. That is
+            // a transient link fault promoted to a permanent session fault.
             handlePipeWriteData(data + 2, len - 2);
             break;
         case CMD_PIPE_WRITE_END:      // 0x0082
