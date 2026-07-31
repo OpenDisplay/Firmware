@@ -33,9 +33,55 @@ public:
 
     // --- state ---
     bool    isReady() const;       // stack initialised and usable
+    // The stack's TOTAL peer count. Note what this is NOT: a test for whether one
+    // particular link is up. CONNECTION_POLICY R1 permits a refused contender to be
+    // transiently attached, so dropping the owner takes this 2->1, never to 0 --
+    // which is why the R3a wait polls instanceLive() per handle instead. Keep using
+    // this only for "is anything connected at all".
     uint8_t connectedCount() const;
     bool    isConnected() const { return connectedCount() > 0; }
-    bool    notifyReady() const;   // connected AND the client has subscribed (CCCD)
+    bool    notifyReady() const;   // owner connected AND subscribed (CCCD), per-instance
+
+    // --- connection instances (CONNECTION_POLICY R2/R3 requirement 5) ---
+    // A fixed per-handle table, sized by the connection cap (3 on ESP32, 1 on nRF),
+    // holding metadata only -- never frames. Callbacks write their own handle's
+    // entry; the loop scans it. That inversion is what makes lost edges stop
+    // mattering: state is bounded by the connection cap rather than by event rate,
+    // so there is nothing to overflow and no eviction policy to specify.
+    //
+    // Liveness IS the packed (handle, epoch) identity word -- all-zero means empty --
+    // so an entry can never present a live identity with a stale state, and the R3a
+    // wait can read identity and liveness in one atomic load.
+    bool     instanceLive(uint16_t handle, uint16_t epoch) const;
+    uint8_t  liveInstanceCount() const;
+    // Packed identity word of the i'th live instance, 0 when the slot is empty.
+    // Phase 3's admission scan walks these to find contenders (any live instance
+    // that is not the owner); Phase 2 only needs it for diagnostics and the wait.
+    uint32_t instanceWordAt(uint8_t index) const;
+    static uint8_t instanceCapacity();
+
+    // --- link drop (CONNECTION_POLICY R3a) ---
+    // Requests termination of ONE link. Returns false only on a genuine failure to
+    // ask; a true return means "requested", NOT "down" -- BLE disconnect is
+    // asynchronous, so callers that need the link actually gone must wait on
+    // instanceLive() (bleDropAndWait() in session_guard.cpp does exactly that).
+    //
+    // No `reason` parameter, deliberately. A host-initiated disconnect must send a
+    // Core-Spec-legal HCI reason; 0x13 (REMOTE_USER_TERMINATED) is the only value
+    // this firmware wants, it is what NimBLE defaults to, and it is the only value
+    // Bluefruit can send at all (BLEConnection::disconnect() hardcodes it, with no
+    // reason argument to pass). Note 0x09 (CONN_LIMIT) is NOT legal here: the
+    // controller silently rejects it and the peer stays connected while the code
+    // looks like it worked.
+    //
+    // Loop task only. A callback that severs its own link mid-dispatch is exactly
+    // the class of bug the unified-loop work removed.
+    bool disconnect(uint16_t handle);
+
+    // Negotiated connection interval in ms for `handle`, 0 when unknown. The
+    // central chooses it; this firmware requests none. Phase 4's TX-flush dwell
+    // sizes itself on this rather than on a constant.
+    uint16_t connIntervalMs(uint16_t handle) const;
 
     // --- data out ---
     // false means backpressure ("retry next pass"), not a hard failure: the
@@ -70,15 +116,25 @@ public:
     // arriving inside the check-then-clear window is lost. This peek neither
     // introduces nor worsens that; fixing it is a separate change.
     bool eventPending() const;
-    bool takeConnectedEvent();
-    // Optionally reports the stack's disconnect reason code, which is otherwise
-    // lost now that the callback no longer runs application code inline.
-    // rxBoundary, when requested, is the RX ring head at the instant the link went
-    // down -- the dividing line between the departed client's queued frames and any
-    // pushed by whoever connected afterwards. Pass it to bleRxQueueDiscardTo(); a
-    // flush without it drops the next client's frames whenever loop() was blocked
-    // long enough for a reconnect to land before this event was serviced.
-    bool takeDisconnectedEvent(uint8_t* reason = nullptr, uint8_t* rxBoundary = nullptr);
+    // Reports the connecting instance's identity (packed word, link_owner.h) so the
+    // loop can act on a specific newcomer. Under requirement 5 this is a hint: the
+    // instance table, not the event, is the mechanism -- a connect that coalesces
+    // away still leaves a live table entry.
+    bool takeConnectedEvent(uint32_t* instanceWord = nullptr);
+    // Optionally reports the departing instance's identity and the stack's
+    // disconnect reason, which is otherwise lost now that the callback no longer
+    // runs application code inline.
+    //
+    // `reason` is uint16_t because NimBLE's is not a byte: it uses two ranges, HCI
+    // reasons wrapped as BLE_HS_ERR_HCI_BASE + code (0x200 + code) and host-layer
+    // BLE_HS_E* codes in 1..31. The old uint8_t truncation kept only the low byte,
+    // so an HCI reason survived by luck (0x213 & 0xFF == 0x13) while BLE_HS_ENOTCONN
+    // (7) read back as the unrelated HCI "memory capacity exceeded". nRF stores a
+    // raw HCI byte with no wrapping and is unaffected.
+    //
+    // The rxBoundary out-param is GONE: the RX-boundary mechanism it fed is retired
+    // in favour of per-frame identity tags (CommandQueueItem::tag).
+    bool takeDisconnectedEvent(uint16_t* reason = nullptr, uint32_t* instanceWord = nullptr);
 
     // --- identity ---
     const char* addressString();   // advertised BLE address, lowercase "aa:bb:.."

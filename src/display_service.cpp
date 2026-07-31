@@ -12,6 +12,8 @@
 #include "communication.h"
 #include "encryption.h"
 #include "boot_screen.h"
+#include "link_owner.h"
+#include "session_guard.h"
 #include "touch_input.h"
 #include "uzlib.h"
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
@@ -83,6 +85,24 @@ extern bool directWriteCompressed;
 extern bool directWriteActive;
 extern uint8_t decompressionChunk[OPENDISPLAY_DECOMPRESSION_CHUNK_SIZE];
 volatile bool epdRefreshInProgress = false;
+
+// The ONE place the refresh bracket is closed, on every path.
+//
+// Both bracket sites used to assign epdRefreshInProgress = false inline. Routing
+// them through a helper is what makes the R4 refresh exclusion implementable: a
+// loop-side edge detector cannot see this transition, because loop() does not run
+// for the refresh's whole duration -- both edges happen inside the blocking
+// handler while wall-clock time passes. The activity clock has to be re-stamped AT
+// the transition or a naive millis()-lastStamp accrues the entire refresh and drops
+// an actively engaged client the instant loop() resumes.
+//
+// Re-stamping can only ever DELAY a drop, never cause a spurious one, which is why
+// it is safe to apply unconditionally here. A future third refresh path gets the
+// exclusion by calling this instead of remembering a second statement.
+void endRefresh(void) {
+    epdRefreshInProgress = false;
+    linkStampRefreshEnd();
+}
 
 extern uint32_t displayed_etag;
 
@@ -589,30 +609,49 @@ void checkTransferTimeouts(void) {
     // in the ~1 ms window where millis() wraps through zero. Of order one in 10^9
     // transfers, so this is removing a special case from the invariant rather than
     // fixing a live risk.
+    // Both branches route through the ONE teardown routine (CONNECTION_POLICY R6's
+    // teardown extended to a non-disconnect trigger). This function is cited in the
+    // freeze-hardening plan as the very reason a shared routine is needed -- it is
+    // where a watchdog once tore down a panel while leaving its pipe session live --
+    // so exempting it would have argued for the routine while leaving the original
+    // drift source untouched.
+    //
+    // Three deliberate behaviour changes come with it: crypto is now cleared (it
+    // used to survive), the link is now dropped, and teardown is no longer selective
+    // (each branch used to clean one transfer half). Dropping follows from clearing:
+    // a retained link whose session is gone draws RESP_AUTH_REQUIRED with no event
+    // to explain it. The client must restart the transfer either way, since the
+    // transfer state is gone regardless.
+    //
+    // dropLink=true dispatches on the OWNER'S transport inside the abort -- this
+    // watchdog is origin-agnostic (both tests below read transfer state, not
+    // origin), so a timed-out LAN transfer must lose its socket, not some unrelated
+    // BLE handle.
+    // Drop the link only when the slot's owner is the transport that OWNS THIS
+    // TRANSFER. They can differ: LAN sessions are admitted unowned in Phase 2 when
+    // BLE already holds the slot, so a timed-out LAN transfer with a BLE owner
+    // would otherwise drop the innocent BLE client's link. Teardown still runs
+    // either way -- only the drop is withheld.
+    const LinkId owner = linkOwnerId();
+    const bool lanOwnsTransfer = (transferSessionOrigin() != 0);   // != ORIGIN_BLE
+    const bool dropOwnersLink =
+        (lanOwnsTransfer && owner.who == OWNER_LAN) ||
+        (!lanOwnsTransfer && owner.who == OWNER_BLE);
+
     if (directWriteActive) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
         if (directWriteDuration > TRANSFER_WATCHDOG_MS) {
-            od_log_error("ERROR: Direct write timeout (%u ms) - cleaning up stuck state", (unsigned)directWriteDuration);
-            cleanupDirectWriteState(true);
-            // Parity with the pipe-partial branch below: a full PIPE transfer owns this
-            // direct-write session as its hardware half, so the pipe half must die with
-            // it. Left alive, pipeState.active keeps the 0x0081 handler accepting frames
-            // into a torn-down session -- and because the cleanup above zeroes the byte
-            // counters, the uncompressed auto-complete test reads 0 >= 0 and drives a
-            // full refresh at an unpowered panel. Deliberately not folded into
-            // cleanupDirectWriteState(), which normal END also calls and where the pipe
-            // reset is already sequenced separately.
-            if (pipeState.active) resetPipeWriteState();
+            od_log_error("ERROR: Direct write timeout (%u ms) - aborting session", (unsigned)directWriteDuration);
+            abortToKnownState("direct-write transfer watchdog", dropOwnersLink, owner);
+            return;   // the abort cleared every branch below
         }
     }
 
     if (partialCtx.active &&
         (millis() - partialCtx.start_time) > TRANSFER_WATCHDOG_MS) {
-        od_log_error("ERROR: Partial write timeout - cleaning up stuck state");
-        cleanup_partial_write_state();
-        // A pipe-partial transfer shares partialCtx: also clear pipeState so a zombie
-        // pipeState.active can't misroute later 0x0081 frames into the dead partialCtx.
-        if (pipeState.partial) resetPipeWriteState();
+        od_log_error("ERROR: Partial write timeout - aborting session");
+        abortToKnownState("partial transfer watchdog", dropOwnersLink, owner);
+        return;
     }
 
     // Postcondition over both branches above: a live, non-errored pipe session
@@ -2464,7 +2503,7 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
         // No bbepSleep here: cleanupDirectWriteState(false) releases the session,
         // keeping the controller awake + rail up when keep-alive holds it warm.
     }
-    epdRefreshInProgress = false;
+    endRefresh();
     cleanupDirectWriteState(false);
     // Request rather than re-arm inline: main.cpp owns the deferral policy and
     // runs it later in this same loop() pass (the refresh above is reached from
@@ -3347,7 +3386,7 @@ static bool partial_write_to_panel(int refreshMode) {
     {
         refreshSuccess = partial_trigger_refresh(refreshMode);
     }
-    epdRefreshInProgress = false;
+    endRefresh();
     // A successful partial refresh leaves both controller planes consistent.
     if (refreshSuccess) epdPlanesPrepared = true;
     // Release keeps the panel warm (rail/SPI up, controller awake) on success;

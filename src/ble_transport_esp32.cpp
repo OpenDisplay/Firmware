@@ -16,6 +16,7 @@
 #include "ble_transport.h"
 #include "ble_transport_esp32.h"
 #include "command_queue.h"
+#include "link_owner.h"
 #include "structs.h"
 #include "od_log.h"
 
@@ -29,22 +30,88 @@ static BLEService*        s_service = nullptr;
 static BLECharacteristic* s_txCharacteristic = nullptr;
 static BLEAdvertisementData s_advertisementData;
 
-static volatile bool s_notifySubscribed = false;
 static volatile bool s_connectedEvent = false;
 static volatile bool s_disconnectedEvent = false;
-static volatile uint8_t s_disconnectReason = 0;
-// RX ring head at the instant the link dropped: the boundary between the departed
-// client's queued frames and anything the next client pushes. Captured in the
-// disconnect callback because that is the only moment it is knowable -- by the time
-// loop() services the event, a reconnect may already have queued frames of its own.
-static volatile uint8_t s_rxBoundaryAtDisconnect = 0;
-static volatile uint16_t s_connHandle = BLE_HS_CONN_HANDLE_NONE;
+// NimBLE's reason is an int spanning two ranges (HCI wrapped at 0x200+, host-layer
+// 1..31), so a uint8_t here silently aliased them onto each other. See
+// takeDisconnectedEvent().
+static volatile uint16_t s_disconnectReason = 0;
+static volatile uint32_t s_connectedWord = 0;      // identity of the last connect
+static volatile uint32_t s_disconnectedWord = 0;   // identity of the last disconnect
+
+// --- the instance table (CONNECTION_POLICY R3 requirement 5) -----------------
+// Sized by the connection cap. CONFIG_BT_NIMBLE_MAX_CONNECTIONS is 3 in the
+// precompiled sdkconfig.h for S3/C3/C6 and absent for classic ESP32 (NimBLE's own
+// #ifndef default is also 3), and a -D override is inert because the precompiled
+// header wins -- which is exactly why exclusivity must be enforced in firmware
+// rather than by config.
+//
+// Each entry's packed identity word IS its liveness: all-zero means empty. There is
+// no separate `state` field, so a reader can never see a live identity with a stale
+// state. Written on the NimBLE host task, read on the loop task; the word is the
+// synchronisation point, and `reason`/`subscribed` are only read once it says down
+// or under owner comparison.
+#ifndef OD_BLE_MAX_INSTANCES
+#define OD_BLE_MAX_INSTANCES 3
+#endif
+
+struct BleInstance {
+    volatile uint32_t word;         // packed (OWNER_BLE, handle, epoch); 0 = empty
+    // Per-link CCCD state (requirement 2). Written on the NimBLE host task by
+    // onSubscribe, read on the loop task by notifyReady, so every access goes
+    // through __atomic_*: `volatile` orders nothing and does not make a concurrent
+    // read/write anything but a data race in C++.
+    volatile uint8_t  subscribed;
+};
+static BleInstance s_instances[OD_BLE_MAX_INSTANCES];
+
+// Search by handle rather than indexing by it. NimBLE allocates from 0 upward in
+// practice, so direct indexing usually works, but a 3-entry linear search costs the
+// same at this size and cannot be broken by a stack change that hands out sparse
+// handles.
+static int instanceIndexOf(uint16_t handle) {
+    for (int i = 0; i < OD_BLE_MAX_INSTANCES; i++) {
+        const uint32_t w = __atomic_load_n(&s_instances[i].word, __ATOMIC_ACQUIRE);
+        if (w != 0 && linkUnpackWord(w).handle == handle) return i;
+    }
+    return -1;
+}
+
+static uint32_t instancePublish(uint16_t handle, uint16_t epoch) {
+    const uint32_t w = linkPackWord(OWNER_BLE, handle, epoch);
+    for (int i = 0; i < OD_BLE_MAX_INSTANCES; i++) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&s_instances[i].word, &expected, w,
+                                        false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&s_instances[i].subscribed, (uint8_t)0, __ATOMIC_RELAXED);
+            return w;
+        }
+    }
+    // Cannot happen while the table is sized at the connection cap; if the stack
+    // ever exceeds it, the link is unrepresentable and therefore unserviceable.
+    od_log_error("ERROR: BLE instance table full, handle %u unrepresentable", (unsigned)handle);
+    return 0;
+}
+
+static void instanceRetire(uint16_t handle) {
+    const int i = instanceIndexOf(handle);
+    if (i < 0) return;
+    __atomic_store_n(&s_instances[i].subscribed, (uint8_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_instances[i].word, (uint32_t)0, __ATOMIC_RELEASE);
+}
+
+static void instancesClear() {
+    for (int i = 0; i < OD_BLE_MAX_INSTANCES; i++) {
+        __atomic_store_n(&s_instances[i].subscribed, (uint8_t)0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_instances[i].word, (uint32_t)0, __ATOMIC_RELEASE);
+    }
+}
 
 static void clearHandles() {
     s_server = nullptr;
     s_service = nullptr;
     s_txCharacteristic = nullptr;
-    s_notifySubscribed = false;
+    instancesClear();
 }
 
 // --- link diagnostics (implementation-private) ------------------------------
@@ -80,29 +147,60 @@ static void logNegotiatedLink(NimBLEConnInfo& info, const char* trigger) {
 class OdServerCallbacks : public BLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
         (void)pServer;
-        od_log_info("=== BLE CLIENT CONNECTED (ESP32) ===");
-        s_notifySubscribed = false;
-        // Captured here because it is the only place NimBLE hands it to us; the
-        // link tuning that consumes it runs later, on the loop task.
-        s_connHandle = connInfo.getConnHandle();
-        // Flag-only. The app work this implies (rebootFlag reset, updatemsdata()
-        // -- which polls I2C and mutates the shared advertisement vector that
-        // loop() also drives on a 60 s cadence) would corrupt the heap if run
-        // here on the NimBLE host task. loop() consumes the event instead.
+        const uint16_t handle = connInfo.getConnHandle();
+        // ORDER IS NORMATIVE (R2): allocate the epoch, publish the table entry,
+        // THEN attempt the claim -- so a successful claim never names an instance
+        // the loop cannot yet see.
+        //
+        // The epoch is allocated for EVERY instance, admitted or not. Allocating on
+        // successful claim instead (an earlier draft) would leave a refused
+        // contender with no epoch, making 7a row 4 -- a contender that reuses the
+        // incumbent's handle after a stale link -- indistinguishable from the
+        // incumbent. Identity is what the admission decision is MADE on, so it must
+        // precede the decision.
+        const uint16_t epoch = linkNextEpoch();
+        const uint32_t word = instancePublish(handle, epoch);
+        // The claim itself, here rather than on the loop task: this is the earliest
+        // transport hook, and R7d makes it the authoritative arbitration point. A
+        // CAS win IS admission; a loss makes this instance a contender, whose writes
+        // the filters below drop from its very first frame. Phase 3 adds the policy
+        // that actively disconnects it.
+        const LinkId id = { OWNER_BLE, handle, epoch };
+        const bool admitted = (word != 0) && linkClaim(id);
+        od_log_info("=== BLE CLIENT CONNECTED (ESP32) h=%u e=%u %s ===",
+                    (unsigned)handle, (unsigned)epoch,
+                    admitted ? "[owner]" : "[contender - refused service]");
+        s_connectedWord = word;
+        // Flag-only beyond the claim. The app work a connect implies (rebootFlag
+        // reset, updatemsdata() -- which polls I2C and mutates the shared
+        // advertisement vector that loop() also drives on a 60 s cadence) would
+        // corrupt the heap if run here on the NimBLE host task. loop() consumes the
+        // event instead. The claim is exempt because it is one CAS on one word.
         s_connectedEvent = true;
     }
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         (void)pServer;
-        (void)connInfo;
-        od_log_info("=== BLE CLIENT DISCONNECTED (ESP32) ===");
-        s_notifySubscribed = false;
-        s_disconnectReason = (uint8_t)reason;
-        s_connHandle = BLE_HS_CONN_HANDLE_NONE;
-        // Producer-task read of the producer-owned head: no synchronisation needed,
-        // and within the copy-and-flag contract. Nothing this client can still send
-        // exists past this point -- the link is gone -- so this is exactly the last
-        // frame of the departed session.
-        s_rxBoundaryAtDisconnect = bleRxQueueHead();
+        const uint16_t handle = connInfo.getConnHandle();
+        const int idx = instanceIndexOf(handle);
+        const uint32_t word = (idx >= 0) ? __atomic_load_n(&s_instances[idx].word, __ATOMIC_ACQUIRE) : 0;
+        od_log_info("=== BLE CLIENT DISCONNECTED (ESP32) h=%u reason=0x%03X ===",
+                    (unsigned)handle, (unsigned)reason);
+        // Full width: NimBLE's reason spans two ranges and truncation aliases them.
+        s_disconnectReason = (uint16_t)reason;
+        s_disconnectedWord = word;
+        // Retiring the entry is what makes the link's death observable per handle --
+        // the predicate bleDropAndWait() polls, and the comparison that lets the loop
+        // notice a departed owner even when every event edge was lost.
+        //
+        // No RX-boundary capture here any more: frames carry their writer's identity
+        // (CommandQueueItem::tag), so a departed session's frames self-discard at
+        // dispatch instead of needing a boundary that handle reuse could destroy.
+        instanceRetire(handle);
+        // The token is deliberately NOT released here -- see the matching note in
+        // ble_transport_nrf.cpp. Releasing on this callback would admit a new owner
+        // while the departed session's state is still live, and RX/TX run before
+        // the deferred cleanup. Release stays the abort's last step (R3a); a
+        // reconnecting client that loses its claim is reaped by contender refusal.
         // Flag-only. The session teardown this implies (EPD force-off with
         // SPI.end()/rail cut, partial + pipe cleanup) is heavyweight,
         // state-mutating work that races loop()'s SPI streaming and pipe-frame
@@ -126,14 +224,35 @@ class OdServerCallbacks : public BLEServerCallbacks {
 
 class OdCharacteristicCallbacks : public BLECharacteristicCallbacks {
 public:
+    // Requirement 2: per-link subscribe state. This used to (void) its connInfo and
+    // write one global, so a contender's subscribe cleared or overwrote the
+    // incumbent's apparent notify-readiness and stalled its TX.
     void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
         (void)pCharacteristic;
-        (void)connInfo;
-        s_notifySubscribed = (subValue & 0x0001) != 0;
-        od_log_info("BLE notify subscription: %s", s_notifySubscribed ? "enabled" : "disabled");
+        const uint16_t handle = connInfo.getConnHandle();
+        const int idx = instanceIndexOf(handle);
+        if (idx < 0) return;
+        const bool on = (subValue & 0x0001) != 0;
+        __atomic_store_n(&s_instances[idx].subscribed, (uint8_t)(on ? 1 : 0), __ATOMIC_RELAXED);
+        od_log_info("BLE notify subscription h=%u: %s", (unsigned)handle, on ? "enabled" : "disabled");
     }
     void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
-        (void)connInfo;
+        const uint16_t handle = connInfo.getConnHandle();
+        // Requirement 1: drop a non-owner's write BEFORE it reaches the RX ring.
+        // This must happen here, not on the loop task -- during a ~16 s refresh no
+        // loop-side decision runs at all, which is long enough for a gatecrasher to
+        // inject a full transfer's worth of commands into the incumbent's stream.
+        //
+        // One atomic load of the owner word, compared against this instance's
+        // identity. That comparison is only possible because the token is a single
+        // published word; a loop-task-only owner would give this callback nothing to
+        // test against.
+        const int idx = instanceIndexOf(handle);
+        const uint32_t word = (idx >= 0) ? __atomic_load_n(&s_instances[idx].word, __ATOMIC_ACQUIRE) : 0;
+        if (word == 0 || word != linkOwnerWord()) {
+            od_log_debug("Dropped write from non-owner h=%u", (unsigned)handle);
+            return;
+        }
         // Keep the raw NimBLEAttValue: converting to Arduino String uses the
         // C-string (strlen) constructor, which truncates at the first 0x00 byte.
         // Pipe-write frames start with 0x00 (00 70 / 00 71 / 00 81), so String()
@@ -144,7 +263,11 @@ public:
         // bleRxQueuePush() owns the arrival log and every drop reason (empty, too
         // large, ring full) so this callback and nRF's onWriteCb() cannot report the
         // same frame differently. Add no logging here.
-        (void)bleRxQueuePush((const uint8_t*)value.c_str(), value.length());
+        //
+        // The frame carries `word` as its tag: the dispatcher re-checks it against
+        // the live owner word, so a frame that was legitimate on arrival but whose
+        // session ended before it was drained never executes in the next session.
+        (void)bleRxQueuePush((const uint8_t*)value.c_str(), value.length(), word);
     }
 };
 
@@ -262,18 +385,103 @@ bool BleTransport::notifyReady() const {
     if (s_txCharacteristic == nullptr || s_server == nullptr || s_server->getConnectedCount() == 0) {
         return false;
     }
-    // NimBLE auto-creates the 0x2902 CCCD; onSubscribe tracks the client's toggle.
-    return s_notifySubscribed;
+    // The OWNER's subscription, not "whoever subscribed last". NimBLE auto-creates
+    // the 0x2902 CCCD; onSubscribe tracks each client's toggle per instance.
+    const uint32_t owner = linkOwnerWord();
+    if (owner == 0) return false;
+    const LinkId id = linkUnpackWord(owner);
+    if (id.who != OWNER_BLE) return false;
+    const int idx = instanceIndexOf(id.handle);
+    if (idx < 0) return false;
+    if (__atomic_load_n(&s_instances[idx].word, __ATOMIC_ACQUIRE) != owner) return false;
+    return __atomic_load_n(&s_instances[idx].subscribed, __ATOMIC_RELAXED) != 0;
 }
 
 bool BleTransport::notify(const uint8_t* data, uint16_t len) {
     if (s_txCharacteristic == nullptr) return false;
-    // notify(data,len) copies the payload into an mbuf immediately, so a
+    // Requirement 3, and a LIVE LEAK FIX rather than a new feature. This used to
+    // call notify(data, len) -- the two-argument overload, whose third parameter
+    // defaults to BLE_HS_CONN_HANDLE_NONE, documented as "send to ALL subscribed
+    // clients". A second central that connected and subscribed therefore received
+    // every response the incumbent was sent, authentication traffic included,
+    // before loop() ran at all and with no policy decision having been made.
+    //
+    // Targeting the owner's handle closes it. With no owner there is nobody to
+    // notify, and returning false leaves the entry queued rather than dropping it.
+    const uint32_t owner = linkOwnerWord();
+    if (owner == 0) return false;
+    const LinkId id = linkUnpackWord(owner);
+    if (id.who != OWNER_BLE) return false;
+    // Re-validate the handle against the table immediately before sending, rather
+    // than trusting a readiness check that ran earlier in the pass. Between
+    // notifyReady() and here the host task can retire the owner and hand the SAME
+    // numeric handle to a contender -- and a bare handle carries no epoch, so
+    // NimBLE would happily deliver the departed owner's queued response to the
+    // newcomer, reopening exactly the leak this function exists to close. The
+    // full-word comparison catches it because the epoch differs.
+    //
+    // RESIDUAL, stated rather than papered over: this narrows the window to the few
+    // instructions between the check and NimBLE's send, but cannot close it. The
+    // stack can retire a link and reassign its numeric handle at any point on the
+    // host task, and notify(handle) addresses whatever connection the stack
+    // currently calls `handle` -- there is no epoch to pass it. Closing it fully
+    // needs the send to be serialised with the host's connection lifecycle, which
+    // this API does not offer. What IS closed is the systematic leak: the previous
+    // two-argument call broadcast every response to ALL subscribed clients, for the
+    // whole life of a contender's subscription.
+    const int idx = instanceIndexOf(id.handle);
+    if (idx < 0) return false;
+    if (__atomic_load_n(&s_instances[idx].word, __ATOMIC_ACQUIRE) != owner) return false;
+    // notify(data,len,handle) copies the payload into an mbuf immediately, so a
     // concurrent client WRITE_NR on this shared RX/TX characteristic cannot
     // corrupt the outgoing frame (as setValue()+notify() could, since the no-arg
     // notify sends whatever value is currently stored). On mbuf exhaustion this
     // returns false -- backpressure, not failure.
-    return s_txCharacteristic->notify(data, len);
+    return s_txCharacteristic->notify(data, len, id.handle);
+}
+
+bool BleTransport::instanceLive(uint16_t handle, uint16_t epoch) const {
+    const int idx = instanceIndexOf(handle);
+    if (idx < 0) return false;
+    return __atomic_load_n(&s_instances[idx].word, __ATOMIC_ACQUIRE) ==
+           linkPackWord(OWNER_BLE, handle, epoch);
+}
+
+uint8_t BleTransport::liveInstanceCount() const {
+    uint8_t n = 0;
+    for (int i = 0; i < OD_BLE_MAX_INSTANCES; i++) {
+        if (__atomic_load_n(&s_instances[i].word, __ATOMIC_ACQUIRE) != 0) n++;
+    }
+    return n;
+}
+
+uint32_t BleTransport::instanceWordAt(uint8_t index) const {
+    if (index >= OD_BLE_MAX_INSTANCES) return 0;
+    return __atomic_load_n(&s_instances[index].word, __ATOMIC_ACQUIRE);
+}
+
+uint8_t BleTransport::instanceCapacity() { return OD_BLE_MAX_INSTANCES; }
+
+bool BleTransport::disconnect(uint16_t handle) {
+    if (s_server == nullptr) return false;
+    // BLE_ERR_REM_USER_CONN_TERM (0x13) is what NimBLE defaults to and the only
+    // reason this seam ever sends; see the header for why 0x09 must not be used.
+    const bool ok = s_server->disconnect(handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (!ok) {
+        // NimBLE already treats "the link is gone" as success (it returns true for
+        // BLE_HS_ENOTCONN / BLE_HS_EALREADY / UNK_CONN_ID), so a false here is a
+        // genuine failure to ask, not a benign race with a client that left first.
+        od_log_warn("WARNING: BLE disconnect request failed for handle %u", (unsigned)handle);
+    }
+    return ok;
+}
+
+uint16_t BleTransport::connIntervalMs(uint16_t handle) const {
+    if (s_server == nullptr) return 0;
+    NimBLEConnInfo info = s_server->getPeerInfoByHandle(handle);
+    const uint16_t units = info.getConnInterval();   // 1.25 ms units
+    if (units == 0) return 0;
+    return (uint16_t)((units * 5 + 3) / 4);          // ceil(units * 1.25)
 }
 
 void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
@@ -309,17 +517,22 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
 // Called from loop() when the connect event is consumed, not from the connect
 // callback -- these are host-stack calls, which the callback contract excludes.
 void BleTransport::requestFastLink() {
-    if (s_server == nullptr || s_connHandle == BLE_HS_CONN_HANDLE_NONE) {
-        return;
-    }
+    // Tune the OWNER's link. This used to read the single s_connHandle scalar,
+    // which the newest connect overwrote -- so with a contender attached, link
+    // tuning targeted the wrong link (one of the shared-scalar defects R3 names).
+    if (s_server == nullptr) return;
+    const uint32_t owner = linkOwnerWord();
+    if (owner == 0) return;
+    const LinkId id = linkUnpackWord(owner);
+    if (id.who != OWNER_BLE) return;
     // 2 Mbps both directions. phyOptions applies only to the CODED PHY, so 0.
     // The peer may decline and stay at 1M -- not an error.
-    if (!s_server->updatePhy(s_connHandle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0)) {
+    if (!s_server->updatePhy(id.handle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0)) {
         od_log_warn("2M PHY request rejected (staying at 1M)");
     }
     // 251-octet Link-Layer PDUs (max DLE); NimBLE derives the PHY-appropriate
     // on-air duration itself, so there is no time parameter to pass.
-    s_server->setDataLen(s_connHandle, 251);
+    s_server->setDataLen(id.handle, 251);
     od_log_debug("Requested fast link: 2M PHY + 251-octet DLE");
     // No negotiated-parameter logging here yet, unlike nRF: that would need an
     // equivalent of nRF's delayed one-shot, since negotiation completes after
@@ -338,17 +551,18 @@ bool BleTransport::eventPending() const {
     return s_connectedEvent || s_disconnectedEvent;
 }
 
-bool BleTransport::takeConnectedEvent() {
+bool BleTransport::takeConnectedEvent(uint32_t* instanceWord) {
     if (!s_connectedEvent) return false;
     s_connectedEvent = false;
+    if (instanceWord != nullptr) *instanceWord = s_connectedWord;
     return true;
 }
 
-bool BleTransport::takeDisconnectedEvent(uint8_t* reason, uint8_t* rxBoundary) {
+bool BleTransport::takeDisconnectedEvent(uint16_t* reason, uint32_t* instanceWord) {
     if (!s_disconnectedEvent) return false;
     s_disconnectedEvent = false;
     if (reason != nullptr) *reason = s_disconnectReason;
-    if (rxBoundary != nullptr) *rxBoundary = s_rxBoundaryAtDisconnect;
+    if (instanceWord != nullptr) *instanceWord = s_disconnectedWord;
     return true;
 }
 

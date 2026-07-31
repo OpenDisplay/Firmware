@@ -236,6 +236,16 @@ static void buzzer_run(void) {
     }
 }
 
+void buzzerStopForSleep(void) {
+    // A SLEEP api, not a session-teardown one. Nothing in abortToKnownState() may
+    // call this: R6 deliberately lets a melody play through a session abort, and
+    // this policy fires the abort far more often than a plain disconnect once did,
+    // so truncating buzzes there would be a correspondingly visible regression.
+    // Deep sleep is the one transition where "let the effect finish" cannot hold,
+    // because buzzerService() stops ticking and the pin would simply stay driven.
+    buzzer_stop_internal();
+}
+
 void buzzerService(void) {
     if (!s_buzzer.active) {
         return;

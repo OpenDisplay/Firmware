@@ -73,6 +73,20 @@ struct CommandQueueItem {
     uint8_t data[MAX_COMMAND_SIZE];
     uint16_t len;
     bool pending;
+    // Packed identity word (link_owner.h) of the instance that wrote this frame,
+    // stamped in the write callback from the same owner-word load the non-owner
+    // filter already does. The dispatcher executes a frame only if this still
+    // equals the current owner word: a frame dispatches iff its instance was the
+    // owner both when it arrived and when it dispatches.
+    //
+    // This is what retired the RX-boundary mechanism (a head captured at link-down
+    // and discarded to on the loop). That boundary lived in the departing
+    // instance's slot and was lost whenever the stack reissued the handle before
+    // loop() scanned -- reachable inside one refresh block. Tags travel with the
+    // frame, so stale frames self-discard at dispatch however many edges were
+    // missed. 4 bytes x 18-34 slots = 72-136 B, per-frame metadata in the ONE ring;
+    // nothing that holds frames is ever replicated per connection.
+    uint32_t tag;
 };
 
 // SPSC. Push runs on the stack callback task; peek/consume run on loop(). The
@@ -91,25 +105,36 @@ struct CommandQueueItem {
 // transport is what let nRF report a malformed frame as "queue full". It logs at
 // arrival, on the callback task, so the timestamp is delivery time rather than
 // dispatch time; see the note on the definition for what that costs.
-bool bleRxQueuePush(const uint8_t* data, uint16_t len);   // false = dropped (logged)
+// `tag` is the writing instance's packed identity word; the dispatcher re-checks
+// it against the live owner word before executing the frame. It is written into
+// the slot BEFORE the release-store that publishes the head, exactly like data and
+// len, or the consumer's acquire load would not be guaranteed to see it.
+bool bleRxQueuePush(const uint8_t* data, uint16_t len, uint32_t tag);   // false = dropped (logged)
 CommandQueueItem* bleRxQueuePeek(void);                   // nullptr = empty
 void bleRxQueueConsume(void);                             // advance past the peeked slot
 uint8_t bleRxQueueHead(void);                             // producer-side, for pollActivity()
 uint8_t bleRxQueueDepth(void);                            // unconsumed frame count
 bool bleRxQueuePending(void);                             // unconsumed frames waiting
 
-// Discard unconsumed frames up to `boundary`, a head value captured at the instant
-// the departed client's link went down (BleTransport::takeDisconnectedEvent hands it
-// out). Consumer-side: call only from the loop task. Returns how many were dropped.
+// Discard every unconsumed frame. Consumer-side: call only from the loop task, and
+// only from abortToKnownState()'s ring-reset step.
 //
-// The boundary is what makes this safe, and it is not optional. loop() can be blocked
-// for tens of seconds inside an EPD refresh -- long enough for the old client's
-// disconnect, the next client's connect, and that client's first command to all land
-// before the disconnect is serviced. A "discard everything present now" flush then
-// eats the NEW client's frames; observed on nRF as a dropped 0x0080 immediately after
-// a reconnect. Frames pushed after the boundary belong to whoever connected next and
-// must survive.
-uint8_t bleRxQueueDiscardTo(uint8_t boundary);
+// SPSC-SAFE BY CONSTRUCTION, and the contract is not optional: this snapshots the
+// producer's head with ACQUIRE and stores that snapshot into the tail with RELEASE.
+// It writes NEITHER the head NOR any slot payload. A conventional "reset both
+// indices / memset the ring" would race a producer mid-copy, since the push writes
+// the payload before publishing the head. A push in flight either published before
+// the snapshot (discarded here) or after it (survives, carrying the departing
+// owner's tag, and is dropped at dispatch) -- which is exactly why this needs no
+// stronger guarantee than the frame tag already provides.
+//
+// Must not run while a peek is outstanding: the consumer holds a pointer into the
+// current slot across dispatch. Every returning abort caller is loop-side, after
+// the pass's RX consumption; deep sleep, the one in-dispatch caller, never returns.
+//
+// Replaces bleRxQueueDiscardTo(boundary), retired with the RX-boundary mechanism
+// (see CommandQueueItem::tag).
+uint8_t bleRxQueueReset(void);
 
 // --- TX: command handlers (producer) -> loop() flush (consumer) --------------
 // One definition of the struct, in one place: communication.cpp used to carry
@@ -128,6 +153,10 @@ struct ResponseQueueItem {
 
 // Both ends run on loop() today, so no atomics here.
 bool bleTxQueuePush(const uint8_t* data, uint16_t len);   // false = too large or full
+// Discard every queued response. The TX-side analogue of bleRxQueueReset(), and
+// the other half of R6's "RX and TX rings drained of the departed session's
+// traffic". Single-task, so no ordering rules apply here.
+void bleTxQueueReset(void);
 uint8_t bleTxQueueDepth(void);
 uint8_t bleTxQueueHead(void);                             // producer-side, for pollActivity()
 bool bleTxQueuePending(void);

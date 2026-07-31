@@ -7,6 +7,7 @@
 #include "structs.h"
 #include "od_log.h"
 #include "ble_transport.h"
+#include "link_owner.h"
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
@@ -96,6 +97,11 @@ static mbedtls_ctr_drbg_context tlsDrbg;
 static mbedtls_entropy_context  tlsEntropy;
 
 static uint32_t lastLanActivityMs = 0;  // for the OD_LAN_READ_TIMEOUT_S idle drop
+// Epoch of the current LAN session's ownership claim, 0 when this session does not
+// own the slot. Kept so the release matches the FULL identity: releasing on
+// transport alone would let a stale LAN teardown free a slot a newer session (or a
+// BLE client) had since taken.
+static uint16_t s_lanEpoch = 0;
 
 static uint16_t lanBasePort(void) {
     return (wifiServerPort != 0) ? wifiServerPort : (uint16_t)OD_LAN_TCP_PORT;
@@ -791,6 +797,28 @@ void initWiFi(bool waitForConnection) {
     }
 }
 
+void wifiLanDropOwnedSocket(void) {
+    // The LAN arm of abortToKnownState()'s step 10. It exists as its own seam
+    // because tlsCloseSession() is file-static, so session_guard.cpp cannot reach
+    // the pieces directly.
+    //
+    // Deliberately the LAN-LOCAL subset of disconnectWiFiServer() below: it closes
+    // the socket and clears this file's session bookkeeping, but does NOT call
+    // clearEncryptionSession() or requestTransferSessionCleanup(), which are the
+    // abort's own steps 8 and 3-5. Calling them here would nest the two teardowns.
+    tlsCloseSession();
+    if (wifiClient.connected()) {
+        lanLog("Closing LAN client (session abort)");
+        wifiClient.stop();
+    }
+    wifiServerConnected = false;
+    tcpReceiveBufferPos = 0;
+    // Deliberately NO linkRelease() here: this is the abort's drop step, and the
+    // abort releases the token itself as its final step (strictly after the drop).
+    // Releasing here would free the slot before the drop had completed.
+    s_lanEpoch = 0;
+}
+
 void disconnectWiFiServer() {
     tlsCloseSession();
     if (wifiClient.connected()) {
@@ -800,6 +828,14 @@ void disconnectWiFiServer() {
     }
     wifiServerConnected = false;
     tcpReceiveBufferPos = 0;
+    // Release the slot if this session held it -- the LAN analogue of the BLE
+    // disconnect callback's release. The link is already closed above, so R3a's
+    // ordering holds. Full-identity release: a stale teardown whose epoch no longer
+    // matches cannot free a slot that a newer session has since claimed.
+    if (s_lanEpoch != 0) {
+        linkRelease((LinkId){OWNER_LAN, 0, s_lanEpoch});
+        s_lanEpoch = 0;
+    }
     // F4: abort any in-flight direct-write / pipe / partial transfer + tear down a
     // mid-transfer panel session, DEFERRED to loop() so cleanup never races an
     // in-progress EPD refresh. Shared with the BLE disconnect path -- main.cpp
@@ -868,11 +904,30 @@ void handleWiFiServer() {
 
     WiFiClient incoming = wifiServer.accept();
     if (incoming) {
-        if (wifiClient.connected()) {
-            lanLog("LAN: new client, replacing previous");
-            tlsCloseSession();
-            clearEncryptionSession();
-            wifiClient.stop();
+        // REFUSE while the slot is held -- do not evict. Same scope note as
+        // serviceContenderRefusal() in main.cpp: refusal belongs to Phase 3, but
+        // Phase 2 cannot ship the owner token without it. Two concrete reasons here:
+        //
+        //  - The old eviction path closed the previous socket without releasing its
+        //    ownership epoch, and the replacement then lost its own claim -- so the
+        //    departed session's identity became unreachable and the slot was held
+        //    until reboot. Refusing removes the path rather than patching it.
+        //  - Eviction is unauthenticated by design: LAN-TLS bypasses app-layer auth,
+        //    so today ANY host on the network can kill an in-flight display push
+        //    just by opening a socket, with no credentials.
+        //
+        // The incumbent is untouched: no teardown, no crypto clear, no cleanup flag.
+        // That is the whole of R3's "refusal is inert", and it also fixes a
+        // pre-existing bug in the eviction it replaces -- that path cleared TLS and
+        // crypto but never requested transfer cleanup, so an evicted client's
+        // in-flight transfer stayed live and the new client's frames (same
+        // ORIGIN_LAN, so frameOwnsSession could not tell them apart) landed in it.
+        const LinkId held = linkOwnerId();
+        if (held.who != OWNER_NONE) {
+            lanLog("LAN: refusing new client, slot held by " +
+                   String(held.who == OWNER_BLE ? "BLE" : "LAN"));
+            incoming.stop();
+            return;
         }
         wifiClient = incoming;
         // TCP_NODELAY: every LAN write is a complete, self-delimited frame, so there
@@ -884,6 +939,29 @@ void handleWiFiServer() {
         tcpReceiveBufferPos = 0;
         wifiServerConnected = true;
         lastLanActivityMs = millis();
+        // Claim the slot at TCP ACCEPT, before the TLS handshake (7a row 2). The
+        // handshake is driven incrementally across later loop passes, so deferring
+        // the claim until it completes would leave the slot free for a BLE connect
+        // or a second socket in the meantime.
+        //
+        // The accept is the LAN transport's earliest hook, so this is the same
+        // "claim at the earliest hook" rule the BLE connect callback follows, and
+        // the same CAS -- which is what makes cross-transport arbitration the word
+        // itself rather than loop ordering.
+        //
+        // The slot was free at the check above, so this claim normally wins. It can
+        // still lose to a BLE connect landing on the host task in between -- the
+        // callback is the authoritative arbitration point, not this loop-side test
+        // (R7d) -- in which case the socket is refused for the same reason.
+        s_lanEpoch = linkNextEpoch();
+        if (!linkClaim((LinkId){OWNER_LAN, 0, s_lanEpoch})) {
+            lanLog("LAN: refusing new client, slot claimed concurrently");
+            s_lanEpoch = 0;
+            incoming.stop();
+            wifiClient = WiFiClient();
+            wifiServerConnected = false;
+            return;
+        }
         lanLog("LAN client connected from " + wifiClient.remoteIP().toString());
         if (tlsMode) {
             if (!tlsBeginSession()) {
@@ -943,7 +1021,14 @@ void handleWiFiServer() {
             return;
         }
         if (got > 0) {
-            lastLanActivityMs = millis();
+            // NOT an activity stamp. R4 defines activity as a RECOGNISED COMMAND
+            // from the owner, and this site fires on any bytes read -- before
+            // framing, opcode recognition, ownership or authentication -- so a
+            // plain-mode flooder could hold the slot indefinitely with garbage and
+            // defeat both the 30 s read timeout and anything built on this clock.
+            // That is the same defect the BLE clock had in its intake-stamping
+            // draft, and it is fixed the same way: the stamp moved to the dispatch
+            // site below, which is reached only by a framed, recognised command.
             drainedBytes += (uint32_t)got;
         } else if (drainedBytes == 0) {
             // No traffic at all this tick: drop only after OD_LAN_READ_TIMEOUT_S
@@ -969,8 +1054,19 @@ void handleWiFiServer() {
             // F4: tag the frame's origin so the dispatcher bypasses app-layer CCM on
             // TLS (already-secure) and routes the response back over LAN only.
             g_commandOrigin = tlsMode ? ORIGIN_LAN_TLS : ORIGIN_LAN_PLAIN;
+            // Instance identity for the R4 activity test. LAN frames never traverse
+            // the BLE ring, so there is no queued tag to carry: the socket is parsed
+            // and dispatched within this pass, and its buffer dies with the session.
+            // Publishing the live owner word directly is therefore exact -- if LAN
+            // does not own the slot, the word will not match and the frame stamps
+            // nothing.
+            {
+                const LinkId lanOwner = linkOwnerId();
+                g_commandInstance = (lanOwner.who == OWNER_LAN) ? linkIdWord(lanOwner) : 0;
+            }
             lastLanActivityMs = millis();
             imageDataWritten(NULL, NULL, tcpReceiveBuffer + 2, flen);
+            g_commandInstance = 0;
             g_commandOrigin = ORIGIN_BLE;   // restore default for any subsequent BLE drain
             uint32_t consumed = 2u + (uint32_t)flen;
             uint32_t rem = tcpReceiveBufferPos - consumed;

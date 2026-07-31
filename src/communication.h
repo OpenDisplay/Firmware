@@ -36,6 +36,14 @@ enum CommandOrigin { ORIGIN_BLE = 0, ORIGIN_LAN_PLAIN = 1, ORIGIN_LAN_TLS = 2 };
 /// Origin of the command currently being dispatched (a CommandOrigin value).
 uint8_t commandOrigin(void);
 
+/**
+ * Instance identity (packed owner word) of the frame being dispatched. Set by each
+ * transport immediately before it calls imageDataWritten(): BLE from the frame's own
+ * queue tag, LAN from the LAN owner's identity. Compared against the live owner word
+ * so a frame from a departed instance neither executes nor stamps the activity clock.
+ */
+extern volatile uint32_t g_commandInstance;
+
 // --- deferred work, serviced by loop() ---------------------------------------
 // Implemented in main.cpp, which owns loop() and the flags behind these. They
 // are requests, not commands: the work happens on a later pass, and main.cpp

@@ -20,6 +20,8 @@
 #include "wifi_service.h"
 #endif
 
+#include "link_owner.h"
+
 bool isAuthenticated();
 extern struct GlobalConfig globalConfig;
 
@@ -34,6 +36,18 @@ extern struct GlobalConfig globalConfig;
 // enum CommandOrigin lives in communication.h so display_service.cpp / main.cpp can
 // name the values instead of comparing against a bare 0.
 volatile uint8_t g_commandOrigin = ORIGIN_BLE;
+
+// Instance identity of the frame currently being dispatched -- the packed owner
+// word (link_owner.h) of the connection that WROTE it, not merely its transport.
+//
+// g_commandOrigin says BLE-or-LAN and nothing more, which is not enough to decide
+// whether a frame still belongs to the live session: BLE conn handles are reused,
+// so a frame queued by a dead instance is indistinguishable from the new owner's by
+// transport alone. serviceBleRx() sets this from the frame's own tag (which
+// CommandQueueItem carries from the write callback) and the LAN listener sets it
+// from the LAN owner's identity, both immediately before dispatch. Same
+// single-loop-task argument as g_commandOrigin, so no locking.
+volatile uint32_t g_commandInstance = 0;
 
 // Transport tag for the RX banner and TX dump. Three transports share this
 // dispatcher (nRF BLE, ESP32 BLE via commandQueue, ESP32 LAN), and without a tag
@@ -547,6 +561,33 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     }
 
     uint16_t command = (data[0] << 8) | data[1];
+
+    // The R4 activity stamp. Two tests, and both matter:
+    //
+    //  - RECOGNISED: commandName() != nullptr. Unknown opcodes fall to the switch
+    //    default's "Unknown command" error, so they are not activity. Reusing the
+    //    existing recognition predicate avoids a second, drift-prone one. This is
+    //    what an earlier draft got wrong by stamping at RX intake instead:
+    //    bleRxQueuePush accepts ANY non-empty payload within the size cap, so a
+    //    two-byte malformed frame counted as activity and a garbage flooder could
+    //    hold the slot indefinitely -- precisely the failure the idle drop exists
+    //    to prevent.
+    //
+    //  - FROM THE OWNER: g_commandInstance (set by the caller from the frame's tag,
+    //    or from the LAN owner's identity) still equals the live owner word. NOT a
+    //    transport comparison: transport alone cannot tell a delayed frame from a
+    //    dead BLE instance apart from the new BLE owner, and such a frame would
+    //    stamp the new owner's clock.
+    //
+    // Deliberately BEFORE the auth gate: CMD_AUTHENTICATE must count as activity or
+    // a client could not complete a handshake without racing the clock. A peer that
+    // floods recognised-but-never-authenticating commands is Phase 4's job (the
+    // auth-abuse counter), not this clock's -- the counter can tell "wrong
+    // credentials" from "silent", which the clock cannot.
+    if (commandName(command) != nullptr && linkIsOwnerWord(g_commandInstance)) {
+        linkStampOwnerCommand();
+    }
+
     // Silence the per-frame command spam for image-write data (0x0071) once the
     // stream is past its first chunk; the display handler's 5% meter reports it.
     const bool quietCmd = (command == CMD_DIRECT_WRITE_DATA || command == CMD_PIPE_WRITE_DATA) && imageWriteLogQuietCmd();

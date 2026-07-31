@@ -578,6 +578,13 @@ void handleLedActivate(uint8_t* data, uint16_t len) {
     sendResponse(successResponse, sizeof(successResponse));
 }
 
+void ledStopForSleep(void) {
+    // Sleep API, not teardown -- see buzzerStopForSleep(). clear_mode=true matches
+    // handleLedStop() below, so the observable result is the same as the client
+    // having sent LED_STOP.
+    led_stop_internal(true);
+}
+
 void handleLedStop(uint8_t* data, uint16_t len) {
     if (s_led.active && len >= 1 && data[0] != s_led.instance) {
         uint8_t errorResponse[] = {RESP_NACK, RESP_LED_STOP_ACK, 0x02, 0x00};

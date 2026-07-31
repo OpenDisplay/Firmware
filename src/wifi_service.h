@@ -28,6 +28,15 @@ void od_tls_reserve_records(void);
 
 void initWiFi(bool waitForConnection = true);
 void disconnectWiFiServer();
+/**
+ * Close the owned LAN socket and its TLS context, without the crypto/transfer
+ * teardown that disconnectWiFiServer() also does.
+ *
+ * The LAN arm of abortToKnownState()'s drop step: the abort owns those other steps,
+ * so this must not repeat them. Synchronous -- a TCP close needs no wait bound,
+ * unlike a BLE disconnect.
+ */
+void wifiLanDropOwnedSocket(void);
 void handleWiFiServer();
 
 // Re-associate to the strongest AP for the configured SSID after the link degrades
