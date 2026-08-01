@@ -46,6 +46,22 @@ typedef struct {
     uint32_t receivedChunks;
 } chunked_write_state_t;
 
+/**
+ * Clear the chunked config-upload state.
+ *
+ * The single primitive for it. The three sites in communication.cpp that used to
+ * clear it inline each zeroed a different subset -- one set only `active`, another
+ * also the counters, none the totals -- so a teardown routed through the wrong one
+ * left a partially-live upload. abortToKnownState() calls this too, which is what
+ * gives session teardown any coverage of this state at all: it previously had no
+ * reset function, so no disconnect path and no watchdog touched it.
+ *
+ * The payload buffer is deliberately not zeroed: `active = false` makes it
+ * unreachable, and MAX_CONFIG_SIZE is large enough that clearing it on every
+ * teardown would be pointless work.
+ */
+void resetChunkedWriteState(void);
+
 bool initConfigStorage();
 void formatConfigStorage();
 bool saveConfig(uint8_t* configData, uint32_t len);

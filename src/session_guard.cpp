@@ -18,7 +18,6 @@
 #endif
 
 extern bool directWriteActive;
-extern chunked_write_state_t chunkedWriteState;
 
 // How long to wait for a requested drop to actually take the link down.
 //
@@ -64,17 +63,6 @@ bool bleDropAndWait(uint16_t handle, uint16_t epoch) {
     return down;
 }
 
-void resetChunkedWriteState(void) {
-    // A real primitive replacing the open-coded inline clears in communication.cpp.
-    // The buffer itself is deliberately not zeroed: `active = false` makes it
-    // unreachable, and MAX_CONFIG_SIZE is large enough that clearing it on every
-    // teardown would be pointless work.
-    chunkedWriteState.active = false;
-    chunkedWriteState.totalSize = 0;
-    chunkedWriteState.receivedSize = 0;
-    chunkedWriteState.expectedChunks = 0;
-    chunkedWriteState.receivedChunks = 0;
-}
 
 void abortToKnownState(const char* reason, bool dropLink, LinkId ownerId) {
     // 1. Log first, one line, so a teardown is always attributable even if a later
@@ -83,7 +71,14 @@ void abortToKnownState(const char* reason, bool dropLink, LinkId ownerId) {
                 dropLink ? 1 : 0, (unsigned)ownerId.who, (unsigned)ownerId.handle,
                 (unsigned)ownerId.epoch);
 
-    // 2. Optional client NACK: skipped when dropLink, since the link is about to go.
+    // 2. Optional client NACK -- deliberately NOT implemented, and the plan's step
+    //    list should be read with this note. It is specified as "skip when
+    //    dropLink", and every caller either drops the link or is called because the
+    //    link is ALREADY gone (disconnect cleanup) or about to be (deep sleep). So
+    //    no caller is in a position to deliver one, and adding a NACK nobody can
+    //    receive would only add a failure mode. Revisit only if a future caller
+    //    aborts a session while intending to keep the link up.
+    //
     //    Note the asymmetry with Phase 4's auth-abuse drop, which must DELIVER its
     //    final FE -- it runs its own bounded TX barrier BEFORE calling this, rather
     //    than asking the abort to hold the link open. Two contradictory jobs in one

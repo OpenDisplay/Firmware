@@ -482,7 +482,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
     if (chunkedWriteState.receivedChunks == 1 && isEncryptionEnabled() && !isAuthenticated()) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
-            chunkedWriteState.active = false;
+            resetChunkedWriteState();
             uint8_t response[] = {RESP_ACK, (uint8_t)(CMD_CONFIG_CHUNK & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
@@ -490,7 +490,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         secureEraseConfig();
     }
     if (len == 0 || len > CONFIG_CHUNK_SIZE || chunkedWriteState.receivedSize + len > MAX_CONFIG_SIZE || chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
-        chunkedWriteState.active = false;
+        resetChunkedWriteState();
         uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
@@ -506,9 +506,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
             reloadConfigAfterSave();
         }
         sendResponse(saved ? ok : err, 4);
-        chunkedWriteState.active = false;
-        chunkedWriteState.receivedSize = 0;
-        chunkedWriteState.receivedChunks = 0;
+        resetChunkedWriteState();
     } else {
         uint8_t ackResponse[] = {RESP_ACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(ackResponse, sizeof(ackResponse));
