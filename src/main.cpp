@@ -980,6 +980,12 @@ void loop() {
     // pass is never judged idle on the strength of it not having been read yet.
     // Moving this above handleWiFiServer() would reintroduce exactly that for LAN.
     serviceIdleTimeout();
+    // After the idle check, and last of the session-policy steps. It ends in the
+    // abort like the idle drop does, so it must not run before inbound traffic has
+    // been parsed this pass -- an accepted command clears the rejection run, and
+    // dropping a client that just authenticated would be the worst possible
+    // outcome for a mechanism whose entire value is speed.
+    serviceBleAuthAbuseDisconnect();
 
     // Work in flight *this iteration* only. Every term is transient and most are
     // cleared earlier in this same pass, so this must never be the sole gate on

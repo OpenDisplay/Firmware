@@ -1,4 +1,5 @@
 #include "encryption.h"
+#include "communication.h"
 #include "encryption_state.h"
 #include "od_log.h"
 
@@ -652,6 +653,13 @@ bool handleAuthenticate(uint8_t* data, uint16_t len) {
             return false;
         }
         encryptionSession.authenticated = true;
+        // A successful handshake ends any run of rejections, even one that has not
+        // yet reached the threshold. Without this the run survives the very event
+        // that resolves it: CMD_AUTHENTICATE returns from its own early branch and
+        // never reaches the post-dispatch reset, so nine rejections followed by a
+        // good handshake followed by one more rejection would drop a client that
+        // had just authenticated.
+        resetAuthAbuseCounter();
         encryptionSession.nonce_counter = 0;
         encryptionSession.last_seen_counter = 0;
         encryptionSession.integrity_failures = 0;

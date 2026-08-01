@@ -44,6 +44,23 @@ uint8_t commandOrigin(void);
  */
 extern volatile uint32_t g_commandInstance;
 
+/**
+ * Drop a BLE link that has answered OD_AUTH_ABUSE_THRESHOLD consecutive commands
+ * with RESP_AUTH_REQUIRED. Loop-serviced, both targets, and it must run on the loop
+ * task: it ends in abortToKnownState().
+ *
+ * Best-effort delivery of the final RESP_AUTH_REQUIRED before the drop -- it drains
+ * TX and dwells about one connection interval, both inside a hard bound. An empty
+ * ring proves stack acceptance of an unacknowledged notification, not receipt, so a
+ * deadline-truncated attempt may forfeit it by design.
+ */
+void serviceBleAuthAbuseDisconnect(void);
+
+/** Clear the consecutive-rejection run. Called by abortToKnownState() so every
+ *  session end resets it -- otherwise a new client inherits its predecessor's
+ *  rejections, which is a defect an earlier prototype shipped with. */
+void resetAuthAbuseCounter(void);
+
 // --- deferred work, serviced by loop() ---------------------------------------
 // Implemented in main.cpp, which owns loop() and the flags behind these. They
 // are requests, not commands: the work happens on a later pass, and main.cpp

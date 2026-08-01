@@ -5,6 +5,7 @@
 
 #include "session_guard.h"
 #include "ble_transport.h"
+#include "communication.h"
 #include "command_queue.h"
 #include "config_parser.h"
 #include "display_service.h"
@@ -105,6 +106,11 @@ void abortToKnownState(const char* reason, bool dropLink, LinkId ownerId) {
     //    directWriteTouchSuspended), so a partial-path teardown cannot leave touch
     //    suspended forever.
     touchForceResume();
+
+    // 7b. The auth-abuse run. Every session end clears it, so a new client can
+    //     never inherit its predecessor's rejections -- a defect the off-branch
+    //     prototype shipped with, because it only reset on a successful command.
+    resetAuthAbuseCounter();
 
     // 8. Crypto. NEW on the disconnect path: today crypto state survives a BLE link
     //    drop entirely -- clearEncryptionSession() runs on session-timeout-at-command,

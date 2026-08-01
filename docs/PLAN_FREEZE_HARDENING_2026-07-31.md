@@ -78,7 +78,7 @@ and R4's no-transfer-gate was reconciled in the previous revision.
 | 1 | Nonce / replay correctness | — | **Shipped** on this branch (`e2e95cd`…`19335e6`) |
 | 2 | BLE-HAL foundation: link-drop seam (with the R3a wait), instance identity + owner token, the instance table, callback-side filtering, frame identity tags, activity clock, abort-to-known-state — **plus contender refusal, moved here from Phase 3** | — | **Implemented** on `feat/phase2-ble-hal-foundation` (`dbec776`, `bb7ad1d`); landed, not closed |
 | 3 | Idle drop + the remaining exclusivity policy | Phase 2 | **Implemented** on `feat/phase3-exclusivity-idle-drop`; landed, not closed |
-| 4 | Auth-abuse disconnect | Phase 2, Phase 3 | Prototype exists off-branch, not here |
+| 4 | Auth-abuse disconnect | Phase 2, Phase 3 | **Implemented** on `feat/phase4-auth-abuse-disconnect`; landed, not closed |
 
 > **Refusal moved from Phase 3 to Phase 2 during implementation.** Phase 2 is not
 > safely shippable without it, so the split as originally drawn was wrong rather
