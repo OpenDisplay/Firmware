@@ -602,10 +602,17 @@ bool BleTransport::eventPending() const {
 bool BleTransport::takeConnectedEvent(uint32_t* instanceWord) {
     // Atomic exchange, not check-then-clear. The old form could lose an event that
     // arrived inside the gap, and -- now that the flag carries an identity payload
-    // -- could also pair one event's flag with another's word. ACQUIRE pairs with
+    // -- could also lose an event that arrived inside the gap. ACQUIRE pairs with
     // the callback's RELEASE store of the flag, which it makes after writing the
-    // payload, so a true return guarantees the payload below is the one that flag
-    // was raised for.
+    // payload, so the payload we read is at least fully written.
+    //
+    // It does NOT bind the payload to the flag we just consumed: acquire/release
+    // orders writes that PRECEDE the release, and nothing freezes the payload
+    // afterwards, so a second connect landing between the exchange and the load
+    // below hands us ITS word instead. That is tolerable only because no decision
+    // depends on it -- teardown and connect-side work are both derived from the
+    // owner token and the instance table, which are authoritative. The payload is
+    // diagnostic. Do not build a decision on it without binding it properly.
     if (!__atomic_exchange_n(&s_connectedEvent, false, __ATOMIC_ACQUIRE)) return false;
     if (instanceWord != nullptr) {
         *instanceWord = __atomic_load_n(&s_connectedWord, __ATOMIC_RELAXED);
@@ -614,9 +621,11 @@ bool BleTransport::takeConnectedEvent(uint32_t* instanceWord) {
 }
 
 bool BleTransport::takeDisconnectedEvent(uint16_t* reason, uint32_t* instanceWord) {
-    // See takeConnectedEvent(): atomic exchange so the flag and its payload cannot
-    // be torn apart, and so an event landing in the old check-then-clear window is
-    // not silently dropped.
+    // See takeConnectedEvent(), including the caveat: the exchange stops events
+    // being lost in the old check-then-clear gap, but does not bind this payload to
+    // the flag just consumed. The reason code below is therefore diagnostic -- a
+    // burst of disconnects can report the latest reason twice. Teardown decides on
+    // table state, not on this.
     if (!__atomic_exchange_n(&s_disconnectedEvent, false, __ATOMIC_ACQUIRE)) return false;
     if (reason != nullptr) *reason = __atomic_load_n(&s_disconnectReason, __ATOMIC_RELAXED);
     if (instanceWord != nullptr) {

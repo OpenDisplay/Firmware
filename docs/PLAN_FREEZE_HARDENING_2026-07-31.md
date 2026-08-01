@@ -1480,14 +1480,26 @@ the placement.
 Phase 2 (the seam and its R3a wait, `abortToKnownState`, the owner token) and Phase 3
 (it slots into the same admission/idle policy layer).
 
-**And Phase 3 depends on *it* for one case**, which is worth stating because the division
-is easy to get backwards. Under R4 the activity clock stamps a *recognised* command
-before the auth gate — it has to, or a client could not complete a handshake without
-racing the clock. So a peer that floods **recognised but never-authenticating** commands
-keeps its clock fresh and the idle drop never fires on it. That peer is Phase 4's job,
-not Phase 3's. The two together are exhaustive: garbage that is not a recognised command
-never stamps the clock and is dropped by the idle timeout; recognised commands that never
-authenticate are dropped by the counter.
+**Phase 4 is now an OPTIMISATION, not a correctness requirement — this changed
+during Phase 3.** An earlier revision of this section said Phase 3 depended on Phase 4
+for one case: because the activity clock stamped any *recognised* command before the
+auth gate, a peer flooding recognised-but-never-authenticating commands kept its clock
+fresh forever, so only the auth-abuse counter could reach it. The two were called
+exhaustive.
+
+They were not, and the fix removed the dependency rather than patching it. That rule
+let `CMD_FIRMWARE_VERSION` pin the slot too — it is dispatched *ahead* of the auth
+gate, so it never drew `RESP_AUTH_REQUIRED` and would never have incremented the
+counter either. Phase 3 therefore narrowed what counts as activity: the two
+handshake/discovery opcodes never stamp the clock in any configuration, and where an
+auth gate exists a command must be past it.
+
+The consequence for this phase: a peer that never authenticates now ages normally and
+**the idle timeout drops it after `OD_BLE_IDLE_TIMEOUT_MS`**. Phase 4 no longer closes
+a hole; it shortens a 120 s reclaim to roughly one exchange, and gives the client an
+explicit reason (`RESP_AUTH_REQUIRED`, then a deliberate drop) instead of a silent
+timeout. Worth having, and cheap — but it should be scheduled on that value, not on a
+correctness argument that no longer applies.
 
 ### Verification
 
