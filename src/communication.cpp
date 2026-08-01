@@ -578,26 +578,37 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     //    alone cannot tell a delayed frame from a dead BLE instance apart from the
     //    new BLE owner, and such a frame would stamp the new owner's clock.
     //
-    //  - ACCEPTED, not merely parsed: while encryption is on, only an
-    //    AUTHENTICATED command counts. This is the correction that matters most in
-    //    practice. Stamping every recognised opcode let an UNAUTHENTICATED session
-    //    hold the slot forever, and not only under deliberate abuse -- the two
-    //    realistic triggers are entirely benign: a monitoring integration that
-    //    polls CMD_FIRMWARE_VERSION (dispatched before the auth gate entirely), and
-    //    a misconfigured client retrying CMD_AUTHENTICATE with stale credentials.
-    //    Either refreshes the clock forever, so the idle timeout never fires, while
-    //    every legitimate client is refused the slot.
+    //  - NOT A HANDSHAKE/DISCOVERY OPCODE, and ACCEPTED where there is a gate to
+    //    pass. Together these stop a session holding the exclusive slot without
+    //    doing any real work, and they are deliberately split so the rule behaves
+    //    the same whether or not authentication is configured:
     //
-    //    A handshake still cannot race the clock, which is what the old rule was
+    //      * CMD_AUTHENTICATE and CMD_FIRMWARE_VERSION never count, in ANY
+    //        configuration. Both are dispatched before the auth gate (they are the
+    //        handshake), and neither represents work the device is doing for a
+    //        client. Excluding them unconditionally is what makes this work on a
+    //        device with encryption DISABLED -- which is the default
+    //        (encryption_enabled = 0 means "all commands work unauthenticated"), so
+    //        an auth-conditional rule alone would be a no-op on most devices.
+    //      * Where a gate exists, the command must also be past it. With encryption
+    //        on, an unauthenticated peer's other commands are refused, so counting
+    //        them as activity would let a rejected client outlive a working one.
+    //
+    //    The two realistic pinning triggers are benign, which is why this is not
+    //    filed under abuse: a monitoring integration polling firmware version, and
+    //    a client retrying authentication with stale credentials. Either used to
+    //    refresh the clock forever while every other client was refused the slot.
+    //
+    //    A handshake still cannot race the clock, which is what the weaker rule was
     //    protecting: the window runs from ADMISSION, so a client has the full idle
-    //    timeout -- 120 s on BLE, against a handshake of one exchange -- to
-    //    authenticate. It simply does not get to extend that window by retrying.
-    //    With encryption disabled there is no gate to pass, so every recognised
-    //    owner command counts.
-    const bool commandAccepted = !isEncryptionEnabled() ||
-                                 g_commandOrigin == ORIGIN_LAN_TLS ||   // TLS is the auth
-                                 isAuthenticated();
-    if (commandAccepted && commandName(command) != nullptr &&
+    //    timeout -- 120 s on BLE, against a handshake of one exchange -- to get
+    //    through it. It simply may not extend that window by retrying.
+    const bool handshakeOpcode = (command == CMD_AUTHENTICATE ||
+                                  command == CMD_FIRMWARE_VERSION);
+    const bool pastAuthGate = !isEncryptionEnabled() ||
+                              g_commandOrigin == ORIGIN_LAN_TLS ||   // TLS is the auth
+                              isAuthenticated();
+    if (!handshakeOpcode && pastAuthGate && commandName(command) != nullptr &&
         linkIsOwnerWord(g_commandInstance)) {
         linkStampOwnerCommand();
     }
