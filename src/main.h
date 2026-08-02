@@ -143,16 +143,19 @@ uint16_t wifiServerPort = 2446;
 // bool wifiServerConfigured = false;  // dead -- nothing reads it (config_parser.cpp)
 #endif
 #ifdef OPENDISPLAY_HAS_WIFI
-// Heavy WiFi-transport surface: the TCP server/client objects and the 16 KB RX
-// reassembly buffer exist ONLY when the WiFi transport is compiled in -- every
-// S3 env (E1004 inherits the flag from esp32-s3-N32R8-extuart), C6, and both C3
-// envs. Only the classic esp32-N4 reclaims this RAM.
-// 16 KB = four max wire frames (OD_LAN_MAX_FRAME 4096): headroom for the
-// streaming client to keep whole frames queued ahead of the parser.
+// Heavy WiFi-transport surface: the TCP server/client objects and the RX
+// reassembly buffer exist ONLY when the WiFi transport is compiled in -- the S3
+// envs (E1004 inherits the flag from esp32-s3-N32R8-extuart). The classic and
+// no-PSRAM parts reclaim this RAM; see src/wifi_service.h for the env list.
+//
+// tcpReceiveBuffer is the DEFINITION of the pointer declared in wifi_service.h
+// (included above); its storage is reserved at boot by odLanReserveRxBuffer(),
+// in PSRAM where there is any. Size lives with the declaration as
+// OD_LAN_RX_BUFFER_SIZE -- do not reintroduce a literal here.
 WiFiServer wifiServer;
 WiFiClient wifiClient;
 bool wifiServerConnected = false;
-uint8_t tcpReceiveBuffer[16384];
+uint8_t* tcpReceiveBuffer = nullptr;
 uint32_t tcpReceiveBufferPos = 0;
 #endif
 
