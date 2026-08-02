@@ -628,10 +628,12 @@ void checkTransferTimeouts(void) {
     // origin), so a timed-out LAN transfer must lose its socket, not some unrelated
     // BLE handle.
     // Drop the link only when the slot's owner is the transport that OWNS THIS
-    // TRANSFER. They can differ: LAN sessions are admitted unowned in Phase 2 when
-    // BLE already holds the slot, so a timed-out LAN transfer with a BLE owner
-    // would otherwise drop the innocent BLE client's link. Teardown still runs
-    // either way -- only the drop is withheld.
+    // TRANSFER. Under the claim CAS the two agree in every sequence I can construct
+    // -- a session that does not hold the slot is refused rather than admitted, and
+    // every abort clears transfer state BEFORE releasing -- so this comparison is
+    // defensive rather than load-bearing. It is kept because the cost is one test
+    // and the failure it guards against (dropping an innocent client's link over
+    // another transport's stuck transfer) is invisible from the log.
     const LinkId owner = linkOwnerId();
     const bool lanOwnsTransfer = (transferSessionOrigin() != 0);   // != ORIGIN_BLE
     const bool dropOwnersLink =

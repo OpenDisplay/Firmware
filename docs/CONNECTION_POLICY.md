@@ -538,8 +538,9 @@ incumbent holds the slot. A client that is genuinely gone is reaped by the link 
 in ~4–6 s (the firmware sets no supervision timeout, so the central's negotiated value
 applies), so the lockout never applies to a crashed or out-of-range peer.
 
-**What counts as activity.** A frame must reach the dispatcher and be **recognised as
-a command from the current owner** — where "from the current owner" is full instance
+**What counts as activity.** A frame must reach the dispatcher, be **recognised as
+a command from the current owner**, and be **accepted** — i.e. past the
+authentication gate wherever there is one — where "from the current owner" is full instance
 identity, not transport: the frame's R3-requirement-6 tag must equal the owner word. A
 transport-level test is insufficient, because a delayed frame from a dead BLE instance
 is indistinguishable from the new BLE owner by transport alone and would stamp the new
@@ -587,8 +588,12 @@ parse first. See R7d.
 
 **Baseline.** The idle window is measured from the later of admission and last inbound
 command, so a freshly admitted client gets a full window before its first command. On
-LAN, admission is TCP accept, but the baseline starts at **TLS handshake completion**
-(see R7a note), since handshake traffic is not a command.
+LAN, admission is TCP accept, which starts a **provisional** window; successful TLS
+handshake completion **restarts** it, since handshake traffic is not a command and the
+client should get its full window from the point it can actually issue one. Both halves
+matter: without the provisional accept-time window a stalled handshake would never be
+reclaimed, and without the restart at completion a slow handshake would eat into the
+client's first-command window.
 
 **Per transport.** Each transport enforces its own timer and constant. LAN already has
 one (`OD_LAN_READ_TIMEOUT_S` = 30 s, [wifi_service.cpp:952](../src/wifi_service.cpp)),

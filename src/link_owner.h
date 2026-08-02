@@ -98,8 +98,14 @@ static inline bool linkIsOwnerWord(uint32_t w) { return w != 0 && w == linkOwner
 
 // --- activity clock (CONNECTION_POLICY R4) -----------------------------------
 // "Idle" is: no inbound command from the owner on the owning transport, AND no
-// refresh in progress. Loop-task-only single-writer, so plain globals -- the same
-// argument that lets g_commandOrigin be a bare global.
+// refresh in progress.
+//
+// NOT loop-task-only, despite what the policy's phrasing suggests: the command and
+// refresh stamps are, but ADMISSION stamps the baseline too, and that runs in the
+// BLE connect callback on the stack host task. So the state is atomic, and the
+// baseline carries the owner word it belongs to -- otherwise a reader can pair a
+// newly published owner with the previous owner's baseline and judge a client that
+// just connected to have been silent for minutes.
 //
 // The baseline is the LATER of admission, last recognised owner command, and last
 // refresh end. Admission is included so a freshly admitted, still-silent client
@@ -109,7 +115,12 @@ static inline bool linkIsOwnerWord(uint32_t w) { return w != 0 && w == linkOwner
 // accrue the whole refresh and drop an actively engaged client the instant loop()
 // resumes.
 uint32_t linkMsSinceOwnerCommand(void);   // 0 when unowned
-void     linkStampOwnerCommand(void);     // dispatcher, on a recognised owner command
+// Restart the idle window for the current owner. Named for its main caller -- the
+// dispatcher, on a recognised command from the owner -- but it is also what starts
+// the window at a point the policy defines as a fresh baseline rather than as
+// activity: LAN calls it at TLS handshake COMPLETION, because handshake traffic is
+// not a command and the window must not run from TCP accept.
+void     linkStampOwnerCommand(void);
 void     linkStampRefreshEnd(void);       // endRefresh(), both bracket sites
 
 #endif  // LINK_OWNER_H

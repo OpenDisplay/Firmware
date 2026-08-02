@@ -562,29 +562,43 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
 
     uint16_t command = (data[0] << 8) | data[1];
 
-    // The R4 activity stamp. Two tests, and both matter:
+    // The R4 activity stamp. THREE tests, and each closes a way of holding the
+    // exclusive slot without doing any real work:
     //
     //  - RECOGNISED: commandName() != nullptr. Unknown opcodes fall to the switch
     //    default's "Unknown command" error, so they are not activity. Reusing the
-    //    existing recognition predicate avoids a second, drift-prone one. This is
-    //    what an earlier draft got wrong by stamping at RX intake instead:
-    //    bleRxQueuePush accepts ANY non-empty payload within the size cap, so a
-    //    two-byte malformed frame counted as activity and a garbage flooder could
-    //    hold the slot indefinitely -- precisely the failure the idle drop exists
-    //    to prevent.
+    //    existing recognition predicate avoids a second, drift-prone one. An
+    //    earlier draft stamped at RX intake instead, where bleRxQueuePush accepts
+    //    ANY non-empty payload within the size cap -- so a two-byte malformed frame
+    //    counted as activity and a garbage flooder held the slot indefinitely.
     //
-    //  - FROM THE OWNER: g_commandInstance (set by the caller from the frame's tag,
-    //    or from the LAN owner's identity) still equals the live owner word. NOT a
-    //    transport comparison: transport alone cannot tell a delayed frame from a
-    //    dead BLE instance apart from the new BLE owner, and such a frame would
-    //    stamp the new owner's clock.
+    //  - FROM THE OWNER: the frame's instance identity (g_commandInstance, set by
+    //    the transport from the queued frame's tag or the LAN owner's identity)
+    //    still equals the live owner word. NOT a transport comparison: transport
+    //    alone cannot tell a delayed frame from a dead BLE instance apart from the
+    //    new BLE owner, and such a frame would stamp the new owner's clock.
     //
-    // Deliberately BEFORE the auth gate: CMD_AUTHENTICATE must count as activity or
-    // a client could not complete a handshake without racing the clock. A peer that
-    // floods recognised-but-never-authenticating commands is Phase 4's job (the
-    // auth-abuse counter), not this clock's -- the counter can tell "wrong
-    // credentials" from "silent", which the clock cannot.
-    if (commandName(command) != nullptr && linkIsOwnerWord(g_commandInstance)) {
+    //  - ACCEPTED, not merely parsed: while encryption is on, only an
+    //    AUTHENTICATED command counts. This is the correction that matters most in
+    //    practice. Stamping every recognised opcode let an UNAUTHENTICATED session
+    //    hold the slot forever, and not only under deliberate abuse -- the two
+    //    realistic triggers are entirely benign: a monitoring integration that
+    //    polls CMD_FIRMWARE_VERSION (dispatched before the auth gate entirely), and
+    //    a misconfigured client retrying CMD_AUTHENTICATE with stale credentials.
+    //    Either refreshes the clock forever, so the idle timeout never fires, while
+    //    every legitimate client is refused the slot.
+    //
+    //    A handshake still cannot race the clock, which is what the old rule was
+    //    protecting: the window runs from ADMISSION, so a client has the full idle
+    //    timeout -- 120 s on BLE, against a handshake of one exchange -- to
+    //    authenticate. It simply does not get to extend that window by retrying.
+    //    With encryption disabled there is no gate to pass, so every recognised
+    //    owner command counts.
+    const bool commandAccepted = !isEncryptionEnabled() ||
+                                 g_commandOrigin == ORIGIN_LAN_TLS ||   // TLS is the auth
+                                 isAuthenticated();
+    if (commandAccepted && commandName(command) != nullptr &&
+        linkIsOwnerWord(g_commandInstance)) {
         linkStampOwnerCommand();
     }
 

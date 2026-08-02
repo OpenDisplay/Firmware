@@ -131,13 +131,13 @@ static void armLinkDiag(uint16_t conn_handle) {
     s_linkDiagTimer.reset();   // start/restart the one-shot; fires ~2.5 s later
 }
 
-// --- stack callbacks (SoftDevice callback task -- flag-only) -----------------
-// The threading contract, as of Phase 3 and matching ESP32: a stack callback may
-// do exactly two things, copy bytes into the RX ring and set a flag. Everything
-// else -- command dispatch, zlib inflate, EPD SPI streaming, notify(), the
-// connect/disconnect application work, even the PHY/DLE request -- runs on the
-// loop() task. Anything added below that is not a push or a flag store
-// reintroduces the cross-task races this phase exists to remove.
+// --- stack callbacks (SoftDevice callback task) ------------------------------
+// The threading contract, matching ESP32: a stack callback may copy bytes into the
+// RX ring, publish its own instance metadata, attempt the single ownership claim
+// CAS, and set an event flag. Everything else -- command dispatch, zlib inflate,
+// EPD SPI streaming, notify(), the connect/disconnect application work, even the
+// PHY/DLE request -- runs on the loop() task. Anything added below beyond that set
+// reintroduces the cross-task races this design exists to remove.
 static void onConnectCb(uint16_t conn_handle) {
     s_connHandle = conn_handle;
     // Same normative order as ESP32 (R2): epoch, then table entry, then claim.
@@ -154,17 +154,18 @@ static void onConnectCb(uint16_t conn_handle) {
     od_log_info("=== BLE CLIENT CONNECTED (nRF) h=%u e=%u %s ===",
                 (unsigned)conn_handle, (unsigned)epoch,
                 admitted ? "[owner]" : "[contender - refused service]");
-    s_connectedWord = word;
-    s_connectedEvent = true;
+    // Payload before flag, flag RELEASE-stored: see the ESP32 twin.
+    __atomic_store_n(&s_connectedWord, word, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_connectedEvent, true, __ATOMIC_RELEASE);
 }
 
 static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
     (void)conn_handle;
     od_log_info("=== BLE CLIENT DISCONNECTED (nRF) reason=0x%03X ===", (unsigned)reason);
     s_connHandle = BLE_CONN_HANDLE_INVALID;
-    s_disconnectReason = reason;
+    __atomic_store_n(&s_disconnectReason, (uint16_t)reason, __ATOMIC_RELAXED);
     const uint32_t word = __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE);
-    s_disconnectedWord = word;
+    __atomic_store_n(&s_disconnectedWord, word, __ATOMIC_RELAXED);
     // Retire the entry: this is what makes link death observable per handle, for
     // the R3a wait and for the loop's owner comparison. No RX-boundary capture --
     // frames carry their writer's identity instead (CommandQueueItem::tag).
@@ -185,7 +186,7 @@ static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
     // claims cleanly. Without refusal the client would sit on nRF's only
     // peripheral link forever with every write filtered, since admission is decided
     // once per instance and never revisited.
-    s_disconnectedEvent = true;
+    __atomic_store_n(&s_disconnectedEvent, true, __ATOMIC_RELEASE);
 }
 
 // Adapter: Bluefruit's write_callback_t is BLECharacteristic*-shaped, whereas the
@@ -430,21 +431,36 @@ void BleTransport::tick() {
 }
 
 bool BleTransport::eventPending() const {
-    return s_connectedEvent || s_disconnectedEvent;
+    // RELAXED: a non-destructive peek used to decide whether to return to loop(),
+    // never to establish ordering. Reading one pass stale is harmless -- the next
+    // pass sees it.
+    return __atomic_load_n(&s_connectedEvent, __ATOMIC_RELAXED) ||
+           __atomic_load_n(&s_disconnectedEvent, __ATOMIC_RELAXED);
 }
 
 bool BleTransport::takeConnectedEvent(uint32_t* instanceWord) {
-    if (!s_connectedEvent) return false;
-    s_connectedEvent = false;
-    if (instanceWord != nullptr) *instanceWord = s_connectedWord;
+    // Atomic exchange, not check-then-clear. The old form could lose an event that
+    // arrived inside the gap, and -- now that the flag carries an identity payload
+    // -- could also pair one event's flag with another's word. ACQUIRE pairs with
+    // the callback's RELEASE store of the flag, which it makes after writing the
+    // payload, so a true return guarantees the payload below is the one that flag
+    // was raised for.
+    if (!__atomic_exchange_n(&s_connectedEvent, false, __ATOMIC_ACQUIRE)) return false;
+    if (instanceWord != nullptr) {
+        *instanceWord = __atomic_load_n(&s_connectedWord, __ATOMIC_RELAXED);
+    }
     return true;
 }
 
 bool BleTransport::takeDisconnectedEvent(uint16_t* reason, uint32_t* instanceWord) {
-    if (!s_disconnectedEvent) return false;
-    s_disconnectedEvent = false;
-    if (reason != nullptr) *reason = s_disconnectReason;
-    if (instanceWord != nullptr) *instanceWord = s_disconnectedWord;
+    // See takeConnectedEvent(): atomic exchange so the flag and its payload cannot
+    // be torn apart, and so an event landing in the old check-then-clear window is
+    // not silently dropped.
+    if (!__atomic_exchange_n(&s_disconnectedEvent, false, __ATOMIC_ACQUIRE)) return false;
+    if (reason != nullptr) *reason = __atomic_load_n(&s_disconnectReason, __ATOMIC_RELAXED);
+    if (instanceWord != nullptr) {
+        *instanceWord = __atomic_load_n(&s_disconnectedWord, __ATOMIC_RELAXED);
+    }
     return true;
 }
 

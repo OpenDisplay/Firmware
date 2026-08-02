@@ -11,12 +11,18 @@
 // base: virtual dispatch would cost a vtable and indirect calls for zero
 // benefit, and application code would still only ever see one type.
 //
-// Threading, as of Phase 1: the callback contract is NOT yet symmetric. ESP32
-// stack callbacks are flag-only (they copy into the RX ring and set a flag);
-// nRF still dispatches commands inline on the SoftDevice callback task and runs
-// the app connect/disconnect hooks there. Phase 3 makes nRF match ESP32. Until
-// then the asymmetry lives entirely inside the two implementation files -- see
-// docs/PLAN_BLE_TRANSPORT_ABSTRACTION_2026-07-27.md.
+// Threading: the callback contract is now SYMMETRIC. On both targets a stack
+// callback may copy bytes into the RX ring, publish its own connection-instance
+// metadata, attempt the one ownership claim CAS, and set an event flag -- nothing
+// else. Command dispatch, decrypt, EPD streaming, notify() and the connect/
+// disconnect application work all run on the loop() task. (An earlier revision of
+// this note said nRF still dispatched inline and that a later phase would fix it;
+// that landed with the loop/BLE unification.)
+//
+// The claim CAS is the one addition to the historical "copy and flag" rule, and it
+// is deliberate: ownership must be decided at the earliest transport hook, because
+// the write filter below has to be able to answer "is this the owner?" long before
+// any loop pass runs -- during a refresh, up to ~16 s before one.
 class BleTransport {
 public:
     // --- lifecycle ---

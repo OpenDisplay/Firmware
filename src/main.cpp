@@ -290,10 +290,26 @@ uint32_t getDeepSleepCount() {
 // when nRF's stack callbacks stopped running application code -- before that the
 // disconnect path executed on the SoftDevice callback task.
 static bool s_disconnectCleanupPending = false;
+// The owner word as it stood when the cleanup was requested. The flag alone is not
+// enough: it is a bare boolean shared by the BLE and LAN teardown paths, so by the
+// time it is serviced -- deferred past a refresh, possibly several passes later --
+// the session it was raised for may already have been torn down by some OTHER path
+// (the idle timeout or the transfer watchdog, both of which abort and release).
+// Servicing it then would run a destructive teardown against whoever holds the slot
+// NOW, resetting a freshly admitted client's crypto and rings and stalling it.
+//
+// Recording the identity turns "something disconnected" into "THIS session
+// disconnected", which is the only form the abort can act on safely.
+static uint32_t s_cleanupForOwner = 0;
 static bool s_advertisingRestartPending = false;
 static bool s_msdUpdatePending = false;
 
 void requestTransferSessionCleanup(void) {
+    // Capture the owner here rather than at service time: this is the moment the
+    // departing session is still identifiable. Callers on the LAN path still hold
+    // the token at this point (release is the abort's final step), and the BLE
+    // raise site does the same.
+    s_cleanupForOwner = linkOwnerWord();
     s_disconnectCleanupPending = true;
 }
 
@@ -389,7 +405,30 @@ static void pollActivity() {
 // clears it. Also raised by the LAN transport, so it is not a BLE-only path.
 static void serviceBleDisconnectCleanup() {
     if (!s_disconnectCleanupPending || epdRefreshInProgress) return;
+    const uint32_t forOwner = s_cleanupForOwner;
     s_disconnectCleanupPending = false;
+    s_cleanupForOwner = 0;
+    // Act only if the slot still holds exactly what it held when this was raised.
+    // Any difference means that session has already been torn down and released by
+    // another path -- the idle timeout and the transfer watchdog both abort and
+    // release -- so there is nothing left for this to do, and proceeding would
+    // apply the teardown to whoever holds the slot now.
+    if (forOwner == 0) {
+        // Raised while nothing owned the slot -- restartWiFiLanAfterReconnect()
+        // calls disconnectWiFiServer() unconditionally, so this is routine. Zero is
+        // not a session identity and must not authorise a destructive teardown: a
+        // BLE claim landing between the test below and the abort would have its
+        // fresh crypto and rings reset, and the abort's release (passed NONE) would
+        // not even free the slot afterwards. There is by definition no session to
+        // tear down here; genuinely orphaned transfer state is healed by the
+        // orphaned-pipe repair in checkTransferTimeouts().
+        od_log_debug("Disconnect cleanup skipped: raised with no owner");
+        return;
+    }
+    if (linkOwnerWord() != forOwner) {
+        od_log_debug("Disconnect cleanup skipped: slot changed hands since it was raised");
+        return;
+    }
     // BLE and LAN both raise this flag, so tear down only when the transport that
     // OWNS THE SLOT is the one that went away. Otherwise a BLE disconnect kills a
     // live LAN push (and a LAN disconnect kills a BLE push) purely because the
@@ -540,7 +579,7 @@ static void serviceBleEvents() {
             (tokenOwner.who == OWNER_BLE &&
              !ble.instanceLive(tokenOwner.handle, tokenOwner.epoch));
         if (ownerDeparted) {
-            s_disconnectCleanupPending = true;
+            requestTransferSessionCleanup();   // records the identity it is for
         } else {
             od_log_debug("Disconnect event from a non-owner instance; no cleanup scheduled");
         }
@@ -879,6 +918,18 @@ void loop() {
     // arbitration point is the earliest transport hook -- the connect callback's
     // claim CAS -- because a BLE connect during a refresh and a LAN socket sitting
     // in the listen backlog are not comparable by the time loop() resumes.
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Reap a LAN socket the peer has closed BEFORE the cleanup below, so the token
+    // is released in THIS pass and handleWiFiServer()'s accept -- later in the same
+    // pass -- sees a free slot (7d step 1 before step 2).
+    //
+    // Doing this inside handleWiFiServer, where it was first placed, is too late:
+    // the reap only raises the deferred cleanup, so the accept a few lines further
+    // on still tested the corpse's token and refused an ordinary reconnect. A
+    // client that closes and immediately reopens between two pushes is the common
+    // case, and one that does not retry would simply not be served.
+    wifiLanReapClosedSession();
+#endif
     serviceBleDisconnectCleanup();
     serviceContenderRefusal();
     serviceBleRx();

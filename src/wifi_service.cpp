@@ -892,6 +892,18 @@ static int lanReadIntoBuffer(void) {
     return (bytesRead > 0) ? bytesRead : 0;
 }
 
+void wifiLanReapClosedSession(void) {
+    // Notice a peer-closed socket EARLY in the pass, so the deferred cleanup that
+    // this raises releases the token before handleWiFiServer()'s accept runs later
+    // in the same pass. See the call site in loop() for why "early" is the whole
+    // point: raising it from inside handleWiFiServer left the accept testing a
+    // corpse's token and refusing an ordinary reconnect.
+    if (wifiServerConnected && !wifiClient.connected()) {
+        lanLog("LAN: peer closed the socket, reaping the session");
+        disconnectWiFiServer();
+    }
+}
+
 // Decide a freshly accepted socket's fate: admit it as the owner, or refuse it.
 //
 // Split out of handleWiFiServer() so the caller can CONTINUE servicing an existing

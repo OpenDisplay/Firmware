@@ -5,9 +5,14 @@
 // environments. Every NimBLE object lives here as file-static state; nothing
 // outside this file names a NimBLE type.
 //
-// Threading contract (already holds here, and is what Phase 3 brings to nRF):
-// NimBLE host-task callbacks do exactly two things -- copy bytes into the RX
-// ring, and set a flag. Everything else runs on the loop() task.
+// Threading contract, identical on both targets: a NimBLE host-task callback may
+// copy bytes into the RX ring, publish its own instance-table entry, attempt the
+// single ownership claim CAS, and set an event flag. Everything else -- dispatch,
+// decrypt, EPD streaming, notify(), the connect/disconnect application work --
+// runs on the loop() task.
+//
+// The claim is the one thing beyond "copy and flag", and it belongs here because
+// the write filter must be able to test ownership before any loop pass runs.
 #ifdef TARGET_ESP32
 
 #include <Arduino.h>
@@ -196,13 +201,17 @@ class OdServerCallbacks : public BLEServerCallbacks {
         od_log_info("=== BLE CLIENT CONNECTED (ESP32) h=%u e=%u %s ===",
                     (unsigned)handle, (unsigned)epoch,
                     admitted ? "[owner]" : "[contender - refused service]");
-        s_connectedWord = word;
+        // Payload before flag, flag RELEASE-stored, so a consumer that sees the flag
+        // is guaranteed to see this word. A plain store here against the consumer's
+        // atomic exchange would be a data race with nothing for its acquire to pair
+        // against.
+        __atomic_store_n(&s_connectedWord, word, __ATOMIC_RELAXED);
         // Flag-only beyond the claim. The app work a connect implies (rebootFlag
         // reset, updatemsdata() -- which polls I2C and mutates the shared
         // advertisement vector that loop() also drives on a 60 s cadence) would
         // corrupt the heap if run here on the NimBLE host task. loop() consumes the
         // event instead. The claim is exempt because it is one CAS on one word.
-        s_connectedEvent = true;
+        __atomic_store_n(&s_connectedEvent, true, __ATOMIC_RELEASE);
     }
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         (void)pServer;
@@ -212,8 +221,8 @@ class OdServerCallbacks : public BLEServerCallbacks {
         od_log_info("=== BLE CLIENT DISCONNECTED (ESP32) h=%u reason=0x%03X ===",
                     (unsigned)handle, (unsigned)reason);
         // Full width: NimBLE's reason spans two ranges and truncation aliases them.
-        s_disconnectReason = (uint16_t)reason;
-        s_disconnectedWord = word;
+        __atomic_store_n(&s_disconnectReason, (uint16_t)reason, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_disconnectedWord, word, __ATOMIC_RELAXED);
         // Retiring the entry is what makes the link's death observable per handle --
         // the predicate bleDropAndWait() polls, and the comparison that lets the loop
         // notice a departed owner even when every event edge was lost.
@@ -232,7 +241,7 @@ class OdServerCallbacks : public BLEServerCallbacks {
         // state-mutating work that races loop()'s SPI streaming and pipe-frame
         // processing. loop() consumes the event and applies its own deferral
         // policy (see serviceBleDisconnectCleanup in main.cpp).
-        s_disconnectedEvent = true;
+        __atomic_store_n(&s_disconnectedEvent, true, __ATOMIC_RELEASE);
     }
     // Negotiation completes asynchronously, after requestFastLink() returns, so
     // these are the only points where the granted values are knowable. Both are
@@ -583,21 +592,36 @@ void BleTransport::tick() {
 }
 
 bool BleTransport::eventPending() const {
-    return s_connectedEvent || s_disconnectedEvent;
+    // RELAXED: a non-destructive peek used to decide whether to return to loop(),
+    // never to establish ordering. Reading one pass stale is harmless -- the next
+    // pass sees it.
+    return __atomic_load_n(&s_connectedEvent, __ATOMIC_RELAXED) ||
+           __atomic_load_n(&s_disconnectedEvent, __ATOMIC_RELAXED);
 }
 
 bool BleTransport::takeConnectedEvent(uint32_t* instanceWord) {
-    if (!s_connectedEvent) return false;
-    s_connectedEvent = false;
-    if (instanceWord != nullptr) *instanceWord = s_connectedWord;
+    // Atomic exchange, not check-then-clear. The old form could lose an event that
+    // arrived inside the gap, and -- now that the flag carries an identity payload
+    // -- could also pair one event's flag with another's word. ACQUIRE pairs with
+    // the callback's RELEASE store of the flag, which it makes after writing the
+    // payload, so a true return guarantees the payload below is the one that flag
+    // was raised for.
+    if (!__atomic_exchange_n(&s_connectedEvent, false, __ATOMIC_ACQUIRE)) return false;
+    if (instanceWord != nullptr) {
+        *instanceWord = __atomic_load_n(&s_connectedWord, __ATOMIC_RELAXED);
+    }
     return true;
 }
 
 bool BleTransport::takeDisconnectedEvent(uint16_t* reason, uint32_t* instanceWord) {
-    if (!s_disconnectedEvent) return false;
-    s_disconnectedEvent = false;
-    if (reason != nullptr) *reason = s_disconnectReason;
-    if (instanceWord != nullptr) *instanceWord = s_disconnectedWord;
+    // See takeConnectedEvent(): atomic exchange so the flag and its payload cannot
+    // be torn apart, and so an event landing in the old check-then-clear window is
+    // not silently dropped.
+    if (!__atomic_exchange_n(&s_disconnectedEvent, false, __ATOMIC_ACQUIRE)) return false;
+    if (reason != nullptr) *reason = __atomic_load_n(&s_disconnectReason, __ATOMIC_RELAXED);
+    if (instanceWord != nullptr) {
+        *instanceWord = __atomic_load_n(&s_disconnectedWord, __ATOMIC_RELAXED);
+    }
     return true;
 }
 
