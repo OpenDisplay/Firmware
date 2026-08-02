@@ -1,4 +1,5 @@
 #include "boot_screen.h"
+#include "watchdog.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
@@ -510,6 +511,7 @@ static bool bootLayoutFit(uint16_t w, uint16_t h, uint16_t h_full, int blockH, i
 // and stream it. planeRow scratch lives just past the 2bpp row in staticRowBuffer
 // (200B + 100B for an 800px panel, well within the 680B buffer).
 static void writeGray4PlaneRow(const uint8_t* row2bpp, int pitch2bpp, int planePitch, uint16_t w, int bitSel) {
+    odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
     uint8_t* planeRow = staticRowBuffer + pitch2bpp;
     memset(planeRow, 0x00, planePitch);
     for (uint16_t x = 0; x < w; x++) {
@@ -1031,6 +1033,7 @@ bool writeBootScreenWithQr() {
             } else if (e1004Stream) {
                 e1004_write_stream_bytes(row + (size_t)halfPass * e1004HalfPitch, e1004HalfPitch);
             } else {
+                odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
                 bbepWriteData(&bbep, row, pitch);
             }
 #else
@@ -1039,6 +1042,7 @@ bool writeBootScreenWithQr() {
             } else if (e1004Stream) {
                 e1004_write_stream_bytes(row + (size_t)halfPass * e1004HalfPitch, e1004HalfPitch);
             } else {
+                odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
                 bbepWriteData(&bbep, row, pitch);
             }
 #endif
@@ -1058,6 +1062,7 @@ bool writeBootScreenWithQr() {
             memset(row, 0x00, pitch);
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
             bbepStartWrite(&bbep, PLANE_1);
+            odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
             for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, pitch);
         }
     }

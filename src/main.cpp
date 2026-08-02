@@ -12,6 +12,7 @@
 #include "link_owner.h"
 #include "session_guard.h"
 #include "od_log.h"
+#include "watchdog.h"
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
 #include <HardwareSerial.h>
@@ -25,24 +26,10 @@ static HardwareSerial LogSerialPort(1);
 #endif
 
 #ifdef TARGET_ESP32
-// Distinguishes a hidden mid-cycle reset (PANIC/WDT/BROWNOUT/SW) from a real
-// power-on or deep-sleep wake; any reset here clears the wake cause, so the
-// next boot takes the NORMAL BOOT branch and redraws the boot screen.
-static const char* resetReasonName(esp_reset_reason_t reason) {
-    switch (reason) {
-        case ESP_RST_POWERON:   return "POWERON";
-        case ESP_RST_EXT:       return "EXT";
-        case ESP_RST_SW:        return "SW";
-        case ESP_RST_PANIC:     return "PANIC";
-        case ESP_RST_INT_WDT:   return "INT_WDT";
-        case ESP_RST_TASK_WDT:  return "TASK_WDT";
-        case ESP_RST_WDT:       return "WDT";
-        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
-        case ESP_RST_BROWNOUT:  return "BROWNOUT";
-        case ESP_RST_SDIO:      return "SDIO";
-        default:                return "UNKNOWN";
-    }
-}
+// resetReasonName() used to live here. It moved to watchdog_esp32.cpp so both
+// targets reach their reset-reason decode through one portable call
+// (odWatchdogBootInit), rather than ESP32 having an inline #ifdef block and nRF
+// having nothing at all. See src/watchdog.h.
 
 // Defined with the sleep helpers below loop()'s activity poller; setup() logs
 // the window length when arming the button-wake hold.
@@ -128,10 +115,12 @@ void setup() {
     // Set only by the ESP32 wake-cause check below; NRF has no deep-sleep wake path.
     bool is_deep_sleep_wake = false;
     bool woke_by_button = false;
+    // Decode why we booted, on BOTH targets. On nRF this also reads the retained
+    // breadcrumb, so a watchdog reset can name the panel phase that wedged. Must
+    // run after od_log_init() (above) or the line is emitted into a dark port, and
+    // before odWatchdogArm().
+    odWatchdogBootInit();
     #ifdef TARGET_ESP32
-    esp_reset_reason_t reset_reason = esp_reset_reason();
-    const char* resetReasonStr = resetReasonName(reset_reason);
-    od_log_info("Reset reason: %s (%d)", resetReasonStr, (int)reset_reason);
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
     if (is_deep_sleep_wake) {
@@ -198,7 +187,23 @@ void setup() {
 #endif
     }
 #endif
-    if (!is_deep_sleep_wake) {
+    // Arm the hardware watchdog immediately BEFORE the boot panel path, so a wedge
+    // inside initDisplay() is itself covered -- that is what makes the strike
+    // counter meaningful (W-3). Nothing earlier may block longer than the timeout;
+    // the bootdiag `while (!Serial)` gate sits far above this point and stays
+    // deliberately outside coverage.
+    //
+    // Inert until step 2 of the plan arms it; it logs the target's watchdog status
+    // either way, which is the only place the ESP32 TWDT gap is reported.
+    odWatchdogArm();
+    if (odWatchdogInSafeMode()) {
+        // Three consecutive watchdog resets: the panel path is what keeps wedging,
+        // so skip it entirely this boot. BLE still comes up below, which is the
+        // whole point -- a device in safe mode stays reachable for a config change
+        // or a DFU instead of being bricked until someone pulls the battery.
+        od_log_warn("[WDT] safe mode - skipping initDisplay()");
+        rebootFlag = 1;
+    } else if (!is_deep_sleep_wake) {
         // Arm here rather than at declaration: this branch is the boot screen
         // redraw, and every real reset (power-on, panic, WDT, SW) clears the
         // wake cause and lands here. A deep-sleep wake skips it and keeps the
@@ -891,6 +896,10 @@ static void platformIdle() {
 // One loop body for both targets. The per-target policy that genuinely differs
 // lives in the two hooks above; everything here is shared.
 void loop() {
+    // The primary liveness proof: reaching the top of loop() is what "the program
+    // is still making progress" means. Every other feed site exists only to keep a
+    // LEGITIMATE long wait from looking like a wedge.
+    odWatchdogFeed();
     serviceBleEvents();
     processLedFlash();
     epdSessionTick();   // millis()-poll: power the panel down screen_timeout_seconds after last release
@@ -1029,6 +1038,10 @@ void idleDelay(uint32_t delayMs) {
     const uint32_t CHECK_INTERVAL_MS = 100;
     uint32_t remainingDelay = delayMs;
     while (remainingDelay > 0) {
+        // A long idle wait is healthy, not a wedge. Fed every chunk (<=100 ms),
+        // which is also what makes WDT CONFIG.SLEEP=1 safe: the CPU sleeps inside
+        // delay() below, and the watchdog keeps counting through it.
+        odWatchdogFeed();
         ble.tick();   // no-op on ESP32
         processButtonEvents();
         processTouchInput();
@@ -1216,6 +1229,12 @@ static void configureDisplayPinsLowPower() {
 }
 
 void pwrmgm(bool onoff){
+    // Never bring the panel rail up in watchdog safe mode. Powering down is still
+    // allowed, so a rail left on by a pre-safe-mode boot can still be shut off.
+    if(onoff && odWatchdogInSafeMode()){
+        od_log_warn("Panel power-up refused - watchdog safe mode");
+        return;
+    }
     if(globalConfig.display_count == 0){
         od_log_warn("No display configured");
         return;
