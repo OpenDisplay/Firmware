@@ -15,6 +15,7 @@
 #include "link_owner.h"
 #include "session_guard.h"
 #include "touch_input.h"
+#include "watchdog.h"
 #include "uzlib.h"
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
 #include "display_fastepd.h"
@@ -203,6 +204,11 @@ static void prepareEpdRailForBoot() {
 static void e1004InitPanel(void) {
     const DisplayConfig& d = globalConfig.displays[0];
     bbepSetCS2(&bbep, e1004_cs2_pin());
+    odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this block if it's no longer needed.
+    od_log_debug("[EPD session][WDT] e1004InitPanel: INIT_SEQ (dual-controller)");
+    odWatchdogFeed();   // bbepInitIO sends pInitFull internally (~240 s worst case)
     bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
 }
 
@@ -361,8 +367,15 @@ static void initBbepPanelSession() {
         return;
     }
 #endif
+    odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this block if it's no longer needed.
+    od_log_debug("[EPD session][WDT] initBbepPanelSession: INIT_SEQ");
+    odWatchdogFeed();   // bbepInitIO sends pInitFull internally (~240 s worst case)
     bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
+    odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
     bbepWakeUp(&bbep);
+    odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
     bbepSendCMDSequence(&bbep, bbep.pInitFull);
     epdAlignCustomPartialRamMode();
     delay(200);
@@ -439,6 +452,10 @@ static void pwrmgmLockGive(void) {
 // power off without re-taking the non-recursive lock.
 static void epdSessionForceOffLocked(void) {
     if (pwrmgmState == PWR_OFF) return;   // idempotent
+    odWatchdogBreadcrumb(OD_WDT_PHASE_FORCE_OFF);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] FORCE_OFF: pwrmgmState=%u -> tearing down", (unsigned)pwrmgmState);
     od_log_info("[EPD session] force off");
     if (epdSessionUsesFastepd()) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
@@ -448,19 +465,47 @@ static void epdSessionForceOffLocked(void) {
         fastepd_mark_hw_deinitialized();
 #endif
     } else {
+        odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
         bbepSleep(&bbep, 1);
         delay(50);
     }
     pwrmgm(false);   // -> PWR_OFF, clears deadline
     epdPlanesPrepared = false;
+    // Panel work is finished. Without this, a later wedge in BLE/WiFi/command
+    // handling would boot reporting breadcrumb=FORCE_OFF and point the next
+    // investigation at the panel teardown that had actually already completed.
+    // IDLE_OFF (not plain IDLE) so a freeze here is distinguishable at the next
+    // boot from a freeze during PWR_WARM keep-alive (see epdSessionRelease).
+    odWatchdogBreadcrumb(OD_WDT_PHASE_IDLE_OFF);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] IDLE_OFF: pwrmgmState=%u", (unsigned)pwrmgmState);
 }
 
 // Bring the panel up for a transfer/refresh. Returns true iff it was COLD (rail
 // was off) — callers may need to (re)open the address window regardless.
 static bool epdSessionAcquire(bool partialInit) {
+    // Safe mode: three consecutive watchdog resets say the panel path is what
+    // keeps wedging, so refuse to drive it at all. Skipping initDisplay() at boot
+    // is NOT sufficient on its own -- a client can connect and push an image, and
+    // that reaches here directly.
+    //
+    // Refusing leaves the session in PWR_OFF, so the transfer fails through the
+    // existing refresh-failure path rather than through new error handling. It is
+    // reported late and generically; a clean immediate NACK needs a "device in
+    // safe mode" code, which must originate in ../opendisplay-protocol and is out
+    // of scope for this branch.
+    if (odWatchdogInSafeMode()) {
+        od_log_warn("[EPD session] acquire REFUSED - watchdog safe mode");
+        return false;
+    }
     pwrmgmLockTake();
     bool cold;
     if (pwrmgmState == PWR_OFF) {
+        odWatchdogBreadcrumb(OD_WDT_PHASE_ACQUIRE_COLD);
+        // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+        // hardware watchdog work -- safe to delete this line if it's no longer needed.
+        od_log_debug("[EPD session][WDT] ACQUIRE_COLD: partialInit=%d", (int)partialInit);
         od_log_info("[EPD session] acquire: COLD bring-up");
         pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
         if (!epdSessionUsesFastepd()) {
@@ -472,10 +517,17 @@ static bool epdSessionAcquire(bool partialInit) {
             } else
 #endif
             {
+                odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+                // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+                // hardware watchdog work -- safe to delete this line if it's no longer needed.
+                od_log_debug("[EPD session][WDT] INIT_SEQ (cold): bbepInitIO+bbepWakeUp+CMDSequence");
+                odWatchdogFeed();   // bbepInitIO sends pInitFull internally (~240 s worst case)
                 bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
+                odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
                 bbepWakeUp(&bbep);
                 const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
                                                      : bbep.pInitFull;
+                odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
                 bbepSendCMDSequence(&bbep, initSeq);
                 epdAlignCustomPartialRamMode();
                 epdSessionInitWasPartial = partialInit;
@@ -484,6 +536,11 @@ static bool epdSessionAcquire(bool partialInit) {
         cold = true;
     } else {
         // WARM re-acquire (or, defensively, an already-ACTIVE re-entry).
+        odWatchdogBreadcrumb(OD_WDT_PHASE_ACQUIRE_WARM);
+        // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+        // hardware watchdog work -- safe to delete this line if it's no longer needed.
+        od_log_debug("[EPD session][WDT] ACQUIRE_WARM: pwrmgmState=%u partialInit=%d",
+                     (unsigned)pwrmgmState, (int)partialInit);
         od_log_info(pwrmgmState == PWR_ACTIVE ? "[EPD session] acquire: already ACTIVE (defensive)"
                                               : "[EPD session] acquire: WARM re-acquire");
         pwrmgmState = PWR_ACTIVE;
@@ -497,9 +554,15 @@ static bool epdSessionAcquire(bool partialInit) {
             } else
 #endif
             {
+                odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+                // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+                // hardware watchdog work -- safe to delete this line if it's no longer needed.
+                od_log_debug("[EPD session][WDT] INIT_SEQ (warm): bbepWakeUp+CMDSequence");
+                odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
                 bbepWakeUp(&bbep);
                 const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
                                                      : bbep.pInitFull;
+                odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
                 bbepSendCMDSequence(&bbep, initSeq);
                 epdAlignCustomPartialRamMode();
                 epdSessionInitWasPartial = partialInit;
@@ -517,16 +580,28 @@ static bool epdSessionAcquire(bool partialInit) {
 static void epdSessionRelease(bool refreshSuccess) {
     pwrmgmLockTake();
     if (pwrmgmState == PWR_OFF) { pwrmgmLockGive(); return; }   // nothing to release
+    odWatchdogBreadcrumb(OD_WDT_PHASE_RELEASE);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] RELEASE: refreshSuccess=%d", (int)refreshSuccess);
     uint32_t window = epdKeepAliveWindowMs();
     if (window == 0 || !refreshSuccess) {
         od_log_info(refreshSuccess ? "[EPD session] release: keep-alive disabled, powering off"
                                    : "[EPD session] release: refresh failed, powering off");
+        // epdSessionForceOffLocked() stamps OD_WDT_PHASE_IDLE_OFF itself; nothing
+        // to add here or the plain-IDLE stamp below would clobber it.
         epdSessionForceOffLocked();
     } else {
         pwrmgmState = PWR_WARM;
         pwrmgmOffDeadlineMs = millis() + window;
         // Controller stays AWAKE (no bbepSleep; is_awake stays 1); rail/SPI stay up.
         od_log_info("[EPD session] release: panel warm-idle, off in %u ms", (unsigned)window);
+        // See the note in ForceOffLocked -- IDLE_WARM, not plain IDLE, so a freeze
+        // during keep-alive is distinguishable from one during PWR_OFF.
+        odWatchdogBreadcrumb(OD_WDT_PHASE_IDLE_WARM);
+        // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+        // hardware watchdog work -- safe to delete this line if it's no longer needed.
+        od_log_debug("[EPD session][WDT] IDLE_WARM: off in %u ms", (unsigned)window);
     }
     pwrmgmLockGive();
 }
@@ -557,8 +632,13 @@ static bool refreshBootScreenFull() {
         od_log_warn("Boot screen render failed");
         return false;
     }
+    odWatchdogBreadcrumb(OD_WDT_PHASE_BOOT_REFRESH);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] BOOT_REFRESH: entering bbepRefresh(REFRESH_FULL)");
     od_log_info("EPD refresh: FULL (boot)");
     touchSuspendForEpdRefresh();
+    odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
     bbepRefresh(&bbep, REFRESH_FULL);
     return waitforrefresh(60);
 }
@@ -850,11 +930,21 @@ bool waitforrefresh(int timeout){
         od_log_info("Refresh completed inside bb_epaper");
         return true;
     }
+    odWatchdogBreadcrumb(OD_WDT_PHASE_REFRESH_WAIT);
     // Poll at 10 ms (was 100 ms) so a ~0.5 s refresh returns up to ~90 ms sooner.
     // BUSY asserts within µs of MASTER_ACTIVATE, so the i==0 "never went busy"
     // error check stays valid at a 10 ms first poll. Loop bound scales x10
     // (timeout*100 iterations of 10 ms); dot cadence every 50 iters keeps ~0.5 s/dot.
     for (size_t i = 0; i < (size_t)(timeout * 100); i++){
+        // A refresh legitimately runs for a long time here -- the loop bound is
+        // ~126 s, NOT `timeout` seconds, because each iteration costs delay(10)
+        // plus bbepIsBusy()'s own delay(10)+delay(1). Feeding per iteration is
+        // what keeps that healthy wait from being mistaken for a wedge.
+        //
+        // This does NOT create a blind spot for a stuck BUSY line: that case keeps
+        // iterating, exhausts the bound, returns false, and loop() resumes -- a
+        // failed refresh is an error to report, not a hang to reset through.
+        odWatchdogFeed();
         delay(10);
         if(i % 50 == 0) od_log_raw(".");
         if(!bbepIsBusy(&bbep)){
@@ -2045,6 +2135,9 @@ static inline bool directWriteIsGray4(void) {
 // is the running total across both planes, so the compressed and uncompressed paths
 // share this one plane-split implementation.
 static void streamGray4Bytes(const uint8_t* buf, uint32_t len) {
+    // Panel data path. Repeats are filtered inside odWatchdogBreadcrumb(), so a
+    // per-call stamp here costs one comparison.
+    odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
     const uint32_t planeBytes = (((uint32_t)directWriteWidth + 7u) / 8u) * directWriteHeight;
     uint32_t off = 0;
     while (off < len && directWriteBytesWritten < 2u * planeBytes) {
@@ -2065,6 +2158,9 @@ static void streamGray4Bytes(const uint8_t* buf, uint32_t len) {
 }
 
 static void directWriteSinkBytes(uint8_t* data, uint32_t len) {
+    // Panel data path. Repeats are filtered inside odWatchdogBreadcrumb(), so a
+    // per-call stamp here costs one comparison.
+    odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
 #ifdef BBEP_T133A01
     if (e1004_panel_used()) {
         if (e1004GeometryOk) e1004_sink_bytes(data, len);
@@ -2500,6 +2596,7 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
 #ifdef BBEP_T133A01
         if (e1004_panel_used()) e1004_end_plane();
 #endif
+        odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
         bbepRefresh(&bbep, refreshMode);
         refreshSuccess = waitforrefresh(60);
         // No bbepSleep here: cleanupDirectWriteState(false) releases the session,
@@ -3228,6 +3325,8 @@ static void partial_set_addr_window(BBEPDISP *pBBEP, int x, int y, int cx, int c
 }
 
 static bool partial_consume_bytes(uint8_t* data, uint32_t len) {
+    // Per-frame, but repeats are filtered inside odWatchdogBreadcrumb().
+    odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
     if (partialCtx.compressed) {
         if (len > UINT32_MAX - partialCtx.bytes_received) return false;
     } else {
@@ -3355,6 +3454,7 @@ static bool partial_trigger_refresh(int refreshMode) {
         bbepWriteCmd(&bbep, SSD1608_MASTER_ACTIVATE);
         return waitforrefresh(60);
     }
+    odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
     bbepRefresh(&bbep, refreshMode);
     return waitforrefresh(60);
 }
@@ -3383,7 +3483,10 @@ static void partial_prepare_panel_ram(void) {
                      partialCtx.width  == globalConfig.displays[0].pixel_width &&
                      partialCtx.height == globalConfig.displays[0].pixel_height;
     if (!fullFrame) {
+        odWatchdogBreadcrumb(OD_WDT_PHASE_FILL);
+        odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
         bbepFill(&bbep, BBEP_WHITE, PLANE_1);
+        odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
         bbepFill(&bbep, BBEP_WHITE, PLANE_0);
         od_log_debug("[+%ums] after fills (ran: sub-rect)", (unsigned)(millis() - t0));
     } else {

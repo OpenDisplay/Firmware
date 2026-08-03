@@ -12,6 +12,7 @@
 #include "link_owner.h"
 #include "session_guard.h"
 #include "od_log.h"
+#include "watchdog.h"
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
 #include <HardwareSerial.h>
@@ -25,24 +26,10 @@ static HardwareSerial LogSerialPort(1);
 #endif
 
 #ifdef TARGET_ESP32
-// Distinguishes a hidden mid-cycle reset (PANIC/WDT/BROWNOUT/SW) from a real
-// power-on or deep-sleep wake; any reset here clears the wake cause, so the
-// next boot takes the NORMAL BOOT branch and redraws the boot screen.
-static const char* resetReasonName(esp_reset_reason_t reason) {
-    switch (reason) {
-        case ESP_RST_POWERON:   return "POWERON";
-        case ESP_RST_EXT:       return "EXT";
-        case ESP_RST_SW:        return "SW";
-        case ESP_RST_PANIC:     return "PANIC";
-        case ESP_RST_INT_WDT:   return "INT_WDT";
-        case ESP_RST_TASK_WDT:  return "TASK_WDT";
-        case ESP_RST_WDT:       return "WDT";
-        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
-        case ESP_RST_BROWNOUT:  return "BROWNOUT";
-        case ESP_RST_SDIO:      return "SDIO";
-        default:                return "UNKNOWN";
-    }
-}
+// resetReasonName() used to live here. It moved to watchdog_esp32.cpp so both
+// targets reach their reset-reason decode through one portable call
+// (odWatchdogBootInit), rather than ESP32 having an inline #ifdef block and nRF
+// having nothing at all. See src/watchdog.h.
 
 // Defined with the sleep helpers below loop()'s activity poller; setup() logs
 // the window length when arming the button-wake hold.
@@ -103,6 +90,25 @@ void setup() {
     // is documented to flap on a healthy link, so a hook there would silently
     // discard good output.
     od_log_set_ready_hook([]() -> bool { return (bool)Serial; });
+    #if OD_LOG_LEVEL >= OD_LOG_DEBUG
+    // Bounded wait for a host terminal to reconnect after ANY reset. USB
+    // re-enumerates from scratch on reset, and without this, the reset-reason and
+    // breadcrumb lines logged just below (odWatchdogBootInit()) -- the whole point
+    // of the watchdog work -- race the host's reconnect and are silently discarded
+    // by the dark-port check in od_emit(). Those drops are NOT counted (see the
+    // comment there), so they vanish with no trace.
+    //
+    // Debug builds only (OD_LOG_LEVEL >= OD_LOG_DEBUG, e.g. nrf52840custom-debug):
+    // production boots should never pay a boot-time cost for a terminal that isn't
+    // there. Capped at 2 s even here, unlike OPENDISPLAY_BOOT_DIAG's unbounded
+    // `while (!Serial)`, and returns immediately once a host is already connected.
+    {
+        uint32_t serialWaitStart = millis();
+        while (!Serial && (millis() - serialWaitStart) < 2000u) {
+            delay(10);
+        }
+    }
+    #endif
     #endif
     #endif
     // Immediately after od_log_init(), so the boot lines below are not emitted at a
@@ -128,10 +134,12 @@ void setup() {
     // Set only by the ESP32 wake-cause check below; NRF has no deep-sleep wake path.
     bool is_deep_sleep_wake = false;
     bool woke_by_button = false;
+    // Decode why we booted, on BOTH targets. On nRF this also reads the retained
+    // breadcrumb, so a watchdog reset can name the panel phase that wedged. Must
+    // run after od_log_init() (above) or the line is emitted into a dark port, and
+    // before odWatchdogArm().
+    odWatchdogBootInit();
     #ifdef TARGET_ESP32
-    esp_reset_reason_t reset_reason = esp_reset_reason();
-    const char* resetReasonStr = resetReasonName(reset_reason);
-    od_log_info("Reset reason: %s (%d)", resetReasonStr, (int)reset_reason);
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
     if (is_deep_sleep_wake) {
@@ -198,7 +206,23 @@ void setup() {
 #endif
     }
 #endif
-    if (!is_deep_sleep_wake) {
+    // Arm the hardware watchdog immediately BEFORE the boot panel path, so a wedge
+    // inside initDisplay() is itself covered -- that is what makes the strike
+    // counter meaningful (W-3). Nothing earlier may block longer than the timeout;
+    // the bootdiag `while (!Serial)` gate sits far above this point and stays
+    // deliberately outside coverage.
+    //
+    // Inert until step 2 of the plan arms it; it logs the target's watchdog status
+    // either way, which is the only place the ESP32 TWDT gap is reported.
+    odWatchdogArm();
+    if (odWatchdogInSafeMode()) {
+        // Three consecutive watchdog resets: the panel path is what keeps wedging,
+        // so skip it entirely this boot. BLE still comes up below, which is the
+        // whole point -- a device in safe mode stays reachable for a config change
+        // or a DFU instead of being bricked until someone pulls the battery.
+        od_log_warn("[WDT] safe mode - skipping initDisplay()");
+        rebootFlag = 1;
+    } else if (!is_deep_sleep_wake) {
         // Arm here rather than at declaration: this branch is the boot screen
         // redraw, and every real reset (power-on, panic, WDT, SW) clears the
         // wake cause and lands here. A deep-sleep wake skips it and keeps the
@@ -891,6 +915,10 @@ static void platformIdle() {
 // One loop body for both targets. The per-target policy that genuinely differs
 // lives in the two hooks above; everything here is shared.
 void loop() {
+    // The primary liveness proof: reaching the top of loop() is what "the program
+    // is still making progress" means. Every other feed site exists only to keep a
+    // LEGITIMATE long wait from looking like a wedge.
+    odWatchdogFeed();
     serviceBleEvents();
     processLedFlash();
     epdSessionTick();   // millis()-poll: power the panel down screen_timeout_seconds after last release
@@ -1029,6 +1057,10 @@ void idleDelay(uint32_t delayMs) {
     const uint32_t CHECK_INTERVAL_MS = 100;
     uint32_t remainingDelay = delayMs;
     while (remainingDelay > 0) {
+        // A long idle wait is healthy, not a wedge. Fed every chunk (<=100 ms),
+        // which is also what makes WDT CONFIG.SLEEP=1 safe: the CPU sleeps inside
+        // delay() below, and the watchdog keeps counting through it.
+        odWatchdogFeed();
         ble.tick();   // no-op on ESP32
         processButtonEvents();
         processTouchInput();
@@ -1216,6 +1248,12 @@ static void configureDisplayPinsLowPower() {
 }
 
 void pwrmgm(bool onoff){
+    // Never bring the panel rail up in watchdog safe mode. Powering down is still
+    // allowed, so a rail left on by a pre-safe-mode boot can still be shut off.
+    if(onoff && odWatchdogInSafeMode()){
+        od_log_warn("Panel power-up refused - watchdog safe mode");
+        return;
+    }
     if(globalConfig.display_count == 0){
         od_log_warn("No display configured");
         return;
@@ -1241,10 +1279,20 @@ void pwrmgm(bool onoff){
     }
     if(axp2101_found){
         if(onoff){
+            // WDT-DEBUG: pwrmgm() step instrumentation, added alongside the hardware
+            // watchdog work -- safe to delete this block if it's no longer needed.
+            // Breadcrumb stamped BEFORE the debug log: the log call itself reaches
+            // tud_cdc_write_flush() -> usbd_edpt_claim() -> a WAIT_FOREVER mutex
+            // (see conversation, 2026-08-03), so it is not guaranteed to return
+            // either. Stamping first means the phase survives even if the log
+            // line is what hangs.
+            odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_AXP2101);
+            od_log_debug("[pwrmgm][WDT] PWRMGM_AXP2101: entering initAXP2101(bus=%u)", (unsigned)axp2101_bus_id);
         od_log_info("Powering up AXP2101 PMIC...");
             initAXP2101(axp2101_bus_id);
         }
         else{
+            od_log_debug("[pwrmgm][WDT] AXP2101 power-down");
             od_log_info("Powering down AXP2101 PMIC...");
             powerDownAXP2101();
             Wire.end();
@@ -1262,12 +1310,21 @@ void pwrmgm(bool onoff){
 #endif
     const DisplayConfig& disp = globalConfig.displays[0];
     if (onoff) {
+        // WDT-DEBUG: pwrmgm() step instrumentation -- see the note above on
+        // breadcrumb-before-log ordering. Safe to delete this whole block (all
+        // odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_*) + od_log_debug("[pwrmgm][WDT]...")
+        // pairs below) if it's no longer needed.
+        odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_RAIL);
+        od_log_debug("[pwrmgm][WDT] PWRMGM_RAIL: pwr_pin=%u", (unsigned)globalConfig.system_config.pwr_pin);
         if (globalConfig.system_config.pwr_pin != 0xFF) {
             digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
             delay(800);
         } else {
             od_log_warn("Power pin not set");
         }
+        od_log_debug("[pwrmgm][WDT] PWRMGM_RAIL: delay(800) returned");
+        odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_PINS);
+        od_log_debug("[pwrmgm][WDT] PWRMGM_PINS: fastepd_driver_spi=%d", (int)fastepd_driver_spi);
         if (!fastepd_driver_spi) {
             if (disp.reset_pin != 0xFF) {
                 pinMode(disp.reset_pin, OUTPUT);
@@ -1300,17 +1357,27 @@ void pwrmgm(bool onoff){
             }
             delay(200);
         }
+        od_log_debug("[pwrmgm][WDT] PWRMGM_PINS: pin setup + delay done");
+        odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_WIRE);
+        od_log_debug("[pwrmgm][WDT] PWRMGM_WIRE: entering initOrRestoreWireForOpenDisplay()");
         initOrRestoreWireForOpenDisplay();
+        od_log_debug("[pwrmgm][WDT] PWRMGM_WIRE: returned");
     } else {
+        // WDT-DEBUG: pwrmgm() power-down step instrumentation. No spare breadcrumb
+        // phase values remain (all 16 are used), so this path is debug-log-only --
+        // safe to delete if it's no longer needed.
+        od_log_debug("[pwrmgm][WDT] power-down: SPI.end()");
         if (!fastepd_driver_spi) {
             SPI.end();
         }
         // Keep I2C alive when sensors/touch use data_bus[0] (e.g. reTerminal MISC_I2C on GPIO0/1).
         if (!openDisplayI2cBusConfigured()) {
+            od_log_debug("[pwrmgm][WDT] power-down: Wire.end()");
             Wire.end();
             invalidateOpenDisplayWire();
         }
         if (globalConfig.system_config.pwr_pin != 0xFF) {
+            od_log_debug("[pwrmgm][WDT] power-down: configureDisplayPinsLowPower()");
             configureDisplayPinsLowPower();
             digitalWrite(globalConfig.system_config.pwr_pin, LOW);
         }
