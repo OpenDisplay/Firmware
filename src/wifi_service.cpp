@@ -780,6 +780,30 @@ void initWiFi(bool waitForConnection) {
         wifiInitialized = false;
         return;
     }
+    // Bound the WiFi driver's TX memory to a fixed pool. Arduino's default
+    // (_wifiUseStaticBuffers = false) REPLACES the IDF buffer profile inside
+    // wifiLowLevelInit() with a demand-driven one: static_tx_buf_num 0 /
+    // dynamic_tx_buf_num 32 / cache_tx_buf_num 4 / static_rx_buf_num 4. Setting this
+    // skips that override, so esp_wifi_init() gets WIFI_INIT_CONFIG_DEFAULT() --
+    // static_tx 8, dynamic_tx 0, cache_tx 0, static_rx 8 (sdkconfig).
+    //
+    // At the documented ~1.6 KB per WiFi buffer that trades ~13 KB more resident
+    // internal DRAM for ~38 KB off the peak: TX becomes 12.8 KB always instead of up
+    // to 51.2 KB whenever traffic asks. The right trade here because this part dies on
+    // transients, not on baseline -- a 2026-08-03 coredump caught the tcpip task with a
+    // NULL from the mDNS allocator during an inbound query burst, and the OOM error log
+    // then aborted in lock_init_generic. RX is unchanged: dynamic_rx_buf_num is 32 in
+    // both profiles and Arduino exposes no knob for it.
+    //
+    // cache_tx_buf_num 0 is correct here, not the "can't be zero!" case in Arduino's
+    // dynamic path: cache TX buffers exist to copy dynamic TX buffers out of PSRAM into
+    // DMA-capable memory, and static TX buffers are already internal and DMA-capable.
+    //
+    // MUST precede every WiFi call -- wifiLowLevelInit() reads the flag once and latches
+    // lowLevelInitDone. Set later it only logs a warning and takes effect after a
+    // WiFi.mode(WIFI_MODE_NULL). Nothing touches the WiFi API before this point: the
+    // WiFi.status() call sites in main.cpp/config_parser.cpp all run after setup().
+    WiFi.useStaticBuffers(true);
     // Do not log the SSID or password (credentials); log only presence/length.
     lanLog("WiFi: connecting to configured SSID (len " + String(strlen(wifiSsid)) + ")");
     registerWiFiDiagEvents();
