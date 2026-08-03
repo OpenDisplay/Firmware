@@ -38,8 +38,8 @@ extern uint16_t wifiServerPort;
 extern WiFiServer wifiServer;
 extern WiFiClient wifiClient;
 extern bool wifiServerConnected;
-extern uint8_t tcpReceiveBuffer[16384];
-extern uint32_t tcpReceiveBufferPos;
+// tcpReceiveBuffer / tcpReceiveBufferPos are declared in wifi_service.h (included
+// above) so the pointer type is checked against its definition in main.h.
 extern uint8_t msd_payload[16];
 
 // This file builds its log lines with Arduino String concatenation, while the rest
@@ -250,6 +250,33 @@ void od_tls_reserve_records(void) {
     }
 }
 
+void odLanReserveRxBuffer(void) {
+    if (tcpReceiveBuffer != nullptr) return;   // idempotent, per od_tls_reserve_records
+    // calloc, not malloc: this was a .bss array and callers may read ahead of the write
+    // cursor on a partial frame. PSRAM first -- it is 16 KB of internal DRAM otherwise,
+    // on a part where mbedTLS alone needs 34 KB contiguous internal.
+    tcpReceiveBuffer = (uint8_t*)heap_caps_calloc(1, OD_LAN_RX_BUFFER_SIZE,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const bool inPsram = (tcpReceiveBuffer != nullptr);
+    if (!inPsram) {
+        tcpReceiveBuffer = (uint8_t*)heap_caps_calloc(1, OD_LAN_RX_BUFFER_SIZE,
+                                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (tcpReceiveBuffer == nullptr) {
+        lanLog("ERROR: LAN RX buffer reservation failed -- LAN transport will not start");
+        return;
+    }
+    lanLog("LAN: reserved RX buffer " + String((unsigned)OD_LAN_RX_BUFFER_SIZE) + " B in " +
+                String(inPsram ? "PSRAM" : "DRAM") +
+                ", internal free=" + String((unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL)) +
+                ", largest block=" + String((unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+    if (!inPsram) {
+        // The only signal that this board's PSRAM is absent or dead:
+        // CONFIG_SPIRAM_IGNORE_NOTFOUND=1 lets it boot silently. No reclaim here.
+        lanLog("WARNING: LAN RX buffer fell back to internal DRAM -- no PSRAM on this board?");
+    }
+}
+
 // Build the shared server config once (RNG + PSK + one ECDHE-PSK ciphersuite).
 static bool tlsEnsureConfig(void) {
     // Late fallback: encryption can be turned on by a runtime config write, long after
@@ -439,6 +466,13 @@ static void restartLanService(void) {
 }
 
 static void startLanServer(void) {
+    // No RX buffer, no listener. Refusing here is the whole degrade path: it covers
+    // every caller, and it is better than accepting a socket the parser cannot serve.
+    // BLE and the display path are unaffected.
+    if (tcpReceiveBuffer == nullptr) {
+        lanLog("ERROR: LAN RX buffer unavailable -- LAN transport disabled");
+        return;
+    }
     tlsMode = isEncryptionEnabled();
     uint16_t port = lanActivePort();
     wifiServer.begin(port);
@@ -864,7 +898,13 @@ static int s_lastLanReadErr = 0;   // mbedTLS ret for the last OD_LAN_READ_ERROR
 // of bytes appended (>=0), OD_LAN_READ_CLOSED on a graceful peer close, or
 // OD_LAN_READ_ERROR on a fatal channel error (caller drops in both cases).
 static int lanReadIntoBuffer(void) {
-    int space = (int)sizeof(tcpReceiveBuffer) - (int)tcpReceiveBufferPos;
+    // Belt-and-braces: startLanServer() refuses to listen without the buffer, so no
+    // socket should reach here, but never index a null on the read path.
+    if (tcpReceiveBuffer == nullptr) return OD_LAN_READ_ERROR;
+    // OD_LAN_RX_BUFFER_SIZE, not sizeof(): tcpReceiveBuffer is a pointer now, and
+    // sizeof would silently yield 4/8 -- reads would collapse to a few bytes per tick
+    // and read as a network fault rather than a code bug.
+    int space = (int)OD_LAN_RX_BUFFER_SIZE - (int)tcpReceiveBufferPos;
     if (space <= 0) {
         lanLog("LAN RX buffer full, dropping connection");
         return -1;
@@ -1126,7 +1166,7 @@ void handleWiFiServer() {
         if (!wifiServerConnected || !wifiClient.connected()) {
             return;
         }
-    } while (got > 0 && drainedBytes < sizeof(tcpReceiveBuffer));
+    } while (got > 0 && drainedBytes < OD_LAN_RX_BUFFER_SIZE);
 }
 
 void restartWiFiLanAfterReconnect() {

@@ -16,6 +16,12 @@
  * The gate below keys off OPENDISPLAY_ENABLE_WIFI only as a proxy for "a build that
  * cares about inflate throughput and can spare the RAM" — it does NOT mean the
  * engine is limited to WiFi traffic. Do not read the gate as a transport filter.
+ * The "can spare the RAM" half is now load-bearing rather than incidental: that flag
+ * is set only on envs with -DBOARD_HAS_PSRAM (see src/wifi_service.h), so the parts
+ * without PSRAM — esp32-c3-N4, esp32-c6-N4, esp32-c3-N16, plus the classic esp32-N4
+ * and esp32-wrover-e-N4R8 — fall back to uzlib and reclaim the ~15 KB of tables
+ * below. They have no PSRAM to relocate anything into, and internal DRAM there is
+ * the scarcest resource on the part.
  *
  * WHY: the uzlib engine is a bit-serial, byte-at-a-time resumable state machine —
  * tolerable for BLE (wire << inflate), but the LAN wire is ~10-100x faster so

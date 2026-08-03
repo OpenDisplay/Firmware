@@ -178,6 +178,12 @@ void setup() {
     // observed failing with -0x7f00 at 51 KB free / 31.7 KB largest block. No-op when
     // encryption is disabled.
     od_tls_reserve_records();
+    // Strictly after the TLS slots: this prefers PSRAM and normally costs no internal
+    // DRAM at all, but on a board whose PSRAM is absent or dead it falls back to 16 KB
+    // of internal -- which must not land in the middle of the contiguous region the
+    // reservation above depends on. One call site serves both the normal-boot and the
+    // deep-sleep-wake path, which share this stretch of setup().
+    odLanReserveRxBuffer();
 #endif
     if (is_deep_sleep_wake) { od_log_info("[wake] << full_config_init >> initio"); od_log_flush(); }
 #if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
