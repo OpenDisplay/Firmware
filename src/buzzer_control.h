@@ -95,5 +95,14 @@ void initPassiveBuzzers(void);
 void handleBuzzerActivate(uint8_t* data, uint16_t len);
 void passiveBuzzerPowerOffAlert(void);
 void buzzerService(void);   // non-blocking playback tick, called from loop()
+/**
+ * Silence the buzzer immediately. DEEP SLEEP ONLY -- not a session-teardown API.
+ *
+ * abortToKnownState() must never call this: a playing melody is a user-facing
+ * effect, not session state, and cannot confuse a later connection the way a
+ * half-open pipe session can. Deep sleep is the exception only because it stops the
+ * clock playback depends on, so an unstopped tone holds the pin driven into sleep.
+ */
+void buzzerStopForSleep(void);
 
 #endif

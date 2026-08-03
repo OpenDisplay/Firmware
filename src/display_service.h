@@ -75,6 +75,13 @@ bool imageWriteLogQuietCmd(void);
 bool imageWriteLogQuietAck(void);
 bool imageWriteLogQuietFrame(const uint8_t* data, uint16_t len);
 extern volatile bool epdRefreshInProgress;
+/**
+ * Close the refresh bracket: clears epdRefreshInProgress AND re-stamps the owner's
+ * activity clock. Every refresh path must end through this rather than assigning
+ * the flag, or that path silently loses the R4 refresh exclusion and can drop an
+ * engaged client the moment loop() resumes.
+ */
+void endRefresh(void);
 void handlePartialWriteStart(uint8_t* data, uint16_t len);
 // Both transfer watchdogs, together. They live beside the state they terminate
 // rather than in loop(): pipeState is reachable from main.cpp via

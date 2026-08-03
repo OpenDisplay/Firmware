@@ -7,9 +7,12 @@
 // server, TLS-PSK listener, RX reassembly buffer, LAN response framing). It is
 // defined only on ESP32 targets built with -DOPENDISPLAY_ENABLE_WIFI, which is
 // applied to every S3, C6, and C3 platformio env (esp32-s3-E1004 sets no flag of
-// its own but inherits it from esp32-s3-N32R8-extuart). The classic esp32-N4 is
-// the sole ESP32 env without it, so it does not compile the WiFi surface and
-// reclaims the 16 KB RX buffer + WiFiServer/WiFiClient RAM. Call sites in
+// its own but inherits it from esp32-s3-N32R8-extuart). TWO classic-ESP32 envs lack
+// it -- esp32-N4 and esp32-wrover-e-N4R8 -- so neither compiles the WiFi surface,
+// and both reclaim the 16 KB RX buffer + WiFiServer/WiFiClient RAM. Note
+// esp32-wrover-e-N4R8 is NOT in platformio.ini's default_envs, so a bare `pio run`
+// skips it: it ships via .github/firmware-targets.json, and it is the target most
+// likely to catch a broken #ifndef OPENDISPLAY_HAS_WIFI path. Build it explicitly. Call sites in
 // main.cpp / communication.cpp / display_service.cpp / device_control.cpp /
 // config_parser.cpp are #ifdef-guarded on this macro.
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_ENABLE_WIFI)
@@ -28,6 +31,24 @@ void od_tls_reserve_records(void);
 
 void initWiFi(bool waitForConnection = true);
 void disconnectWiFiServer();
+/**
+ * Close the owned LAN socket and its TLS context, without the crypto/transfer
+ * teardown that disconnectWiFiServer() also does.
+ *
+ * The LAN arm of abortToKnownState()'s drop step: the abort owns those other steps,
+ * so this must not repeat them. Synchronous -- a TCP close needs no wait bound,
+ * unlike a BLE disconnect.
+ */
+void wifiLanDropOwnedSocket(void);
+/**
+ * Tear down a LAN session whose peer has already closed the socket.
+ *
+ * Called early in loop(), ahead of the deferred disconnect cleanup, so the token is
+ * released before the accept later in the same pass -- otherwise an ordinary
+ * reconnect is refused against the departed session's token (7d step 1 before
+ * step 2). No-op when there is no session or the peer is still connected.
+ */
+void wifiLanReapClosedSession(void);
 void handleWiFiServer();
 
 // Re-associate to the strongest AP for the configured SSID after the link degrades

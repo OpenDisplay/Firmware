@@ -55,6 +55,18 @@ void powerDownExternalFlashFromConfig(void);
 void ws_pp_init();
 extern bool encryptionInitialized;
 
+// Defined in main.h (the single-inclusion globals header), so it needs an extern
+// here rather than an include -- main.h may not be included twice.
+extern chunked_write_state_t chunkedWriteState;
+
+void resetChunkedWriteState(void) {
+    chunkedWriteState.active = false;
+    chunkedWriteState.totalSize = 0;
+    chunkedWriteState.receivedSize = 0;
+    chunkedWriteState.expectedChunks = 0;
+    chunkedWriteState.receivedChunks = 0;
+}
+
 bool initConfigStorage(){
     #ifdef TARGET_NRF
     if (!InternalFS.begin()) {

@@ -12,7 +12,7 @@ pio run -e <env> -t upload       # build + flash
 pio run                          # build every environment
 ```
 
-Common envs: `nrf52840custom`, `esp32-s3-N16R8`, `esp32-s3-N8R8`, `esp32-c3-N16`, `esp32-c6-N4`. CI (`.github/workflows/main.yaml`) builds **all eleven** environments on every push — keep them all green.
+Common envs: `nrf52840custom`, `esp32-s3-N16R8`, `esp32-s3-N8R8`, `esp32-c3-N16`, `esp32-c6-N4`. CI (`.github/workflows/main.yaml`) builds every environment in `.github/firmware-targets.json` on every push — **12** of them — keep them all green. Note `platformio.ini`'s `default_envs` lists only 11: `esp32-wrover-e-N4R8` ships but is NOT in it, so a bare `pio run` silently skips the target most likely to catch a broken `#ifndef OPENDISPLAY_HAS_WIFI` path. Build it explicitly (`pio run -e esp32-wrover-e-N4R8`) before claiming a clean sweep.
 
 Factory provisioning: `OPENDISPLAY_FACTORY_CONFIG_HEX="..." pio run -e <env>` (or `tools/provision_firmware.py`). `scripts/factory_config_gen.py` runs as a pre-build step.
 

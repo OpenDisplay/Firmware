@@ -20,6 +20,9 @@
 #include "wifi_service.h"
 #endif
 
+#include "link_owner.h"
+#include "session_guard.h"
+
 bool isAuthenticated();
 extern struct GlobalConfig globalConfig;
 
@@ -35,6 +38,18 @@ extern struct GlobalConfig globalConfig;
 // name the values instead of comparing against a bare 0.
 volatile uint8_t g_commandOrigin = ORIGIN_BLE;
 
+// Instance identity of the frame currently being dispatched -- the packed owner
+// word (link_owner.h) of the connection that WROTE it, not merely its transport.
+//
+// g_commandOrigin says BLE-or-LAN and nothing more, which is not enough to decide
+// whether a frame still belongs to the live session: BLE conn handles are reused,
+// so a frame queued by a dead instance is indistinguishable from the new owner's by
+// transport alone. serviceBleRx() sets this from the frame's own tag (which
+// CommandQueueItem carries from the write callback) and the LAN listener sets it
+// from the LAN owner's identity, both immediately before dispatch. Same
+// single-loop-task argument as g_commandOrigin, so no locking.
+volatile uint32_t g_commandInstance = 0;
+
 // Transport tag for the RX banner and TX dump. Three transports share this
 // dispatcher (nRF BLE, ESP32 BLE via commandQueue, ESP32 LAN), and without a tag
 // the log cannot show which one a frame took -- in particular whether a frame used
@@ -49,6 +64,141 @@ static const char* originTag(void) {
         case ORIGIN_LAN_PLAIN: return "LAN";
         default:               return "BLE";
     }
+}
+
+// --- auth-abuse drop (CONNECTION_POLICY R3 / freeze-hardening Phase 4) ---------
+//
+// Count CONSECUTIVE commands answered RESP_AUTH_REQUIRED and drop the link at the
+// threshold, so a session that cannot authenticate stops holding the exclusive slot
+// while it retries.
+//
+// This is an OPTIMISATION, not a hole-closer -- the distinction matters for how
+// hard it should try. Phase 3 narrowed the activity clock so handshake/discovery
+// opcodes and pre-auth commands no longer stamp it, which means such a peer already
+// ages normally and the idle timeout reclaims the slot at OD_BLE_IDLE_TIMEOUT_MS.
+// What this adds is speed and a reason: roughly one exchange instead of 120 s, and
+// an explicit final RESP_AUTH_REQUIRED before a deliberate drop rather than a
+// silent timeout. So it may fail safe (never dropping) without reopening anything.
+#ifndef OD_AUTH_ABUSE_THRESHOLD
+// CLIENT BEHAVIOUR THIS ASSUMES: py-opendisplay authenticates in ONE exchange, so a
+// legitimate client never reaches 2, let alone 10.
+//
+// Chosen deliberately BELOW py-opendisplay's 16-frame pipe window, which is the one
+// case where a well-behaved client trips it: if its session dies mid-upload, every
+// in-flight frame bounces. Dropping at 10 rather than waiting out all 16 is the
+// right outcome -- the session is already dead, every one of those frames is doomed,
+// and the drop tells the client immediately instead of after a full window of
+// pointless round trips. Recorded because an earlier prototype inherited this
+// threshold by accident rather than deciding it.
+#define OD_AUTH_ABUSE_THRESHOLD 10
+#endif
+#ifndef OD_AUTH_ABUSE_FLUSH_MS
+// Hard bound on the whole best-effort delivery attempt below. On expiry the drop
+// happens regardless, so a client that has stopped reading cannot keep the abuser
+// attached by refusing to drain.
+#define OD_AUTH_ABUSE_FLUSH_MS 500
+#endif
+#ifndef OD_AUTH_ABUSE_DWELL_FALLBACK_MS
+// Used when the negotiated connection interval is not yet known. The central
+// chooses that interval and this firmware requests none, so there is no constant to
+// hard-code -- see BleTransport::connIntervalMs().
+#define OD_AUTH_ABUSE_DWELL_FALLBACK_MS 50
+#endif
+
+// Set by any RESP_AUTH_REQUIRED answer for the frame being dispatched, on EVERY
+// transport. Read once after the dispatch switch to decide whether the frame was
+// activity. Loop-task-only, like g_commandOrigin.
+static bool     s_frameRejected = false;
+static uint8_t  s_authRejectRun = 0;        // consecutive RESP_AUTH_REQUIRED answers
+static bool     s_authAbuseDropPending = false;
+static uint32_t s_authAbuseDeadlineMs = 0;  // hard bound on the delivery attempt
+static uint32_t s_authAbuseDwellUntil = 0;  // set once TX has drained; 0 = not yet
+
+// Called at every site that answers RESP_AUTH_REQUIRED.
+//
+// BLE ONLY, and the origin gate is not decoration: the same auth gate is reachable
+// from plaintext LAN, and counting those would let LAN traffic drop a BLE client.
+// TLS-LAN never reaches the gate at all (the transport is the authentication).
+static void noteAuthRejected(void) {
+    // Mark the frame first, for every origin. The COUNTER is BLE-only (see below),
+    // but "this frame was refused, so it is not activity" is transport-independent
+    // -- and getting that wrong on LAN is exactly how a TLS client could hold the
+    // slot forever.
+    s_frameRejected = true;
+    if (g_commandOrigin != ORIGIN_BLE) return;
+    if (s_authAbuseDropPending) return;              // already decided
+    if (s_authRejectRun < 255) s_authRejectRun++;
+    if (s_authRejectRun < OD_AUTH_ABUSE_THRESHOLD) return;
+    // The offender is the frame's own instance, taken from its queue tag -- not
+    // "whichever peer the stack lists first", which is how an earlier prototype
+    // misidentified it before frames carried identity.
+    if (!linkIsOwnerWord(g_commandInstance)) return; // not the owner: nothing to drop
+    od_log_warn("Auth abuse: %u consecutive unauthenticated commands - dropping link",
+                (unsigned)s_authRejectRun);
+    s_authAbuseDropPending = true;
+    s_authAbuseDeadlineMs = millis() + OD_AUTH_ABUSE_FLUSH_MS;
+    s_authAbuseDwellUntil = 0;
+}
+
+void resetAuthAbuseCounter(void) {
+    s_authRejectRun = 0;
+    s_authAbuseDropPending = false;
+    s_authAbuseDeadlineMs = 0;
+    s_authAbuseDwellUntil = 0;
+}
+
+void serviceBleAuthAbuseDisconnect(void) {
+    if (!s_authAbuseDropPending) return;
+    // Never mid-refresh: loop() is blocked throughout one, and the abort is
+    // loop-task-only by contract.
+    if (epdRefreshInProgress) return;
+
+    const LinkId owner = linkOwnerId();
+    if (owner.who != OWNER_BLE) {
+        // The link went away, or LAN took the slot, while we were draining. Nothing
+        // to drop -- and dropping on a stale identity is exactly what the epoch
+        // exists to prevent.
+        resetAuthAbuseCounter();
+        return;
+    }
+
+    // BEST EFFORT, and deliberately not more than that. An empty TX ring proves the
+    // stack ACCEPTED the notification, not that it went on air: the ring advances
+    // when notify() returns true, and a BLE notification is unacknowledged. Without
+    // an indication -- a wire change this plan forbids -- there is no delivery
+    // signal to wait on, so this drains, dwells about one connection interval to
+    // give the radio a chance to send, and then drops.
+    serviceBleTx();
+    const bool expired = (int32_t)(millis() - s_authAbuseDeadlineMs) >= 0;
+    if (!bleTxQueuePending() && s_authAbuseDwellUntil == 0) {
+        uint16_t intervalMs = ble.connIntervalMs(owner.handle);
+        if (intervalMs == 0) intervalMs = OD_AUTH_ABUSE_DWELL_FALLBACK_MS;
+        const uint32_t dwellEnd = millis() + intervalMs + 5u;   // +margin
+        // Never past the hard deadline: a drain landing just before it yields a
+        // short or zero dwell, which is the expiry case behaving as specified
+        // rather than a contradiction.
+        s_authAbuseDwellUntil =
+            ((int32_t)(dwellEnd - s_authAbuseDeadlineMs) > 0) ? s_authAbuseDeadlineMs : dwellEnd;
+    }
+    const bool dwelled = (s_authAbuseDwellUntil != 0) &&
+                         ((int32_t)(millis() - s_authAbuseDwellUntil) >= 0);
+    if (!expired && !dwelled) return;   // keep draining next pass
+
+    // One more pass if RX still holds frames. serviceBleRx() drains once per pass,
+    // early, while this runs late -- so a frame that arrived on the callback task in
+    // between is still queued, and the abort's ring reset would discard it unread.
+    // That frame may be the client's authentication, which would cancel this drop
+    // entirely. Bounded by the same hard deadline, so a client that keeps the ring
+    // permanently non-empty cannot defer the drop indefinitely.
+    if (!expired && bleRxQueuePending()) return;
+
+    resetAuthAbuseCounter();
+    // dropLink=true. The abort's own step 10 is the R3a bounded wait for link-down
+    // before its step 11 releases -- two bounded waits in sequence, composing rather
+    // than conflicting: this one runs BEFORE the abort precisely because the abort
+    // deliberately skips the client NACK when dropping, and asking one routine to
+    // both hold the link open for a response and tear it down is contradictory.
+    abortToKnownState("auth abuse", true, owner);
 }
 
 static void reloadConfigAfterSave(void) {
@@ -407,6 +557,7 @@ void handleWriteConfig(uint8_t* data, uint16_t len) {
     if (isEncryptionEnabled() && !isAuthenticated()) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
+            noteAuthRejected();
             uint8_t response[] = {RESP_ACK, (uint8_t)(CMD_CONFIG_WRITE & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
@@ -468,7 +619,8 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
     if (chunkedWriteState.receivedChunks == 1 && isEncryptionEnabled() && !isAuthenticated()) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
-            chunkedWriteState.active = false;
+            resetChunkedWriteState();
+            noteAuthRejected();
             uint8_t response[] = {RESP_ACK, (uint8_t)(CMD_CONFIG_CHUNK & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
@@ -476,7 +628,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
         secureEraseConfig();
     }
     if (len == 0 || len > CONFIG_CHUNK_SIZE || chunkedWriteState.receivedSize + len > MAX_CONFIG_SIZE || chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
-        chunkedWriteState.active = false;
+        resetChunkedWriteState();
         uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
@@ -492,9 +644,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
             reloadConfigAfterSave();
         }
         sendResponse(saved ? ok : err, 4);
-        chunkedWriteState.active = false;
-        chunkedWriteState.receivedSize = 0;
-        chunkedWriteState.receivedChunks = 0;
+        resetChunkedWriteState();
     } else {
         uint8_t ackResponse[] = {RESP_ACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(ackResponse, sizeof(ackResponse));
@@ -547,6 +697,8 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     }
 
     uint16_t command = (data[0] << 8) | data[1];
+
+
     // Silence the per-frame command spam for image-write data (0x0071) once the
     // stream is past its first chunk; the display handler's 5% meter reports it.
     const bool quietCmd = (command == CMD_DIRECT_WRITE_DATA || command == CMD_PIPE_WRITE_DATA) && imageWriteLogQuietCmd();
@@ -581,6 +733,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
     if (isEncryptionEnabled() && g_commandOrigin != ORIGIN_LAN_TLS) {
         if (!isAuthenticated()) {
             od_log_error("ERROR: [%s] Command requires authentication (encryption enabled)", originTag());
+            noteAuthRejected();
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
@@ -588,6 +741,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
 
         if (len < BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE + ENCRYPTION_TAG_SIZE) {
             od_log_error("ERROR: [%s] Unencrypted command received when encryption is enabled", originTag());
+            noteAuthRejected();
             uint8_t response[] = {RESP_ACK, (uint8_t)(command & 0xFF), RESP_AUTH_REQUIRED};
             sendResponseUnencrypted(response, sizeof(response));
             return;
@@ -628,6 +782,10 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         len = 2 + plaintext_len;
         data = decrypted_data;
     }
+
+    // Cleared before dispatch, inspected after it: the handlers themselves can
+    // still refuse this frame, so acceptance is not knowable until they return.
+    s_frameRejected = false;
 
     // The per-command banner is logged once above (commandName()); cases below do
     // NOT log their own "=== ... COMMAND ... ===". CMD_AUTHENTICATE and
@@ -700,5 +858,38 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         default:
             od_log_error("ERROR: Unknown command: 0x%04X", command);
             break;
+    }
+
+    // R4 ACTIVITY, decided HERE -- after dispatch, on the OUTCOME rather than on a
+    // prediction of it. This is the third and final position for this test, and the
+    // two earlier ones were both wrong in the same way:
+    //
+    //  - At the top, gated on isAuthenticated(): an authenticated client sending a
+    //    too-short plaintext frame stamped here, then got RESP_AUTH_REQUIRED from
+    //    the length check below it.
+    //  - Just before the switch: TLS-LAN frames bypass the CCM gate and reach
+    //    dispatch, but handleWriteConfig() and the chunk handler apply their OWN
+    //    app-layer auth check and can still answer RESP_AUTH_REQUIRED -- so a TLS
+    //    client repeating CMD_CONFIG_WRITE stamped the clock on every rejected
+    //    attempt and held the slot indefinitely.
+    //
+    // Both are the same mistake at different depths: anything that predicts
+    // acceptance is wrong at whatever layer rejects next. Reading s_frameRejected
+    // after the handler has run is the only position with nothing below it.
+    //
+    // Unknown opcodes do not stamp (commandName() is null for them), and the two
+    // handshake/discovery opcodes return from their own early branches and never
+    // reach here -- so "handshake and discovery are not activity" holds
+    // structurally rather than by a test that could drift.
+    if (!s_frameRejected && commandName(command) != nullptr &&
+        linkIsOwnerWord(g_commandInstance)) {
+        linkStampOwnerCommand();
+        // A fully accepted command means this client is working normally, so it
+        // clears the auth-abuse state ENTIRELY -- including a drop already pending.
+        // Clearing only the run would let a client that recovered mid-flush (say it
+        // re-authenticated after its session expired under a 16-frame pipe burst)
+        // still be dropped by a decision taken moments earlier, which is the worst
+        // outcome for a mechanism whose whole value is reacting quickly.
+        resetAuthAbuseCounter();
     }
 }

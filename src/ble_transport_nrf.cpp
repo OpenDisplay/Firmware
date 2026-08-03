@@ -9,6 +9,7 @@
 #include "ble_transport.h"
 #include "ble_transport_nrf.h"
 #include "command_queue.h"
+#include "link_owner.h"
 #include "structs.h"
 #include "encryption.h"
 #include "od_log.h"
@@ -35,12 +36,27 @@ static bool     s_begun = false;
 static uint16_t s_connHandle = BLE_CONN_HANDLE_INVALID;
 static volatile bool s_connectedEvent = false;
 static volatile bool s_disconnectedEvent = false;
-static volatile uint8_t s_disconnectReason = 0;
-// RX ring head at the instant the link dropped: the boundary between the departed
-// client's queued frames and anything the next client pushes. Captured in the
-// disconnect callback because that is the only moment it is knowable -- by the time
-// loop() services the event, a reconnect may already have queued frames of its own.
-static volatile uint8_t s_rxBoundaryAtDisconnect = 0;
+// uint16_t for signature parity with ESP32, where NimBLE's reason genuinely needs
+// the width. The SoftDevice hands us a raw HCI byte with no wrapping, so nothing
+// is lost or aliased here -- but the two targets now log the same way.
+static volatile uint16_t s_disconnectReason = 0;
+static volatile uint32_t s_connectedWord = 0;
+static volatile uint32_t s_disconnectedWord = 0;
+
+// --- the instance table (CONNECTION_POLICY R3 requirement 5) -----------------
+// Degenerate at one entry: Bluefruit.begin(1, 0) configures the SoftDevice for a
+// single peripheral link, so cross-central injection is unreachable at the link
+// layer. It exists anyway because the mechanisms above it are portable -- the R3a
+// wait polls per-handle liveness, and frames carry identity tags on both targets.
+// A single-link target still queues frames that can outlive their session across a
+// disconnect/reconnect pair inside one blocked-loop window, which is precisely
+// what the tag protects against.
+static volatile uint32_t s_instanceWord = 0;
+static volatile bool     s_instanceSubscribed = false;
+// Claim disposition: 0 while the claim is in flight, otherwise the identity word
+// the claim was decided for. See the matching field in ble_transport_esp32.cpp for
+// why it carries the identity rather than a bare flag.
+static volatile uint32_t s_instanceDecidedWord = 0;
 
 // --- advertising interval policy --------------------------------------------
 static uint32_t s_advBoostUntil = 0;
@@ -115,30 +131,62 @@ static void armLinkDiag(uint16_t conn_handle) {
     s_linkDiagTimer.reset();   // start/restart the one-shot; fires ~2.5 s later
 }
 
-// --- stack callbacks (SoftDevice callback task -- flag-only) -----------------
-// The threading contract, as of Phase 3 and matching ESP32: a stack callback may
-// do exactly two things, copy bytes into the RX ring and set a flag. Everything
-// else -- command dispatch, zlib inflate, EPD SPI streaming, notify(), the
-// connect/disconnect application work, even the PHY/DLE request -- runs on the
-// loop() task. Anything added below that is not a push or a flag store
-// reintroduces the cross-task races this phase exists to remove.
+// --- stack callbacks (SoftDevice callback task) ------------------------------
+// The threading contract, matching ESP32: a stack callback may copy bytes into the
+// RX ring, publish its own instance metadata, attempt the single ownership claim
+// CAS, and set an event flag. Everything else -- command dispatch, zlib inflate,
+// EPD SPI streaming, notify(), the connect/disconnect application work, even the
+// PHY/DLE request -- runs on the loop() task. Anything added below beyond that set
+// reintroduces the cross-task races this design exists to remove.
 static void onConnectCb(uint16_t conn_handle) {
-    od_log_info("=== BLE CLIENT CONNECTED (nRF) ===");
     s_connHandle = conn_handle;
-    s_connectedEvent = true;
+    // Same normative order as ESP32 (R2): epoch, then table entry, then claim.
+    const uint16_t epoch = linkNextEpoch();
+    const uint32_t word = linkPackWord(OWNER_BLE, conn_handle, epoch);
+    __atomic_store_n(&s_instanceDecidedWord, (uint32_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_instanceWord, word, __ATOMIC_RELEASE);
+    s_instanceSubscribed = false;
+    const LinkId id = { OWNER_BLE, conn_handle, epoch };
+    const bool admitted = linkClaim(id);
+    // Publish the identity the claim resolved FOR, so the loop-side refusal scan
+    // can bind the disposition to this exact instance.
+    __atomic_store_n(&s_instanceDecidedWord, word, __ATOMIC_RELEASE);
+    od_log_info("=== BLE CLIENT CONNECTED (nRF) h=%u e=%u %s ===",
+                (unsigned)conn_handle, (unsigned)epoch,
+                admitted ? "[owner]" : "[contender - refused service]");
+    // Payload before flag, flag RELEASE-stored: see the ESP32 twin.
+    __atomic_store_n(&s_connectedWord, word, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_connectedEvent, true, __ATOMIC_RELEASE);
 }
 
 static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
     (void)conn_handle;
-    od_log_info("=== BLE CLIENT DISCONNECTED (nRF) ===");
+    od_log_info("=== BLE CLIENT DISCONNECTED (nRF) reason=0x%03X ===", (unsigned)reason);
     s_connHandle = BLE_CONN_HANDLE_INVALID;
-    s_disconnectReason = reason;
-    // Producer-task read of the producer-owned head: no synchronisation needed, and
-    // within the copy-and-flag contract. Nothing this client can still send exists
-    // past this point -- the link is gone -- so this is exactly the last frame of
-    // the departed session.
-    s_rxBoundaryAtDisconnect = bleRxQueueHead();
-    s_disconnectedEvent = true;
+    __atomic_store_n(&s_disconnectReason, (uint16_t)reason, __ATOMIC_RELAXED);
+    const uint32_t word = __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&s_disconnectedWord, word, __ATOMIC_RELAXED);
+    // Retire the entry: this is what makes link death observable per handle, for
+    // the R3a wait and for the loop's owner comparison. No RX-boundary capture --
+    // frames carry their writer's identity instead (CommandQueueItem::tag).
+    s_instanceSubscribed = false;
+    __atomic_store_n(&s_instanceDecidedWord, (uint32_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_instanceWord, (uint32_t)0, __ATOMIC_RELEASE);
+    // The token is deliberately NOT released here. An intermediate version did
+    // release it on this callback, to let a fast reconnect win a fresh claim -- but
+    // that admits a new owner while the departed session's transfer, crypto and TX
+    // ring are still live, and RX/TX are serviced before the deferred cleanup, so
+    // the new client's commands would run against the old session's state and its
+    // queued responses could be delivered to the newcomer. Release stays where R3a
+    // puts it: the last step of the abort, after teardown.
+    //
+    // What makes that safe for a reconnecting client is contender refusal
+    // (serviceContenderRefusal in main.cpp): a client that reconnects into a
+    // still-held slot is disconnected once the loop runs, and its NEXT connect
+    // claims cleanly. Without refusal the client would sit on nRF's only
+    // peripheral link forever with every write filtered, since admission is decided
+    // once per instance and never revisited.
+    __atomic_store_n(&s_disconnectedEvent, true, __ATOMIC_RELEASE);
 }
 
 // Adapter: Bluefruit's write_callback_t is BLECharacteristic*-shaped, whereas the
@@ -146,13 +194,24 @@ static void onDisconnectCb(uint16_t conn_handle, uint8_t reason) {
 // every target). Adapting here is what keeps Bluefruit types out of
 // communication.cpp.
 static void onWriteCb(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
-    (void)conn_hdl;
     (void)chr;
+    // Same owner filter as ESP32, so the two targets read identically. Latent
+    // rather than live here -- the SoftDevice permits only one peripheral link, so
+    // there is no second central to filter out -- but the TAG it produces is not
+    // latent at all: it is what stops a frame queued by a departed session from
+    // dispatching into the next one.
+    //
+    // This callback used to (void) the handle it was given.
+    const uint32_t word = __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE);
+    if (word == 0 || linkUnpackWord(word).handle != conn_hdl || word != linkOwnerWord()) {
+        od_log_debug("Dropped write from non-owner h=%u", (unsigned)conn_hdl);
+        return;
+    }
     // bleRxQueuePush() owns the arrival log and every drop reason (empty, too large,
     // ring full) so this callback and ESP32's onWrite() cannot report the same frame
     // differently. This site used to print "queue full" for all three, sending you
     // after ring depth when the real cause was a malformed frame. Add no logging here.
-    (void)bleRxQueuePush(data, len);
+    (void)bleRxQueuePush(data, len, word);
 }
 
 // --- BleTransport ------------------------------------------------------------
@@ -239,11 +298,66 @@ uint8_t BleTransport::connectedCount() const {
 }
 
 bool BleTransport::notifyReady() const {
-    return Bluefruit.connected() && s_imageCharacteristic.notifyEnabled();
+    // Gated on ownership as well as CCCD, matching ESP32: with the slot unowned
+    // there is nobody a response may legitimately go to.
+    if (!Bluefruit.connected() || !s_imageCharacteristic.notifyEnabled()) return false;
+    const uint32_t owner = linkOwnerWord();
+    return owner != 0 && owner == __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE);
 }
 
 bool BleTransport::notify(const uint8_t* data, uint16_t len) {
+    // Single-link by construction (Bluefruit.begin(1, 0)), so there is no
+    // all-subscribers overload to avoid as there is on NimBLE -- but the ownership
+    // gate is kept so both targets refuse to notify an unowned or foreign link.
+    const uint32_t owner = linkOwnerWord();
+    if (owner == 0 || owner != __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE)) return false;
     return s_imageCharacteristic.notify(data, len);
+}
+
+bool BleTransport::instanceLive(uint16_t handle, uint16_t epoch) const {
+    return __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE) ==
+           linkPackWord(OWNER_BLE, handle, epoch);
+}
+
+uint8_t BleTransport::liveInstanceCount() const {
+    return __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE) != 0 ? 1 : 0;
+}
+
+uint32_t BleTransport::instanceWordAt(uint8_t index) const {
+    if (index != 0) return 0;
+    return __atomic_load_n(&s_instanceWord, __ATOMIC_ACQUIRE);
+}
+
+uint32_t BleTransport::instanceClaimDecidedWordAt(uint8_t index) const {
+    if (index != 0) return 0;
+    return __atomic_load_n(&s_instanceDecidedWord, __ATOMIC_ACQUIRE);
+}
+
+uint8_t BleTransport::instanceCapacity() { return 1; }
+
+bool BleTransport::disconnect(uint16_t handle, uint16_t epoch) {
+    // Re-validate as late as possible; see the ESP32 twin and the header note.
+    if (!instanceLive(handle, epoch)) return true;   // already gone, or reassigned
+    // Bluefruit takes ONLY a handle: BLEConnection::disconnect() calls
+    // sd_ble_gap_disconnect(_conn_hdl, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION),
+    // so 0x13 is sent and there is no reason argument to pass -- which is why the
+    // seam exposes none.
+    //
+    // Unlike the DFU-entry disconnect in device_control.cpp, restartOnDisconnect
+    // is deliberately left ON: this drop frees the slot for the next client rather
+    // than ending the device's session life.
+    if (!Bluefruit.connected()) return true;   // already gone
+    const bool ok = Bluefruit.disconnect(handle);
+    if (!ok) od_log_warn("WARNING: BLE disconnect request failed for handle %u", (unsigned)handle);
+    return ok;
+}
+
+uint16_t BleTransport::connIntervalMs(uint16_t handle) const {
+    BLEConnection* conn = Bluefruit.Connection(handle);
+    if (conn == nullptr) return 0;
+    const uint16_t units = conn->getConnectionInterval();   // 1.25 ms units
+    if (units == 0) return 0;
+    return (uint16_t)((units * 5 + 3) / 4);
 }
 
 void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
@@ -317,20 +431,45 @@ void BleTransport::tick() {
 }
 
 bool BleTransport::eventPending() const {
-    return s_connectedEvent || s_disconnectedEvent;
+    // RELAXED: a non-destructive peek used to decide whether to return to loop(),
+    // never to establish ordering. Reading one pass stale is harmless -- the next
+    // pass sees it.
+    return __atomic_load_n(&s_connectedEvent, __ATOMIC_RELAXED) ||
+           __atomic_load_n(&s_disconnectedEvent, __ATOMIC_RELAXED);
 }
 
-bool BleTransport::takeConnectedEvent() {
-    if (!s_connectedEvent) return false;
-    s_connectedEvent = false;
+bool BleTransport::takeConnectedEvent(uint32_t* instanceWord) {
+    // Atomic exchange, not check-then-clear. The old form could lose an event that
+    // arrived inside the gap, and -- now that the flag carries an identity payload
+    // -- could also lose an event that arrived inside the gap. ACQUIRE pairs with
+    // the callback's RELEASE store of the flag, which it makes after writing the
+    // payload, so the payload we read is at least fully written.
+    //
+    // It does NOT bind the payload to the flag we just consumed: acquire/release
+    // orders writes that PRECEDE the release, and nothing freezes the payload
+    // afterwards, so a second connect landing between the exchange and the load
+    // below hands us ITS word instead. That is tolerable only because no decision
+    // depends on it -- teardown and connect-side work are both derived from the
+    // owner token and the instance table, which are authoritative. The payload is
+    // diagnostic. Do not build a decision on it without binding it properly.
+    if (!__atomic_exchange_n(&s_connectedEvent, false, __ATOMIC_ACQUIRE)) return false;
+    if (instanceWord != nullptr) {
+        *instanceWord = __atomic_load_n(&s_connectedWord, __ATOMIC_RELAXED);
+    }
     return true;
 }
 
-bool BleTransport::takeDisconnectedEvent(uint8_t* reason, uint8_t* rxBoundary) {
-    if (!s_disconnectedEvent) return false;
-    s_disconnectedEvent = false;
-    if (reason != nullptr) *reason = s_disconnectReason;
-    if (rxBoundary != nullptr) *rxBoundary = s_rxBoundaryAtDisconnect;
+bool BleTransport::takeDisconnectedEvent(uint16_t* reason, uint32_t* instanceWord) {
+    // See takeConnectedEvent(), including the caveat: the exchange stops events
+    // being lost in the old check-then-clear gap, but does not bind this payload to
+    // the flag just consumed. The reason code below is therefore diagnostic -- a
+    // burst of disconnects can report the latest reason twice. Teardown decides on
+    // table state, not on this.
+    if (!__atomic_exchange_n(&s_disconnectedEvent, false, __ATOMIC_ACQUIRE)) return false;
+    if (reason != nullptr) *reason = __atomic_load_n(&s_disconnectReason, __ATOMIC_RELAXED);
+    if (instanceWord != nullptr) {
+        *instanceWord = __atomic_load_n(&s_disconnectedWord, __ATOMIC_RELAXED);
+    }
     return true;
 }
 

@@ -9,6 +9,8 @@
 #include "touch_input.h"
 #include "encryption.h"
 #include "ble_transport.h"
+#include "link_owner.h"
+#include "session_guard.h"
 #include "od_log.h"
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
@@ -288,10 +290,26 @@ uint32_t getDeepSleepCount() {
 // when nRF's stack callbacks stopped running application code -- before that the
 // disconnect path executed on the SoftDevice callback task.
 static bool s_disconnectCleanupPending = false;
+// The owner word as it stood when the cleanup was requested. The flag alone is not
+// enough: it is a bare boolean shared by the BLE and LAN teardown paths, so by the
+// time it is serviced -- deferred past a refresh, possibly several passes later --
+// the session it was raised for may already have been torn down by some OTHER path
+// (the idle timeout or the transfer watchdog, both of which abort and release).
+// Servicing it then would run a destructive teardown against whoever holds the slot
+// NOW, resetting a freshly admitted client's crypto and rings and stalling it.
+//
+// Recording the identity turns "something disconnected" into "THIS session
+// disconnected", which is the only form the abort can act on safely.
+static uint32_t s_cleanupForOwner = 0;
 static bool s_advertisingRestartPending = false;
 static bool s_msdUpdatePending = false;
 
 void requestTransferSessionCleanup(void) {
+    // Capture the owner here rather than at service time: this is the moment the
+    // departing session is still identifiable. Callers on the LAN path still hold
+    // the token at this point (release is the abort's final step), and the BLE
+    // raise site does the same.
+    s_cleanupForOwner = linkOwnerWord();
     s_disconnectCleanupPending = true;
 }
 
@@ -387,39 +405,78 @@ static void pollActivity() {
 // clears it. Also raised by the LAN transport, so it is not a BLE-only path.
 static void serviceBleDisconnectCleanup() {
     if (!s_disconnectCleanupPending || epdRefreshInProgress) return;
+    const uint32_t forOwner = s_cleanupForOwner;
     s_disconnectCleanupPending = false;
-    // BLE and LAN both raise this flag, so tear down only when the transport that
-    // OWNS the in-flight transfer is the one that went away. Otherwise a BLE
-    // disconnect kills a live LAN push (and a LAN disconnect kills a BLE push)
-    // purely because the other link dropped. Owner is recorded at START.
-    //
-    // The guard is NOT inside OPENDISPLAY_HAS_WIFI, though it used to be. Only the
-    // LAN half is WiFi-specific; ble.isConnected() is meaningful on every target, and
-    // gating the whole test left nRF with no guard at all. That mattered: this flag
-    // can be serviced tens of seconds late (loop() blocked in an EPD refresh), by
-    // which time a NEW client may be connected and mid-transfer -- and the
-    // resetPipeWriteState() below would destroy its session, not the departed one's.
-#ifdef OPENDISPLAY_HAS_WIFI
-    const bool lanOwnsSession = (transferSessionOrigin() != 0);   // != ORIGIN_BLE
-    const bool ownerStillUp = lanOwnsSession ? wifiLanClientConnected() : ble.isConnected();
-#else
-    const bool lanOwnsSession = false;
-    const bool ownerStillUp = ble.isConnected();
-#endif
-    if (ownerStillUp) {
-        od_log_info("Disconnect cleanup skipped: transfer still owned by a live %s session",
-                    lanOwnsSession ? "LAN" : "BLE");
+    s_cleanupForOwner = 0;
+    // Act only if the slot still holds exactly what it held when this was raised.
+    // Any difference means that session has already been torn down and released by
+    // another path -- the idle timeout and the transfer watchdog both abort and
+    // release -- so there is nothing left for this to do, and proceeding would
+    // apply the teardown to whoever holds the slot now.
+    if (forOwner == 0) {
+        // Raised while nothing owned the slot -- restartWiFiLanAfterReconnect()
+        // calls disconnectWiFiServer() unconditionally, so this is routine. Zero is
+        // not a session identity and must not authorise a destructive teardown: a
+        // BLE claim landing between the test below and the abort would have its
+        // fresh crypto and rings reset, and the abort's release (passed NONE) would
+        // not even free the slot afterwards. There is by definition no session to
+        // tear down here; genuinely orphaned transfer state is healed by the
+        // orphaned-pipe repair in checkTransferTimeouts().
+        od_log_debug("Disconnect cleanup skipped: raised with no owner");
         return;
     }
-    // ACTIVE-only-teardown invariant: a WARM (post-successful-refresh) panel
-    // SURVIVES disconnect and keeps its keep-alive window, so the cleanups below
-    // no-op on power when WARM and only tear down a mid-transfer (PWR_ACTIVE)
-    // session. No logic change needed for keep-alive.
-    if (directWriteActive) cleanupDirectWriteState(true);
-    // Partial sessions (0x76 or pipe-partial) power the panel without setting
-    // directWriteActive; release it here instead of waiting on the 15-min watchdog.
-    cleanupPartialWriteOnDisconnect();
-    resetPipeWriteState();   // clear any pipe transfer + reorder queue on disconnect
+    if (linkOwnerWord() != forOwner) {
+        od_log_debug("Disconnect cleanup skipped: slot changed hands since it was raised");
+        return;
+    }
+    // BLE and LAN both raise this flag, so tear down only when the transport that
+    // OWNS THE SLOT is the one that went away. Otherwise a BLE disconnect kills a
+    // live LAN push (and a LAN disconnect kills a BLE push) purely because the
+    // other link dropped.
+    //
+    // The question is asked of the OWNER TOKEN and the instance table, not of
+    // transferSessionOrigin() plus ble.isConnected() as it used to be. Two reasons,
+    // and the second is a live defect the aggregate count would reintroduce:
+    //
+    //  - The token is authoritative about who holds the slot, whereas
+    //    transferSessionOrigin() only says who started the last transfer -- so the
+    //    old test could not answer the question at all when no transfer was running,
+    //    which is exactly when a stranded token matters most.
+    //  - ble.isConnected() is the stack's TOTAL peer count. With a refused contender
+    //    transiently attached (which R1 explicitly permits), it stays true after the
+    //    owner leaves, so the old guard would skip the cleanup and the slot would
+    //    never be released -- every later client refused service until reboot. The
+    //    per-instance instanceLive() test is immune to that.
+    //
+    // The comparison also means a LOST disconnect edge cannot strand the slot: if
+    // the owner's instance is no longer live in the table, the owner is gone,
+    // however many events coalesced away while loop() sat in a refresh.
+    const LinkId owner = linkOwnerId();
+    bool ownerStillUp = false;
+    if (owner.who == OWNER_BLE) {
+        ownerStillUp = ble.instanceLive(owner.handle, owner.epoch);
+#ifdef OPENDISPLAY_HAS_WIFI
+    } else if (owner.who == OWNER_LAN) {
+        ownerStillUp = wifiLanClientConnected();
+#endif
+    }
+    if (ownerStillUp) {
+        od_log_info("Disconnect cleanup skipped: slot still held by a live %s session",
+                    owner.who == OWNER_BLE ? "BLE" : "LAN");
+        return;
+    }
+    // Route the teardown through the ONE shared routine (R6). Keeping a second
+    // teardown path here is exactly how the direct-write watchdog once tore down a
+    // panel while leaving its pipe session live.
+    //
+    // dropLink=false: the link is already gone, which is what the test above
+    // establishes. The abort's own release is its last step, so the slot frees here
+    // rather than at the event -- and the WARM-panel survival the old inline code
+    // relied on is preserved inside the abort (cleanupDirectWriteState no-ops on
+    // WARM). With the slot already unowned this is still worth running: it is
+    // idempotent, and it is what clears a transfer left behind by a session whose
+    // token was released on some other path.
+    abortToKnownState("owner disconnected", false, owner);
 }
 
 // Deferral policy for re-arming the radio, formerly buried inside
@@ -459,49 +516,228 @@ static void serviceBleAdvertisingRestart() {
 // s_advertisingRestartPending as its only trace of a connect+drop landing
 // entirely between two passes.
 static void serviceBleEvents() {
-    if (ble.takeConnectedEvent()) {
+    uint32_t connectedWord = 0;
+    (void)ble.takeConnectedEvent(&connectedWord);
+    // Connect-side work is driven by OWNERSHIP, not by the event.
+    //
+    // Only the owner's connect may drive it: a refused contender must not perturb
+    // incumbent-visible state (R3), and every item below is exactly that -- reboot
+    // state, an MSD rebuild that polls I2C and republishes the advertisement, and
+    // link tuning aimed at the owner's link.
+    //
+    // But gating on the EVENT's identity is not enough either. The event word is a
+    // single slot: if the owner connects and a contender connects before the loop
+    // consumes the flag, the word holds only the contender, and the owner's connect
+    // work would be lost for the life of the session -- no fast link, no MSD update.
+    // Comparing against the last owner this work ran for is immune to any number of
+    // coalesced edges, which is the same "state, not events" argument that made the
+    // instance table a table.
+    static uint32_t s_connectWorkDoneFor = 0;
+    const uint32_t owner = linkOwnerWord();
+    const LinkId ownerId = linkUnpackWord(owner);
+    if (owner != 0 && ownerId.who == OWNER_BLE && owner != s_connectWorkDoneFor &&
+        ble.instanceLive(ownerId.handle, ownerId.epoch)) {
+        s_connectWorkDoneFor = owner;
         rebootFlag = 0;
         s_msdUpdatePending = true;
         // SoftDevice PHY/DLE calls on nRF, no-op on ESP32. Deliberately here and
-        // not in the connect callback: the callback contract is copy-and-flag only.
+        // not in the connect callback: the callback contract is copy-and-flag only
+        // (plus the one claim CAS, which is a single word write).
         ble.requestFastLink();
     }
-    uint8_t disconnectReason = 0;
-    uint8_t rxBoundary = 0;
-    if (ble.takeDisconnectedEvent(&disconnectReason, &rxBoundary)) {
-        od_log_info("Disconnect reason: %u", disconnectReason);
-        // Drop anything the departed client left in the RX ring. Without this,
-        // serviceBleRx() runs BEFORE serviceBleDisconnectCleanup() in the pass, so
-        // up to a full window of frames from a dead session would dispatch --
-        // touching pipe/partial state that resetPipeWriteState() is about to
-        // discard anyway, and emitting responses that queueBleNotifyCopy() then
-        // drops for want of a connection.
+    uint16_t disconnectReason = 0;
+    uint32_t disconnectedWord = 0;
+    if (ble.takeDisconnectedEvent(&disconnectReason, &disconnectedWord)) {
+        // 0x%03X so a wrapped NimBLE HCI reason (0x213) and a host-layer one (0x007)
+        // are visibly distinct. Printed as decimal %u from a truncated byte, they
+        // used to collide on screen as well as in storage.
+        od_log_info("Disconnect reason: 0x%03X", (unsigned)disconnectReason);
+        // No RX flush here any more. Frames carry their writer's identity, so
+        // serviceBleRx() drops a departed session's frames at dispatch -- which also
+        // covers the case this site could never handle: a boundary lost because the
+        // stack reused the handle before the loop got here.
         //
-        // Bounded by rxBoundary, the ring head captured when that link went down.
-        // "Discard everything present now" was wrong: loop() can sit inside a ~16 s
-        // EPD refresh, and a disconnect, a reconnect, and the NEW client's first
-        // command all land before this event is serviced -- so the flush ate a frame
-        // from a session that had never disconnected.
-        //
-        // Deliberately here and NOT in serviceBleDisconnectCleanup(): that flag is
-        // raised by the LAN transport too, and a LAN drop must not discard queued
-        // BLE frames. Only a real BLE disconnect event invalidates this ring.
-        const uint8_t droppedRx = bleRxQueueDiscardTo(rxBoundary);
-        if (droppedRx > 0) {
-            od_log_warn("Dropped %u queued command(s) from the disconnected client", droppedRx);
-        }
         // Raise the flag; do NOT tear the session down here. The teardown belongs
         // in serviceBleDisconnectCleanup(), which holds it off while an EPD
         // refresh is mid-flight and checks whether LAN still owns the transfer.
         // Doing it inline would reintroduce the mid-refresh SPI teardown that
         // moving nRF off the callback task was meant to eliminate.
-        s_disconnectCleanupPending = true;
+        //
+        // Raised on OWNER DEPARTURE, not on any disconnect event. R3 requires a
+        // refused contender's disconnect to be inert, and refusal now produces a
+        // real disconnect event of its own -- so an unconditional raise here would
+        // make every refusal schedule a session teardown. That teardown is skipped
+        // a pass later by the live-owner guard, but "correct because something
+        // downstream catches it" is exactly the coupling R3 forbids.
+        //
+        // The test is state, not the event's identity, so it survives coalescing:
+        // if the token's BLE owner no longer has a live table entry, the owner is
+        // gone however many edges were lost. A LAN owner's departure raises the
+        // same flag from its own path (requestTransferSessionCleanup).
+        const LinkId tokenOwner = linkOwnerId();
+        const bool ownerDeparted =
+            (tokenOwner.who == OWNER_BLE &&
+             !ble.instanceLive(tokenOwner.handle, tokenOwner.epoch));
+        if (ownerDeparted) {
+            requestTransferSessionCleanup();   // records the identity it is for
+        } else {
+            od_log_debug("Disconnect event from a non-owner instance; no cleanup scheduled");
+        }
         // Raised unconditionally: serviceBleAdvertisingRestart() owns the
         // capability decision, so this site does not need to know whether the
         // stack re-arms the radio by itself. On such a target the flag is simply
         // cleared unserviced, later in this same pass.
         s_advertisingRestartPending = true;
     }
+}
+
+// Disconnect every live BLE instance that is not the owner (CONNECTION_POLICY R3).
+//
+// SCOPE NOTE. The freeze-hardening plan assigns refusal to Phase 3, and this is
+// Phase 2. It is here because Phase 2 is not safely shippable without it: admission
+// is decided once per instance, at its connect hook, and never revisited, so a
+// client that reconnects into a still-held slot -- the ordinary case when loop()
+// was blocked in a ~16 s refresh -- becomes a permanent contender. On nRF, whose
+// single peripheral link it now occupies, nothing else can connect either, so the
+// device is unreachable until that client happens to leave. The two alternatives
+// were worse: releasing the token in the disconnect callback admits a new owner
+// while the departed session's transfer, crypto and TX ring are still live, and
+// promoting a contender from this scan is exactly what 7a row 10 forbids.
+//
+// What is NOT here is the rest of Phase 3: no idle timeout, no reclaim of a held
+// slot. This only makes refusal actually happen, which is what the "decided once"
+// rule assumes.
+//
+// A TABLE SCAN, not an event handler: a refusal missed because two connects
+// coalesced self-corrects on the next pass, where an event-driven version would
+// leak the contender permanently. Refusal is idempotent and inert -- re-refusing an
+// entry already tearing down costs nothing, and NimBLE reports "already gone" as
+// success -- so no bookkeeping is needed to avoid repeats.
+//
+// Refusal touches NOTHING but the contender's own link: no abort, no
+// s_disconnectCleanupPending, no linkRelease. The incumbent must be unable to
+// observe that a contender arrived, which is why this is a separate helper rather
+// than a branch inside the disconnect path it would otherwise resemble.
+static void serviceContenderRefusal() {
+    // Refuse an entry only once its claim has been DECIDED and it is not the owner.
+    //
+    // Both halves of that test are load-bearing, and each replaces a wrong rule:
+    //
+    //  - Testing ownership alone would disconnect the winner. The connect callback
+    //    publishes its table entry BEFORE attempting the claim (R2's normative
+    //    order), so an entry can be visible while its CAS has not run; comparing it
+    //    against an owner word snapshotted moments earlier can refuse the very
+    //    connection that is taking the slot.
+    //  - Skipping the scan whenever the slot is unowned -- an intermediate fix --
+    //    leaves a decided loser attached forever. That is exactly the sequence this
+    //    whole helper exists for: the owner departs, the abort releases the token,
+    //    and the client that reconnected and lost its one-shot claim is then never
+    //    reaped, because by the time anyone looks the slot is free. On nRF it holds
+    //    the only peripheral link, so the device stops accepting clients entirely.
+    //
+    // An undecided entry is simply skipped; the next pass sees it resolved. That is
+    // safe because refusal has no deadline -- a contender's writes are already
+    // filtered and its frames already fail the dispatch tag check.
+    // ORDER OF THE THREE LOADS IS THE CORRECTNESS ARGUMENT. They cannot be taken
+    // atomically, so each is re-derived in the order that makes a stale read safe:
+    //
+    //   1. the entry word          -- the candidate's identity
+    //   2. its decided-for word    -- must EQUAL (1), which proves the claim
+    //                                 resolved for this exact instance and that the
+    //                                 slot was not retired and reused underneath us
+    //   3. the owner word, read FRESH and last -- if the candidate just won, this
+    //                                 now names it and the entry is skipped
+    //
+    // Reading the owner once up front (as an earlier version did) is the bug: an
+    // entry can publish, win its claim and resolve between that snapshot and the
+    // per-entry loads, and would then be refused despite being the new owner. After
+    // step 3 the candidate can no longer become owner, because each instance
+    // attempts its claim exactly once and step 2 proved that attempt is over.
+    const uint8_t cap = BleTransport::instanceCapacity();
+    for (uint8_t i = 0; i < cap; i++) {
+        const uint32_t w = ble.instanceWordAt(i);
+        if (w == 0) continue;
+        if (ble.instanceClaimDecidedWordAt(i) != w) continue;   // in flight, or slot reused
+        if (w == linkOwnerWord()) continue;                     // it won; not a contender
+        const LinkId id = linkUnpackWord(w);
+        od_log_info("Refusing contender h=%u e=%u (slot held)", (unsigned)id.handle,
+                    (unsigned)id.epoch);
+        (void)ble.disconnect(id.handle, id.epoch);
+    }
+}
+
+// How long an ADMITTED client may stay silent before its link is dropped and the
+// slot reclaimed (CONNECTION_POLICY R4, 7c row 1).
+//
+// CLIENT BEHAVIOUR THIS ASSUMES: py-opendisplay authenticates within one exchange
+// of connecting and, during a transfer, never leaves more than a few seconds
+// between frames. 120 s is therefore two orders of magnitude above any legitimate
+// inter-command gap. If a client change ever pushes real silence toward this
+// value, the assertion in py-opendisplay's suite is what should fail first, not a
+// field report.
+//
+// WHY SO GENEROUS -- the direction of the error inverted when R4 landed, so this
+// is not an oversight in the other direction:
+//   - While the drop was gated on !transferActive(), a short timeout could only
+//     ever kill an idle session, so erring short was cheap.
+//   - R4 removed that gate. This can now terminate an in-progress UPLOAD whose
+//     client went quiet, so erring short costs a legitimate transfer.
+// The accepted cost is bounded and lands on one case: a returning client waits up
+// to 120 s behind a stale-but-ALIVE incumbent. A client that is genuinely gone is
+// reaped by the link layer in ~4-6 s (this firmware requests no supervision
+// timeout, so the central's negotiated value applies), so the lockout never
+// applies to a crashed or out-of-range peer.
+//
+// Firmware-local rather than a wire field, unlike its LAN cousin: OD_LAN_READ_TIMEOUT_S
+// lives in opendisplay_protocol.h because it is a documented client-visible
+// contract, and this plan may not touch that header. The asymmetry is deliberate.
+#ifndef OD_BLE_IDLE_TIMEOUT_MS
+#define OD_BLE_IDLE_TIMEOUT_MS 120000UL
+#endif
+
+// Reclaim a slot held by a client that has gone silent (7c). This is the ONLY way
+// a held slot is ever released short of the client leaving, because admission
+// never evicts -- refusal and reclaim are deliberately independent mechanisms, so
+// an incumbent's fate never depends on whether someone else happened to knock.
+//
+// Runs LAST in the pass (7d step 4) so traffic parsed earlier this pass counts.
+// That ordering is load-bearing for LAN, where inbound bytes can be sitting in the
+// socket when the deadline is evaluated.
+static void serviceIdleTimeout() {
+    // 7c row 3: a refresh is not idleness. loop() does not run for its duration
+    // while wall-clock time passes, so this would otherwise fire the instant a
+    // long refresh ended. endRefresh() re-stamps the clock at the transition; this
+    // guard covers the pass in which the refresh is still running.
+    if (epdRefreshInProgress) return;
+    const LinkId owner = linkOwnerId();
+    // 7c row 4: no owner, no timer. Also excludes OWNER_TERMINAL, where the device
+    // is on its way into deep sleep and there is nothing left to reclaim.
+    if (owner.who != OWNER_BLE && owner.who != OWNER_LAN) return;
+
+    // R4's "each transport enforces its own timer and constant" is satisfied by the
+    // CONSTANTS differing, not by duplicating the clock -- one clock is what keeps
+    // the two from drifting apart in what they consider activity.
+    uint32_t limitMs = OD_BLE_IDLE_TIMEOUT_MS;
+#ifdef OPENDISPLAY_HAS_WIFI
+    if (owner.who == OWNER_LAN) limitMs = (uint32_t)OD_LAN_READ_TIMEOUT_S * 1000UL;
+#endif
+
+    const uint32_t idleMs = linkMsSinceOwnerCommand();
+    if (idleMs <= limitMs) return;   // 7c row 2
+
+    // NO transferActive() GATE, and that is the whole point of R4. A client that
+    // goes silent DURING an upload is precisely the case that wedges the device,
+    // and a transfer gate would exempt exactly it. The partial transfer is
+    // discarded by the abort; partial upload state is never preserved across a
+    // drop. What remains uncaught is narrower -- a client that keeps sending
+    // recognised commands while its transfer never completes -- and that is still
+    // bounded only by the from-START transfer watchdog.
+    //
+    // WARN with the measured value, so field tuning has data rather than guesses.
+    od_log_warn("Idle timeout: %s owner silent %u ms (limit %u ms) - dropping",
+                owner.who == OWNER_BLE ? "BLE" : "LAN",
+                (unsigned)idleMs, (unsigned)limitMs);
+    abortToKnownState("idle timeout", true, owner);
 }
 
 // Bounded drain: service up to COMMAND_QUEUE_SIZE commands per pass so a
@@ -515,16 +751,39 @@ static void serviceBleEvents() {
 // and corrupt multi-frame transfer state mid-stream.
 static void serviceBleRx() {
     uint8_t drained = 0;
+    uint16_t staleDropped = 0;
     while (drained < COMMAND_QUEUE_SIZE) {
         CommandQueueItem* item = bleRxQueuePeek();
         if (item == nullptr) break;
+        // CONNECTION_POLICY R3 requirement 6, and the whole of it: a frame executes
+        // only if its writer is STILL the owner. The write callback already refused
+        // non-owners, so this catches the other half -- a frame that was legitimate
+        // on arrival but whose session ended before loop() drained it. That is
+        // reachable whenever loop() was blocked in a ~16 s refresh: the owner
+        // disconnects, a new client connects (possibly on the same reused handle),
+        // and the old frames are still sitting here.
+        //
+        // This replaced the RX-boundary flush, which could not survive the table
+        // entry being overwritten by handle reuse before the loop scanned. One
+        // compare per frame, and no boundary to lose.
+        if (!linkIsOwnerWord(item->tag)) {
+            bleRxQueueConsume();
+            staleDropped++;
+            continue;
+        }
+        // Publish the frame's identity for the dispatcher's activity-clock test.
+        g_commandInstance = item->tag;
         // imageDataWritten (misleading name) actually services any BLE command.
         // The dispatch banner (commandName() in communication.cpp) already logs
         // which command runs, so no drain-start/-end framing line is needed here.
         imageDataWritten(0, nullptr, item->data, item->len);
+        g_commandInstance = 0;
         bleRxQueueConsume();
         drained++;
         serviceBleTx();
+    }
+    if (staleDropped > 0) {
+        od_log_warn("Dropped %u queued command(s) from a departed session", (unsigned)staleDropped);
     }
 }
 
@@ -537,7 +796,16 @@ static bool platformLoopPrologue() {
     pollActivity();
     // THIS IS THE MAIN (FIRST) LOOP FOR A DEEP SLEEP ENABLED ESP32
     if (woke_from_deep_sleep && advertising_timeout_active) {
-        if (ble.isConnected()) {
+        // An ADMITTED client, not merely a physical link. ble.isConnected() is the
+        // stack's aggregate peer count, so a contender -- including a client that
+        // reconnected into a still-held slot and lost its claim -- would trip this
+        // branch, run fullSetupAfterConnection(), close the wake window and return
+        // before the refusal scan ever gets to reap it. Application-visible setup
+        // work and a changed sleep decision, both driven by a connection that is
+        // never going to be serviced.
+        const LinkId prologueOwner = linkOwnerId();
+        if (prologueOwner.who == OWNER_BLE &&
+            ble.instanceLive(prologueOwner.handle, prologueOwner.epoch)) {
             od_log_info("BLE connection established - switching to full mode");
             advertising_timeout_active = false;
             fullSetupAfterConnection();
@@ -547,6 +815,7 @@ static bool platformLoopPrologue() {
         // A connect+drop entirely inside one poll gap leaves the radio dark for the
         // rest of the window; the flags are otherwise only serviced past this return.
         serviceBleDisconnectCleanup();   // tear down before re-advertising
+        serviceContenderRefusal();       // reap a contender rather than idling behind it
         serviceBleAdvertisingRestart();
         uint32_t advertising_timeout_ms = globalConfig.power_option.sleep_timeout_ms;
         if (advertising_timeout_ms == 0) {
@@ -629,12 +898,42 @@ void loop() {
 
     if (platformLoopPrologue()) return;
 
-    // Drain commands, then service the deferred work the stack callbacks flagged.
-    // Cleanup runs before the advertising restart so a disconnected session is
-    // fully torn down before the radio re-arms.
+    // WITHIN-PASS ORDER IS NORMATIVE (CONNECTION_POLICY R7d), not incidental:
+    //
+    //   1. owner disconnects  -- release + abort FIRST, so a slot freed this pass
+    //                            is available to an admission decision in the same
+    //                            pass, and so a departed session's state is gone
+    //                            before any frame is dispatched against it
+    //   2. refusals           -- contenders reaped before they can linger
+    //   3. inbound traffic    -- stamps the activity clock
+    //   (4. idle timeout      -- Phase 3, and it must run last so traffic parsed in
+    //                            step 3 counts)
+    //
+    // The cleanup used to run AFTER the RX drain. That ordering is what made the
+    // frame tag load-bearing rather than merely defensive, and reversing it removes
+    // a whole class of "old session's frames meet new session's state" hazard
+    // instead of relying on the tag to catch every instance of it.
+    //
+    // Note this order resolves ties WITHIN a pass only. The authoritative
+    // arbitration point is the earliest transport hook -- the connect callback's
+    // claim CAS -- because a BLE connect during a refresh and a LAN socket sitting
+    // in the listen backlog are not comparable by the time loop() resumes.
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Reap a LAN socket the peer has closed BEFORE the cleanup below, so the token
+    // is released in THIS pass and handleWiFiServer()'s accept -- later in the same
+    // pass -- sees a free slot (7d step 1 before step 2).
+    //
+    // Doing this inside handleWiFiServer, where it was first placed, is too late:
+    // the reap only raises the deferred cleanup, so the accept a few lines further
+    // on still tested the corpse's token and refused an ordinary reconnect. A
+    // client that closes and immediately reopens between two pushes is the common
+    // case, and one that does not retry would simply not be served.
+    wifiLanReapClosedSession();
+#endif
+    serviceBleDisconnectCleanup();
+    serviceContenderRefusal();
     serviceBleRx();
     serviceBleTx();
-    serviceBleDisconnectCleanup();
     if (s_msdUpdatePending) {
         s_msdUpdatePending = false;
         updatemsdata();
@@ -674,6 +973,19 @@ void loop() {
     #else
     const bool wifiLanSession = false;
     #endif
+
+    // 7d step 4, and it must stay LAST of the four. Traffic parsed earlier in this
+    // pass -- BLE in serviceBleRx(), LAN in handleWiFiServer() just above -- has
+    // already stamped the activity clock, so a client whose command arrived this
+    // pass is never judged idle on the strength of it not having been read yet.
+    // Moving this above handleWiFiServer() would reintroduce exactly that for LAN.
+    serviceIdleTimeout();
+    // After the idle check, and last of the session-policy steps. It ends in the
+    // abort like the idle drop does, so it must not run before inbound traffic has
+    // been parsed this pass -- an accepted command clears the rejection run, and
+    // dropping a client that just authenticated would be the worst possible
+    // outcome for a mechanism whose entire value is speed.
+    serviceBleAuthAbuseDisconnect();
 
     // Work in flight *this iteration* only. Every term is transient and most are
     // cleared earlier in this same pass, so this must never be the sole gate on
@@ -802,6 +1114,28 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
         return;
     }
     // Panel power-down MUST sit below every early-return above (including the
+    // ORDER IS NORMATIVE (CONNECTION_POLICY 7e row 3): gate admission, THEN abort,
+    // THEN take the stack down.
+    //
+    // linkMarkTerminal() first, or there is a race: the abort's last step frees the
+    // owner word while this link may still be up and advertising is still on, so a
+    // connect on the host task could win the freed word and the new owner would be
+    // destroyed by ble.end() below with no abort ever run for it. The terminal
+    // exchange makes every later claim fail, and it returns the identity it
+    // displaced -- which the abort must be handed, because from here on
+    // linkOwnerId() reads terminal rather than the departing owner.
+    //
+    // Why the abort at all, given wake reloads RAM: not because state survives
+    // (it does not -- only RTC_DATA_ATTR does), but because deep sleep is a
+    // MID-SESSION exit whose path otherwise hand-rolls a private teardown subset
+    // that has to be kept in sync with the real one forever. Forced sleep bypasses
+    // the live-link guard above and this path never arbitrates a LAN owner, so it
+    // can begin with a transfer in flight. dropLink=false because ble.end() takes
+    // the stack down immediately: there is no link left to drop politely, and no
+    // loop pass will service the resulting event.
+    const LinkId displaced = linkMarkTerminal();
+    abortToKnownState("deep sleep", false, displaced);
+    // Panel power-down MUST sit below every early-return above (including the
     // min-wake hold): on mains (power_mode != 1) enterDeepSleep bails before here,
     // so a WARM panel stays warm and the keep-alive tick in idleDelay(2000) expires
     // it after the configured window. On battery this is the routine
@@ -809,7 +1143,23 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     // window) and also closes the pre-existing "deep sleep never powers the panel
     // down" hazard. Net effect on battery ESP32: effective keep-alive =
     // min(configured window, idle-hold).
+    //
+    // Stays HERE, in the sleep path, and must never move into the abort: this kills
+    // every power state including PWR_WARM, whereas the abort deliberately lets a
+    // WARM keep-alive panel survive. Sleep is the one transition where no panel may
+    // stay powered.
     epdSessionForceOff();
+    // Sleep quiescing, not session teardown: the abort deliberately leaves buzzer
+    // and LED running (they are user-facing effects, and a client that fires a buzz
+    // then drops the link is a normal pattern). But deep sleep cuts the clocks they
+    // run on -- buzzerService() never ticks again from here -- so a tone left on is
+    // not a melody finishing, it is a driven pin held through teardown and into
+    // sleep, sounding continuously and drawing current until the next wake.
+    // Silencing here rather than waiting means sleep is never delayed by an effect.
+    //
+    // Deep sleep ONLY: power-latch off deliberately plays a chirp on the way down.
+    buzzerStopForSleep();
+    ledStopForSleep();
     woke_from_deep_sleep = true; // Will be true on next boot
     ble.stopAdvertising();
     delay(200);

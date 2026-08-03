@@ -413,6 +413,16 @@ static bool touch_light_resume_gt911(uint8_t idx, TouchController* tc, TouchRunt
     return true;
 }
 
+void touchForceResume(void) {
+    if (s_epd_refresh_suspend == 0) {
+        return;   // already resumed; idempotent by contract
+    }
+    // Collapse the counter to 1 and let the normal path do the actual resume work,
+    // so the re-init sequence lives in exactly one place.
+    s_epd_refresh_suspend = 1;
+    touchResumeAfterEpdRefresh();
+}
+
 void touchResumeAfterEpdRefresh(void) {
     if (s_epd_refresh_suspend == 0) {
         return;

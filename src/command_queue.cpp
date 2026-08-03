@@ -47,7 +47,7 @@ static volatile uint8_t s_rxTail = 0;
 // healthy path reads [BLE][Q:0] and a rising Q means arrivals are outrunning
 // loop()'s drain. RX is BLE-only by construction -- LAN frames reach the dispatcher
 // without touching this ring -- so the tag is a literal, not originTag().
-bool bleRxQueuePush(const uint8_t* data, uint16_t len) {
+bool bleRxQueuePush(const uint8_t* data, uint16_t len, uint32_t tag) {
     if (len == 0) {
         od_log_warn("WARNING: Empty BLE frame received, dropping");
         return false;
@@ -89,6 +89,10 @@ bool bleRxQueuePush(const uint8_t* data, uint16_t len) {
     memcpy(s_rx[head].data, data, len);
     s_rx[head].len = len;
     s_rx[head].pending = true;
+    // Before the RELEASE store, with the payload: the consumer's ACQUIRE load of
+    // the head is what makes all of these visible, and a tag published after it
+    // could be read stale -- dispatching a frame against the wrong identity.
+    s_rx[head].tag = tag;
     __atomic_store_n(&s_rxHead, nextHead, __ATOMIC_RELEASE);
     return true;
 }
@@ -108,31 +112,29 @@ void bleRxQueueConsume(void) {
     __atomic_store_n(&s_rxTail, (uint8_t)((tail + 1) % COMMAND_QUEUE_SIZE), __ATOMIC_RELEASE);
 }
 
-uint8_t bleRxQueueDiscardTo(uint8_t boundary) {
-    // Discard up to `boundary` -- a head value captured when the departed client's
-    // link went down -- NOT up to the current head. Discarding to the current head
-    // is what broke: loop() can be blocked for tens of seconds inside an EPD refresh,
-    // during which the old client's disconnect, the next client's connect, and that
-    // client's first command all land. Servicing the stale disconnect then threw away
-    // a frame that had never belonged to the departed session.
+uint8_t bleRxQueueReset(void) {
+    // Consumer-side discard ONLY -- see the contract in command_queue.h. Snapshot
+    // the producer's head with ACQUIRE, store it into the tail with RELEASE, and
+    // touch neither the head nor any slot payload. Writing both indices (or
+    // clearing slots) would race a producer that is mid-memcpy into s_rx[head]
+    // before its own RELEASE publishes the frame.
     //
-    // ACQUIRE the head for the same reason peek does. Safe against a concurrent
-    // producer: it only ever advances the head, so frames pushed after this load
-    // survive to the next pass rather than being lost or double-counted.
+    // A frame the departing owner pushes after this snapshot survives, by design:
+    // it carries that instance's tag, so serviceBleRx() drops it once the token is
+    // released. That is the same construction that makes an expired R3a wait
+    // harmless, and it is why this reset needs no retry or second pass.
     uint8_t tail = __atomic_load_n(&s_rxTail, __ATOMIC_RELAXED);
     uint8_t head = __atomic_load_n(&s_rxHead, __ATOMIC_ACQUIRE);
     if (tail == head) return 0;
-    const uint8_t occupied = (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
-    const uint8_t wanted   = (uint8_t)((boundary - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
-    // The consumer already drained past the boundary: nothing of the old session is
-    // left. Without this test the modular subtraction above would read as a nearly
-    // full ring and discard the live client's frames -- the very bug being fixed.
-    if (wanted > occupied) return 0;
-    for (uint8_t i = tail; i != boundary; i = (uint8_t)((i + 1) % COMMAND_QUEUE_SIZE)) {
-        s_rx[i].pending = false;
-    }
-    __atomic_store_n(&s_rxTail, boundary, __ATOMIC_RELEASE);
-    return wanted;
+    const uint8_t dropped = (uint8_t)((head - tail + COMMAND_QUEUE_SIZE) % COMMAND_QUEUE_SIZE);
+    // Advance the tail and touch NOTHING else. Clearing each discarded slot's
+    // `pending` (as a first draft did, copying bleRxQueueDiscardTo) writes producer
+    // territory: the producer owns every slot from `head` onward, and a slot this
+    // loop walks can already have been handed to a concurrent push. It is only
+    // harmless today because nothing reads `pending`, which is precisely the kind
+    // of latent violation that turns into a corrupted frame the moment it does.
+    __atomic_store_n(&s_rxTail, head, __ATOMIC_RELEASE);
+    return dropped;
 }
 
 uint8_t bleRxQueueHead(void) {
@@ -173,6 +175,15 @@ bool bleTxQueuePush(const uint8_t* data, uint16_t len) {
     s_tx[s_txHead].pending = true;
     s_txHead = nextHead;
     return true;
+}
+
+void bleTxQueueReset(void) {
+    // Both ends are the loop task, so this is a plain drain -- no ordering rules,
+    // unlike the RX side.
+    while (s_txTail != s_txHead) {
+        s_tx[s_txTail].pending = false;
+        s_txTail = (uint8_t)((s_txTail + 1) % RESPONSE_QUEUE_SIZE);
+    }
 }
 
 uint8_t bleTxQueueDepth(void) {
