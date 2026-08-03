@@ -205,6 +205,9 @@ static void e1004InitPanel(void) {
     const DisplayConfig& d = globalConfig.displays[0];
     bbepSetCS2(&bbep, e1004_cs2_pin());
     odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this block if it's no longer needed.
+    od_log_debug("[EPD session][WDT] e1004InitPanel: INIT_SEQ (dual-controller)");
     odWatchdogFeed();   // bbepInitIO sends pInitFull internally (~240 s worst case)
     bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
 }
@@ -365,6 +368,9 @@ static void initBbepPanelSession() {
     }
 #endif
     odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this block if it's no longer needed.
+    od_log_debug("[EPD session][WDT] initBbepPanelSession: INIT_SEQ");
     odWatchdogFeed();   // bbepInitIO sends pInitFull internally (~240 s worst case)
     bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
     odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
@@ -447,6 +453,9 @@ static void pwrmgmLockGive(void) {
 static void epdSessionForceOffLocked(void) {
     if (pwrmgmState == PWR_OFF) return;   // idempotent
     odWatchdogBreadcrumb(OD_WDT_PHASE_FORCE_OFF);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] FORCE_OFF: pwrmgmState=%u -> tearing down", (unsigned)pwrmgmState);
     od_log_info("[EPD session] force off");
     if (epdSessionUsesFastepd()) {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
@@ -465,7 +474,12 @@ static void epdSessionForceOffLocked(void) {
     // Panel work is finished. Without this, a later wedge in BLE/WiFi/command
     // handling would boot reporting breadcrumb=FORCE_OFF and point the next
     // investigation at the panel teardown that had actually already completed.
-    odWatchdogBreadcrumb(OD_WDT_PHASE_IDLE);
+    // IDLE_OFF (not plain IDLE) so a freeze here is distinguishable at the next
+    // boot from a freeze during PWR_WARM keep-alive (see epdSessionRelease).
+    odWatchdogBreadcrumb(OD_WDT_PHASE_IDLE_OFF);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] IDLE_OFF: pwrmgmState=%u", (unsigned)pwrmgmState);
 }
 
 // Bring the panel up for a transfer/refresh. Returns true iff it was COLD (rail
@@ -489,6 +503,9 @@ static bool epdSessionAcquire(bool partialInit) {
     bool cold;
     if (pwrmgmState == PWR_OFF) {
         odWatchdogBreadcrumb(OD_WDT_PHASE_ACQUIRE_COLD);
+        // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+        // hardware watchdog work -- safe to delete this line if it's no longer needed.
+        od_log_debug("[EPD session][WDT] ACQUIRE_COLD: partialInit=%d", (int)partialInit);
         od_log_info("[EPD session] acquire: COLD bring-up");
         pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
         if (!epdSessionUsesFastepd()) {
@@ -501,6 +518,9 @@ static bool epdSessionAcquire(bool partialInit) {
 #endif
             {
                 odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+                // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+                // hardware watchdog work -- safe to delete this line if it's no longer needed.
+                od_log_debug("[EPD session][WDT] INIT_SEQ (cold): bbepInitIO+bbepWakeUp+CMDSequence");
                 odWatchdogFeed();   // bbepInitIO sends pInitFull internally (~240 s worst case)
                 bbepInitIO(&bbep, d.dc_pin, d.reset_pin, d.busy_pin, d.cs_pin, d.data_pin, d.clk_pin, 8000000);
                 odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
@@ -517,6 +537,10 @@ static bool epdSessionAcquire(bool partialInit) {
     } else {
         // WARM re-acquire (or, defensively, an already-ACTIVE re-entry).
         odWatchdogBreadcrumb(OD_WDT_PHASE_ACQUIRE_WARM);
+        // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+        // hardware watchdog work -- safe to delete this line if it's no longer needed.
+        od_log_debug("[EPD session][WDT] ACQUIRE_WARM: pwrmgmState=%u partialInit=%d",
+                     (unsigned)pwrmgmState, (int)partialInit);
         od_log_info(pwrmgmState == PWR_ACTIVE ? "[EPD session] acquire: already ACTIVE (defensive)"
                                               : "[EPD session] acquire: WARM re-acquire");
         pwrmgmState = PWR_ACTIVE;
@@ -531,6 +555,9 @@ static bool epdSessionAcquire(bool partialInit) {
 #endif
             {
                 odWatchdogBreadcrumb(OD_WDT_PHASE_INIT_SEQ);
+                // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+                // hardware watchdog work -- safe to delete this line if it's no longer needed.
+                od_log_debug("[EPD session][WDT] INIT_SEQ (warm): bbepWakeUp+CMDSequence");
                 odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
                 bbepWakeUp(&bbep);
                 const uint8_t* initSeq = partialInit ? (bbep.pInitPart ? bbep.pInitPart : bbep.pInitFull)
@@ -554,18 +581,28 @@ static void epdSessionRelease(bool refreshSuccess) {
     pwrmgmLockTake();
     if (pwrmgmState == PWR_OFF) { pwrmgmLockGive(); return; }   // nothing to release
     odWatchdogBreadcrumb(OD_WDT_PHASE_RELEASE);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] RELEASE: refreshSuccess=%d", (int)refreshSuccess);
     uint32_t window = epdKeepAliveWindowMs();
     if (window == 0 || !refreshSuccess) {
         od_log_info(refreshSuccess ? "[EPD session] release: keep-alive disabled, powering off"
                                    : "[EPD session] release: refresh failed, powering off");
+        // epdSessionForceOffLocked() stamps OD_WDT_PHASE_IDLE_OFF itself; nothing
+        // to add here or the plain-IDLE stamp below would clobber it.
         epdSessionForceOffLocked();
     } else {
         pwrmgmState = PWR_WARM;
         pwrmgmOffDeadlineMs = millis() + window;
         // Controller stays AWAKE (no bbepSleep; is_awake stays 1); rail/SPI stay up.
         od_log_info("[EPD session] release: panel warm-idle, off in %u ms", (unsigned)window);
+        // See the note in ForceOffLocked -- IDLE_WARM, not plain IDLE, so a freeze
+        // during keep-alive is distinguishable from one during PWR_OFF.
+        odWatchdogBreadcrumb(OD_WDT_PHASE_IDLE_WARM);
+        // WDT-DEBUG: EPD session stage instrumentation, added alongside the
+        // hardware watchdog work -- safe to delete this line if it's no longer needed.
+        od_log_debug("[EPD session][WDT] IDLE_WARM: off in %u ms", (unsigned)window);
     }
-    odWatchdogBreadcrumb(OD_WDT_PHASE_IDLE);   // see the note in ForceOffLocked
     pwrmgmLockGive();
 }
 
@@ -596,6 +633,9 @@ static bool refreshBootScreenFull() {
         return false;
     }
     odWatchdogBreadcrumb(OD_WDT_PHASE_BOOT_REFRESH);
+    // WDT-DEBUG: EPD session stage instrumentation, added alongside the hardware
+    // watchdog work -- safe to delete this line if it's no longer needed.
+    od_log_debug("[EPD session][WDT] BOOT_REFRESH: entering bbepRefresh(REFRESH_FULL)");
     od_log_info("EPD refresh: FULL (boot)");
     touchSuspendForEpdRefresh();
     odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)

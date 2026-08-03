@@ -82,6 +82,31 @@ static void logResetReason(uint32_t r) {
     od_log_info("[WDT] reset reason: %s (0x%08lX)", buf, (unsigned long)r);
 }
 
+// Names OdWatchdogPhase values (watchdog.h) for the boot-time breadcrumb log.
+// Kept as a plain table, same pattern as logResetReason()'s kinds[] above, so a
+// new phase added to the enum is one line here, not a guess at the call site.
+static const char* phaseName(uint8_t phase) {
+    switch (phase) {
+        case OD_WDT_PHASE_IDLE:         return "IDLE";
+        case OD_WDT_PHASE_ACQUIRE_COLD: return "ACQUIRE_COLD";
+        case OD_WDT_PHASE_ACQUIRE_WARM: return "ACQUIRE_WARM";
+        case OD_WDT_PHASE_INIT_SEQ:     return "INIT_SEQ";
+        case OD_WDT_PHASE_FILL:         return "FILL";
+        case OD_WDT_PHASE_STREAM:       return "STREAM";
+        case OD_WDT_PHASE_REFRESH_WAIT: return "REFRESH_WAIT";
+        case OD_WDT_PHASE_RELEASE:      return "RELEASE";
+        case OD_WDT_PHASE_FORCE_OFF:    return "FORCE_OFF";
+        case OD_WDT_PHASE_BOOT_REFRESH: return "BOOT_REFRESH";
+        case OD_WDT_PHASE_IDLE_OFF:     return "IDLE_OFF";
+        case OD_WDT_PHASE_IDLE_WARM:    return "IDLE_WARM";
+        case OD_WDT_PHASE_PWRMGM_AXP2101: return "PWRMGM_AXP2101";
+        case OD_WDT_PHASE_PWRMGM_RAIL:    return "PWRMGM_RAIL";
+        case OD_WDT_PHASE_PWRMGM_PINS:    return "PWRMGM_PINS";
+        case OD_WDT_PHASE_PWRMGM_WIRE:    return "PWRMGM_WIRE";
+        default:                        return "UNKNOWN";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Retained state: GPREGRET2
 // ---------------------------------------------------------------------------
@@ -214,8 +239,9 @@ void odWatchdogBootInit(void) {
         od_log_warn("[WDT] GPREGRET2 unreadable - breadcrumb and strike count unavailable");
     } else if ((g2 & OD_WDT_G2_TAG_MASK) == OD_WDT_G2_TAG_VALUE) {
         strikes = (uint8_t)((g2 & OD_WDT_G2_CNT_MASK) >> OD_WDT_G2_CNT_SHIFT);
-        od_log_info("[WDT] breadcrumb from previous run: phase=%u strikes=%u",
-                    (unsigned)(g2 & OD_WDT_G2_PHASE_MASK), (unsigned)strikes);
+        uint8_t phase = (uint8_t)(g2 & OD_WDT_G2_PHASE_MASK);
+        od_log_info("[WDT] breadcrumb from previous run: phase=%s (%u) strikes=%u",
+                    phaseName(phase), (unsigned)phase, (unsigned)strikes);
     } else {
         od_log_info("[WDT] no retained breadcrumb (cold start or first boot)");
         if (!g2Write(OD_WDT_G2_TAG_VALUE)) {

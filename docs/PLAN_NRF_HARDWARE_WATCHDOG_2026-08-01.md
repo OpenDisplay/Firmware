@@ -10,6 +10,30 @@ reset-reason decode relocates out of `main.cpp`.
 **Goal:** recover the device when an *unbounded* wait — in `loop()`, or below it in a
 vendored driver we cannot instrument — wedges the panel permanently.
 
+---
+**STATUS UPDATE (2026-08-03): timeout changed to 120 s, below this plan's D-1 value.**
+`OPENDISPLAY_NRF_WDT_S` was dropped from the 300 s this plan derives and validates (§3.2,
+§10 D-1) to **120 s**. This is a deliberate, confirmed choice made outside this plan's
+analysis, not a correction to it — everything below about the 240 s worst case, the 1.25×
+margin at 300 s, and W-2's pre-call feed policy is still accurate background, but the
+headline numbers ("300 s", "1.25× margin") no longer describe the shipped value.
+
+**Consequence: the margin this plan relies on is gone.** At 120 s, a healthy
+`REFRESH_FULL` on the 7-colour split-buffer panel (§3.1's ~240 s worst case) will trip the
+watchdog *mid-refresh* on a device that isn't wedged. T2 (§8) — measuring that panel's real
+span — is now a prerequisite for shipping to it, not a confirmation exercise; the "possible
+sizing error" residual in §10 is elevated from unlikely to expected. Do not ship this
+timeout to a 7-colour split-buffer panel without re-deriving it.
+
+**Also since rev 2:** two idle breadcrumb phases (`IDLE_OFF`/`IDLE_WARM`) replaced the
+single shared `OD_WDT_PHASE_IDLE` used at `epdSessionForceOffLocked()`/`epdSessionRelease()`,
+and four more (`PWRMGM_AXP2101`/`RAIL`/`PINS`/`WIRE`) were added inside `pwrmgm()` itself
+(`main.cpp`) after a watchdog reset landed there — `pwrmgm()` had no breadcrumb coverage in
+the original design. All 16 phase values in the 4-bit field are now in use (`watchdog.h`).
+See the retained-breadcrumb reset-reason logging fix below for a related gap that was
+losing the very reset-reason line this plan's boot log depends on.
+---
+
 ## 1. What this closes
 
 Two accepted residuals and one new finding converge on the same gap.

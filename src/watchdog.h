@@ -44,7 +44,8 @@
 // that something did. Values must fit 4 bits (0-15); see the GPREGRET2 layout in
 // watchdog_nrf.cpp.
 enum OdWatchdogPhase : uint8_t {
-    OD_WDT_PHASE_IDLE         = 0,
+    OD_WDT_PHASE_IDLE         = 0,   // pre-session: stamped once at boot, before
+                                     // the first epdSessionAcquire/Release/ForceOff
     OD_WDT_PHASE_ACQUIRE_COLD = 1,
     OD_WDT_PHASE_ACQUIRE_WARM = 2,
     OD_WDT_PHASE_INIT_SEQ     = 3,
@@ -54,6 +55,20 @@ enum OdWatchdogPhase : uint8_t {
     OD_WDT_PHASE_RELEASE      = 7,
     OD_WDT_PHASE_FORCE_OFF    = 8,
     OD_WDT_PHASE_BOOT_REFRESH = 9,
+    // pwrmgmState is plain RAM, not retained across a reset, so without a
+    // distinct phase per idle sub-state a freeze during either one reports the
+    // same generic OD_WDT_PHASE_IDLE and the two are indistinguishable after the
+    // fact. These name which idle state the session was actually left in.
+    OD_WDT_PHASE_IDLE_OFF     = 10,  // session fully powered down (PWR_OFF)
+    OD_WDT_PHASE_IDLE_WARM    = 11,  // panel kept awake for keep-alive (PWR_WARM)
+    // pwrmgm(true)'s rail bring-up sequence, uninstrumented until the 2026-08-03
+    // freeze (reset ~120s after ACQUIRE_COLD, never reaching INIT_SEQ -- the wedge
+    // was somewhere inside pwrmgm() itself). These name which of its four
+    // sub-steps was entered last. Uses the last 4 of the 16 available phase values.
+    OD_WDT_PHASE_PWRMGM_AXP2101 = 12,  // before initAXP2101() (I2C PMIC bring-up)
+    OD_WDT_PHASE_PWRMGM_RAIL    = 13,  // before pwr_pin HIGH + delay(800)
+    OD_WDT_PHASE_PWRMGM_PINS    = 14,  // before panel GPIO setup + delay(100/200)
+    OD_WDT_PHASE_PWRMGM_WIRE    = 15,  // before initOrRestoreWireForOpenDisplay()
     OD_WDT_PHASE__MAX         = 15,
 };
 

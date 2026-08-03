@@ -90,6 +90,25 @@ void setup() {
     // is documented to flap on a healthy link, so a hook there would silently
     // discard good output.
     od_log_set_ready_hook([]() -> bool { return (bool)Serial; });
+    #if OD_LOG_LEVEL >= OD_LOG_DEBUG
+    // Bounded wait for a host terminal to reconnect after ANY reset. USB
+    // re-enumerates from scratch on reset, and without this, the reset-reason and
+    // breadcrumb lines logged just below (odWatchdogBootInit()) -- the whole point
+    // of the watchdog work -- race the host's reconnect and are silently discarded
+    // by the dark-port check in od_emit(). Those drops are NOT counted (see the
+    // comment there), so they vanish with no trace.
+    //
+    // Debug builds only (OD_LOG_LEVEL >= OD_LOG_DEBUG, e.g. nrf52840custom-debug):
+    // production boots should never pay a boot-time cost for a terminal that isn't
+    // there. Capped at 2 s even here, unlike OPENDISPLAY_BOOT_DIAG's unbounded
+    // `while (!Serial)`, and returns immediately once a host is already connected.
+    {
+        uint32_t serialWaitStart = millis();
+        while (!Serial && (millis() - serialWaitStart) < 2000u) {
+            delay(10);
+        }
+    }
+    #endif
     #endif
     #endif
     // Immediately after od_log_init(), so the boot lines below are not emitted at a
@@ -1260,10 +1279,20 @@ void pwrmgm(bool onoff){
     }
     if(axp2101_found){
         if(onoff){
+            // WDT-DEBUG: pwrmgm() step instrumentation, added alongside the hardware
+            // watchdog work -- safe to delete this block if it's no longer needed.
+            // Breadcrumb stamped BEFORE the debug log: the log call itself reaches
+            // tud_cdc_write_flush() -> usbd_edpt_claim() -> a WAIT_FOREVER mutex
+            // (see conversation, 2026-08-03), so it is not guaranteed to return
+            // either. Stamping first means the phase survives even if the log
+            // line is what hangs.
+            odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_AXP2101);
+            od_log_debug("[pwrmgm][WDT] PWRMGM_AXP2101: entering initAXP2101(bus=%u)", (unsigned)axp2101_bus_id);
         od_log_info("Powering up AXP2101 PMIC...");
             initAXP2101(axp2101_bus_id);
         }
         else{
+            od_log_debug("[pwrmgm][WDT] AXP2101 power-down");
             od_log_info("Powering down AXP2101 PMIC...");
             powerDownAXP2101();
             Wire.end();
@@ -1281,12 +1310,21 @@ void pwrmgm(bool onoff){
 #endif
     const DisplayConfig& disp = globalConfig.displays[0];
     if (onoff) {
+        // WDT-DEBUG: pwrmgm() step instrumentation -- see the note above on
+        // breadcrumb-before-log ordering. Safe to delete this whole block (all
+        // odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_*) + od_log_debug("[pwrmgm][WDT]...")
+        // pairs below) if it's no longer needed.
+        odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_RAIL);
+        od_log_debug("[pwrmgm][WDT] PWRMGM_RAIL: pwr_pin=%u", (unsigned)globalConfig.system_config.pwr_pin);
         if (globalConfig.system_config.pwr_pin != 0xFF) {
             digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
             delay(800);
         } else {
             od_log_warn("Power pin not set");
         }
+        od_log_debug("[pwrmgm][WDT] PWRMGM_RAIL: delay(800) returned");
+        odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_PINS);
+        od_log_debug("[pwrmgm][WDT] PWRMGM_PINS: fastepd_driver_spi=%d", (int)fastepd_driver_spi);
         if (!fastepd_driver_spi) {
             if (disp.reset_pin != 0xFF) {
                 pinMode(disp.reset_pin, OUTPUT);
@@ -1319,17 +1357,27 @@ void pwrmgm(bool onoff){
             }
             delay(200);
         }
+        od_log_debug("[pwrmgm][WDT] PWRMGM_PINS: pin setup + delay done");
+        odWatchdogBreadcrumb(OD_WDT_PHASE_PWRMGM_WIRE);
+        od_log_debug("[pwrmgm][WDT] PWRMGM_WIRE: entering initOrRestoreWireForOpenDisplay()");
         initOrRestoreWireForOpenDisplay();
+        od_log_debug("[pwrmgm][WDT] PWRMGM_WIRE: returned");
     } else {
+        // WDT-DEBUG: pwrmgm() power-down step instrumentation. No spare breadcrumb
+        // phase values remain (all 16 are used), so this path is debug-log-only --
+        // safe to delete if it's no longer needed.
+        od_log_debug("[pwrmgm][WDT] power-down: SPI.end()");
         if (!fastepd_driver_spi) {
             SPI.end();
         }
         // Keep I2C alive when sensors/touch use data_bus[0] (e.g. reTerminal MISC_I2C on GPIO0/1).
         if (!openDisplayI2cBusConfigured()) {
+            od_log_debug("[pwrmgm][WDT] power-down: Wire.end()");
             Wire.end();
             invalidateOpenDisplayWire();
         }
         if (globalConfig.system_config.pwr_pin != 0xFF) {
+            od_log_debug("[pwrmgm][WDT] power-down: configureDisplayPinsLowPower()");
             configureDisplayPinsLowPower();
             digitalWrite(globalConfig.system_config.pwr_pin, LOW);
         }
