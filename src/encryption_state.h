@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "structs.h"
+#include "nonce_window.h"
 #ifdef TARGET_ESP32
 #include "mbedtls/ccm.h"
 #endif
@@ -18,7 +19,15 @@ struct EncryptionSession {
 #endif
     uint64_t nonce_counter;
     uint64_t last_seen_counter;
-    uint64_t replay_window[64];
+    // Anti-replay: bit i == "counter (last_seen_counter - i) has been consumed".
+    // Bit 0 is last_seen_counter itself. The backward window is implicitly
+    // OD_NONCE_BACKWARD_BITS - 1; there is no separate window constant to keep
+    // in step, and no insertion index to reset. Replaces a uint64_t[64] value
+    // ring (512 B -> 32 B). last_seen_counter only ever moves UP; see
+    // src/nonce_window.h for the decision rule and why that is the whole
+    // anti-replay argument, and docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md
+    // Step 1 / Decision B.
+    uint64_t replay_bitmap[OD_NONCE_BITMAP_WORDS];
     uint32_t last_activity;
     uint8_t integrity_failures;
     uint32_t session_start_time;

@@ -257,9 +257,8 @@ void clearEncryptionSession();
 bool checkEncryptionSessionTimeout();
 void updateEncryptionSessionActivity();
 bool handleAuthenticate(uint8_t* data, uint16_t len);
-bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plaintext, uint16_t* plaintext_len, uint8_t* nonce, uint8_t* auth_tag, uint16_t command_header);
+bool decryptCommand(uint8_t* ciphertext, uint16_t ciphertext_len, uint8_t* plaintext, uint16_t* plaintext_len, uint8_t* nonce, uint8_t* auth_tag, uint16_t command_header, NonceResult* reason_out);
 bool encryptResponse(uint8_t* plaintext, uint16_t plaintext_len, uint8_t* ciphertext, uint16_t* ciphertext_len, uint8_t* nonce, uint8_t* auth_tag);
-bool verifyNonceReplay(uint8_t* nonce);
 void incrementNonceCounter();
 void getCurrentNonce(uint8_t* nonce);
 

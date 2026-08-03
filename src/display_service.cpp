@@ -2661,6 +2661,24 @@ static void sendPipeAck(void) {
 static void sendPipeNack(uint8_t err) {
     uint8_t r[8] = {RESP_NACK, 0x81, err, 0, 0, 0, 0, 0};
     pipeBuildAckPayload(r + 3);
+    // The only record that this session died and why. Everything below is
+    // observable from the client or a sniffer but nothing was observable from the
+    // device, so a failed upload could not be told apart from a stall or a link
+    // drop without one. Logged BEFORE the send so the line survives whatever the
+    // response path does, and at ERROR because this is always terminal.
+    //
+    // Cannot flood: pipeState.error is set immediately below and makes every
+    // later 0x0081 frame discard, so at most one of these per session.
+    //
+    // err 0x04 (out of window on both sides) deserves particular suspicion. A
+    // conforming client cannot produce it -- it only transmits seq within W of
+    // its own base, and the device's expected_seq is provably within W of that
+    // base too -- so seeing 0x04 means either a non-conforming peer or that the
+    // client's window rule has drifted from what this firmware assumes.
+    od_log_error("ERROR: PIPE NACK err=0x%02X (expected=%u highest_seen=%u queued=%u W=%u%s) - session fatal",
+                 (unsigned)err, (unsigned)pipeState.expected_seq, (unsigned)r[3],
+                 (unsigned)pipeState.queued_count, (unsigned)pipeState.window,
+                 pipeState.partial ? " partial" : "");
     sendResponse(r, sizeof(r));
     pipeState.error = true;
     // Partial transfers own partialCtx, not the full-frame direct-write session:

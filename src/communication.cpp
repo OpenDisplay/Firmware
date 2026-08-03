@@ -763,7 +763,36 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         // screen. It moves to the failure path below, where it is the only thing that
         // separates a replay-window jump from nonce reuse from a wrong session key,
         // and where nRF (which has no RX hex line at all) would otherwise be blind.
-        if (!decryptCommand(data + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command)) {
+        NonceResult decrypt_reason = NONCE_OK;
+        if (!decryptCommand(data + BLE_CMD_HEADER_SIZE + ENCRYPTION_NONCE_SIZE, encrypted_data_len, plaintext, &plaintext_len, nonce_full, auth_tag, command, &decrypt_reason)) {
+            // Step 4b / [H1]: a pipe DATA frame rejected because its nonce fell
+            // outside the window IS ordinary packet loss - it is the direct
+            // consequence of frames having been dropped. pipe-write-protocol.md
+            // §5.2 already reserves NACKs for unrecoverable conditions, "not
+            // ordinary packet loss", and §5.1 makes a 0x81 NACK unconditionally
+            // fatal, so answering one here violates the spec as written. Send
+            // NOTHING: silence is a first-class signal on the pipe path. The seq
+            // is absent from the next SACK mask, the client retransmits it under a
+            // FRESH, higher counter, and that counter is accepted unconditionally
+            // (nonce_window.h has no forward bound), so the transfer continues.
+            // Answering with the 3-byte NACK instead makes the client raise
+            // IntegrityCheckError, which its pipe send loop does not catch,
+            // killing the whole upload on the first rejected frame.
+            //
+            // Rare by construction now: the only surviving nonce rejections are a
+            // duplicate delivery and a counter more than OD_NONCE_BACKWARD_BITS
+            // behind, neither of which this transport produces. It stays because
+            // being wrong here costs the whole upload.
+            //
+            // Deliberately narrow:
+            //  - TAG failures keep the NACK. They are tamper evidence, not loss.
+            //  - 0x0071 (legacy DIRECT_WRITE_DATA) is left alone on purpose: it
+            //    has a different ACK discipline that has not been analysed, and
+            //    the field failure lives on the pipe path. Not an oversight.
+            const bool nonce_loss = (decrypt_reason == NONCE_OUT_OF_WINDOW || decrypt_reason == NONCE_REPLAY);
+            if (nonce_loss && command == CMD_PIPE_WRITE_DATA) {
+                return;
+            }
             // 16 bytes render as 47 chars + NUL, an exact fit in 48; sized past that
             // so a future ENCRYPTION_NONCE_SIZE bump truncates nothing.
             char nonceHex[64];
@@ -846,10 +875,35 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             handlePipeWriteStart(data + 2, len - 2);
             break;
         case CMD_PIPE_WRITE_DATA:     // 0x0081
-            // The replay counter (verifyNonceReplay) already advanced at decrypt time,
-            // above this switch, for every 0x0081 frame — including ones the handler
-            // then queues or discards — so drops/dupes never desync it and the counter
-            // delta stays within in-flight <= W <= 32 <= the +-32 replay window.
+            // Replay state is committed at decrypt time (nonceCommit, first
+            // statement of decryptCommand's success arm) for every 0x0081 frame
+            // that authenticates — including ones this handler then queues or
+            // discards — so drops/dupes never desync it.
+            //
+            // The forward gap is deliberately UNBOUNDED, and it has to be. The
+            // client burns a nonce counter per *transmission*, landed or not, and
+            // its three transmit sites are new sends (window-credit-limited), PTO
+            // probes, and selective repair — and selective repair spends no window
+            // credit at all. The ceiling is the client's retransmit budget
+            // max_retx = max(3*W, n/2), scaled by blocks_per_ack, a user-facing
+            // Home Assistant option (1..32) in another repo: order thousands for a
+            // full-panel upload, and it accumulates ACROSS aborted attempts
+            // because the client never re-authenticates mid-transfer. Any firmware
+            // constant placed here would be a number this repo cannot prove and a
+            // client-side setting could silently falsify.
+            //
+            // So there is no such constant. A counter ahead of last_seen is
+            // accepted at any distance and gated by the CCM tag instead
+            // (src/nonce_window.h). A forward cap would not bound an attacker —
+            // checking commits nothing — but it would strand the session, because
+            // once a gap exceeded it nothing would commit, last_seen would never
+            // advance, and each retransmission's still-higher counter would be
+            // rejected further out than the last, until re-authentication. That is
+            // a transient link fault promoted to a permanent session fault.
+            //
+            // This reverses Decision A of
+            // docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md, which specified a cap of
+            // 128; see "Reversal of Decision A" at the end of that file.
             handlePipeWriteData(data + 2, len - 2);
             break;
         case CMD_PIPE_WRITE_END:      // 0x0082
