@@ -109,13 +109,13 @@ uint8_t* getConfigScratch(void) {
 }
 
 #if OD_CONFIG_BUFFERS_IN_PSRAM
-// PSRAM only, with NO internal-DRAM fallback. This gate is only reached on envs
-// built -DBOARD_HAS_PSRAM, and a board whose PSRAM is missing or dead cannot run
-// this firmware anyway: FastEPD's framebuffer is a single 2.6 MB allocation, so
-// the panel is dead long before the config path matters. A fallback here would
-// only take 4 KB of the scarcest memory on the part at the moment it is scarcest,
-// to serve a case that cannot occur -- so it fails closed instead and the
-// consumers refuse their commands.
+// PSRAM only, with NO internal-DRAM fallback and no null handling at the
+// consumers. This gate is only reached on envs built -DBOARD_HAS_PSRAM, the
+// allocation runs at boot with a pristine heap, and a board whose PSRAM is missing
+// or dead cannot run this firmware anyway: FastEPD's framebuffer is a single
+// 2.6 MB allocation, so the panel is dead long before the config path matters.
+// That makes a failure here defective hardware, not a runtime condition -- log it
+// so it is named at boot, and carry no degraded mode for it.
 //
 // Never freed: both buffers must be available for the whole uptime (the scratch on
 // every config read, the chunk buffer across a multi-command upload), and an
@@ -290,9 +290,7 @@ bool hasValidStoredConfig(void) {
     }
 #endif
     uint32_t len = MAX_CONFIG_SIZE;
-    uint8_t* scratch = getConfigScratch();
-    if (scratch == nullptr) return false;   // see odConfigReserveBuffers()
-    return loadConfig(scratch, &len);
+    return loadConfig(getConfigScratch(), &len);
 }
 
 static uint16_t crc16_ccitt_feed(uint16_t crc, uint8_t b) {
@@ -354,11 +352,6 @@ bool loadGlobalConfig(){
     globalConfig.data_extended_loaded = false;
     uint8_t* configData = getConfigScratch();
     uint32_t configLen = MAX_CONFIG_SIZE;
-    if (configData == nullptr) {   // see odConfigReserveBuffers()
-        od_log_error("ERROR: config scratch unavailable, cannot load configuration");
-        globalConfig.loaded = false;
-        return false;
-    }
     if (!loadConfig(configData, &configLen)) {
         globalConfig.loaded = false;
         return false;

@@ -122,11 +122,11 @@ uint8_t* getConfigScratch(void);
 // MUST be called before full_config_init(): loadGlobalConfig() is the first
 // consumer of the scratch buffer and runs there.
 //
-// PSRAM only -- no internal-DRAM fallback, deliberately. See reserveConfigBuffer()
-// in config_parser.cpp: a board that reaches this code with dead PSRAM cannot drive
-// its panel either, so the fallback would spend 4 KB of the scarcest memory on a
-// case that cannot occur. On failure the pointers stay null and the consumers
-// refuse their commands rather than dereferencing them.
+// PSRAM only -- no internal-DRAM fallback and no null handling, deliberately. A
+// failure here means defective PSRAM: the allocation runs at boot with a pristine
+// heap, and a board that cannot hold 4 KB cannot hold FastEPD's 2.6 MB framebuffer
+// either, so the panel is dead regardless. reserveConfigBuffer() logs the fault so
+// it is named at boot; there is no degraded mode worth carrying code for.
 void odConfigReserveBuffers(void);
 
 #endif
