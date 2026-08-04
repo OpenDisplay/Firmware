@@ -165,6 +165,7 @@ void setup() {
     // od_tls_reserve_records()/odLanReserveRxBuffer() below, this one takes no
     // internal DRAM at all, so it has no ordering relationship with them.
     odConfigReserveBuffers();
+    odDisplayReserveBuffers();   // PIPE reorder queue; same gate, also PSRAM-only
     if (is_deep_sleep_wake) { od_log_info("[wake] >> full_config_init"); od_log_flush(); }
 #if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
     Serial.println("[BOOTDIAG] before full_config_init()");

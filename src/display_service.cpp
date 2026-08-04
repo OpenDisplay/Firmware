@@ -675,7 +675,56 @@ static bool imageWriteFramesMayStillArrive(void);
 // early so the quiet-logging predicates below can consult pipeState.active. The
 // reorder array is a file static (not in the struct) so both targets pay it once.
 static PipeWriteState pipeState = {};
+
+// The reorder queue is 33 slots x 252 B = 8,316 B on the S3 envs -- the second
+// largest app-owned .bss item -- and it is dead memory except during a PIPE
+// transfer. Where there is PSRAM to hold it and a WiFi surface creating the
+// internal-DRAM pressure, reserve it there at boot instead. Same gate and same
+// reasoning as OD_CONFIG_BUFFERS_IN_PSRAM (config_parser.h); written against the
+// raw -D flags for the same reason.
+//
+// Unlike the config buffers this needs NO ODR care: PipeReorderSlot itself is
+// unchanged, only this file-static array becomes a pointer, and it is private to
+// this translation unit.
+//
+// Safe to relocate: touched only on the loop task via the BLE command dispatch,
+// never from an ISR, and never handed to DMA -- pipeConsumePayload() copies out of
+// it into the decompressor or the panel sink. Access is at BLE frame rate.
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_ENABLE_WIFI) && defined(BOARD_HAS_PSRAM)
+#define OD_PIPE_REORDER_IN_PSRAM 1
+#else
+#define OD_PIPE_REORDER_IN_PSRAM 0
+#endif
+
+#if OD_PIPE_REORDER_IN_PSRAM
+static PipeReorderSlot* pipeReorder = nullptr;
+#else
 static PipeReorderSlot pipeReorder[PIPE_REORDER_SLOTS];
+#endif
+
+void odDisplayReserveBuffers(void) {
+#if OD_PIPE_REORDER_IN_PSRAM
+    if (pipeReorder != nullptr) return;   // idempotent
+    // PSRAM only, no internal fallback -- see reserveConfigBuffer() in
+    // config_parser.cpp for why a fallback here would serve a case that cannot
+    // occur on a board this code runs on.
+    pipeReorder = (PipeReorderSlot*)heap_caps_calloc(PIPE_REORDER_SLOTS,
+                                                     sizeof(PipeReorderSlot),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // No null handling beyond this line, deliberately: a board whose PSRAM
+    // allocation fails at boot, with the heap pristine, is defective hardware --
+    // and one that cannot hold 8 KB cannot hold FastEPD's 2.6 MB framebuffer
+    // either, so the panel is dead regardless. The log line exists to name the
+    // fault at boot rather than to enable a degraded mode.
+    if (pipeReorder == nullptr) {
+        od_log_error("ERROR: PIPE reorder queue PSRAM reservation failed -- defective PSRAM?");
+        return;
+    }
+    od_log_info("PIPE reorder queue: %u slots x %u B reserved in PSRAM, internal free=%u",
+                (unsigned)PIPE_REORDER_SLOTS, (unsigned)sizeof(PipeReorderSlot),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#endif
+}
 
 // Shared by both watchdogs below. Measured from START, not from the last accepted
 // frame, so it bounds the whole transfer rather than a stall -- see the residual
