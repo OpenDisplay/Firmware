@@ -97,10 +97,52 @@ void formatConfigStorage(){
 // See getConfigScratch() in config_parser.h for the sharing contract. Replaces a
 // per-consumer 4 KB buffer each in loadGlobalConfig (static), hasValidStoredConfig
 // (static) and handleReadConfig (stack -- a 4 KB spike on the loop task).
+#if OD_CONFIG_BUFFERS_IN_PSRAM
+static uint8_t* configScratch = nullptr;
+extern chunked_write_state_t chunkedWriteState;   // defined in main.h
+#else
 static uint8_t configScratch[MAX_CONFIG_SIZE];
+#endif
 
 uint8_t* getConfigScratch(void) {
     return configScratch;
+}
+
+#if OD_CONFIG_BUFFERS_IN_PSRAM
+// PSRAM only, with NO internal-DRAM fallback. This gate is only reached on envs
+// built -DBOARD_HAS_PSRAM, and a board whose PSRAM is missing or dead cannot run
+// this firmware anyway: FastEPD's framebuffer is a single 2.6 MB allocation, so
+// the panel is dead long before the config path matters. A fallback here would
+// only take 4 KB of the scarcest memory on the part at the moment it is scarcest,
+// to serve a case that cannot occur -- so it fails closed instead and the
+// consumers refuse their commands.
+//
+// Never freed: both buffers must be available for the whole uptime (the scratch on
+// every config read, the chunk buffer across a multi-command upload), and an
+// on-demand allocation would fail precisely when someone is trying to reconfigure
+// a device that is already short of memory.
+static uint8_t* reserveConfigBuffer(const char* what) {
+    uint8_t* p = (uint8_t*)heap_caps_calloc(1, MAX_CONFIG_SIZE,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p == nullptr) {
+        od_log_error("ERROR: config buffer '%s' PSRAM reservation failed -- config commands will be refused", what);
+    }
+    return p;
+}
+#endif
+
+void odConfigReserveBuffers(void) {
+#if OD_CONFIG_BUFFERS_IN_PSRAM
+    if (configScratch == nullptr) {
+        configScratch = reserveConfigBuffer("scratch");
+    }
+    if (chunkedWriteState.buffer == nullptr) {
+        chunkedWriteState.buffer = reserveConfigBuffer("chunked-write");
+    }
+    od_log_info("Config buffers: 2 x %u B reserved, internal free=%u",
+                (unsigned)MAX_CONFIG_SIZE,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#endif
 }
 
 bool saveConfig(uint8_t* configData, uint32_t len){
@@ -248,7 +290,9 @@ bool hasValidStoredConfig(void) {
     }
 #endif
     uint32_t len = MAX_CONFIG_SIZE;
-    return loadConfig(getConfigScratch(), &len);
+    uint8_t* scratch = getConfigScratch();
+    if (scratch == nullptr) return false;   // see odConfigReserveBuffers()
+    return loadConfig(scratch, &len);
 }
 
 static uint16_t crc16_ccitt_feed(uint16_t crc, uint8_t b) {
@@ -310,6 +354,11 @@ bool loadGlobalConfig(){
     globalConfig.data_extended_loaded = false;
     uint8_t* configData = getConfigScratch();
     uint32_t configLen = MAX_CONFIG_SIZE;
+    if (configData == nullptr) {   // see odConfigReserveBuffers()
+        od_log_error("ERROR: config scratch unavailable, cannot load configuration");
+        globalConfig.loaded = false;
+        return false;
+    }
     if (!loadConfig(configData, &configLen)) {
         globalConfig.loaded = false;
         return false;

@@ -507,7 +507,7 @@ void handleReadConfig() {
     // path, so no other consumer can claim the scratch while we hold it.
     uint8_t* configData = getConfigScratch();
     uint32_t configLen = MAX_CONFIG_SIZE;
-    if (loadConfig(configData, &configLen)) {
+    if (configData != nullptr && loadConfig(configData, &configLen)) {
         uint32_t remaining = configLen;
         uint32_t offset = 0;
         uint16_t chunkNumber = 0;
@@ -554,6 +554,16 @@ void handleReadConfig() {
 
 void handleWriteConfig(uint8_t* data, uint16_t len) {
     if (len == 0) return;
+#if OD_CONFIG_BUFFERS_IN_PSRAM
+    // Fail closed if odConfigReserveBuffers() could not reserve the chunk buffer.
+    // Refusing here covers the chunked path too: handleWriteConfigChunk() only ever
+    // runs after this function has set chunkedWriteState.active.
+    if (chunkedWriteState.buffer == nullptr) {
+        uint8_t errorResponse[] = {RESP_NACK, RESP_CONFIG_WRITE, 0x00, 0x00};
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
+#endif
     if (isEncryptionEnabled() && !isAuthenticated()) {
         bool rewriteAllowed = (securityConfig.flags & (1 << 0)) != 0;
         if (!rewriteAllowed) {
