@@ -68,7 +68,9 @@ static constexpr uint16_t NRF_ADV_BOOST_MAX = 48;       // 30 ms
 static constexpr uint32_t NRF_ADV_BOOST_MS = 3000;
 
 static void applyAdvInterval() {
-    if (s_advBoostUntil != 0 && millis() < s_advBoostUntil) {
+    if (!globalConfig.loaded) {
+        Bluefruit.Advertising.setInterval(NRF_ADV_BOOST_MIN, NRF_ADV_BOOST_MAX);
+    } else if (s_advBoostUntil != 0 && millis() < s_advBoostUntil) {
         Bluefruit.Advertising.setInterval(NRF_ADV_BOOST_MIN, NRF_ADV_BOOST_MAX);
     } else {
         s_advBoostUntil = 0;
@@ -219,7 +221,7 @@ bool BleTransport::begin(const char* deviceName) {
     Bluefruit.configCentralBandwidth(BANDWIDTH_MAX);
     Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
     Bluefruit.autoConnLed(false);
-    Bluefruit.setTxPower(globalConfig.power_option.tx_power);
+    Bluefruit.setTxPower(globalConfig.loaded ? globalConfig.power_option.tx_power : 8);
     Bluefruit.begin(1, 0);
     od_log_info("BLE initialized successfully");
     od_log_info("Setting up BLE service 0x2446...");
