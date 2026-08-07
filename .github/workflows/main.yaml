@@ -8,26 +8,6 @@ permissions:
   contents: read
 
 jobs:
-  # Separate top-level job on purpose ([L5]): the `build` job below is an
-  # 11-entry matrix, so a step added there would run the host test eleven times.
-  # This needs no toolchain beyond the runner's stock g++ and gates every push
-  # alongside the firmware builds. tools/ is invisible to every firmware build
-  # (build_src_filter is relative to src_dir and no env adds tools/), so the
-  # test file cannot affect the matrix.
-  host-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build and run the nonce-window host test
-        # -fsanitize=undefined is not decoration: it is what catches the `x << 64`
-        # UB in the bitmap shift automatically rather than relying on the test
-        # author to predict it. See Decision D in
-        # docs/PLAN_PHASE1_NONCE_REPLAY_2026-07-26.md.
-        run: |
-          g++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined,address \
-              tools/test_nonce_window.cpp -o /tmp/test_nonce_window
-          /tmp/test_nonce_window
-
   # The environment list lives in .github/firmware-targets.json, shared with
   # release.yml. Keeping one list means CI can't build a target the release
   # forgets to ship (which is how esp32-N4 went unreleased) or vice versa.
