@@ -6,6 +6,31 @@
 #define CONFIG_FILE_PATH "/config.bin"
 #define MAX_CONFIG_SIZE 4096
 
+// Where the two 4 KB config buffers live. 1 = reserved in PSRAM at boot and
+// reached through a pointer; 0 = plain .bss arrays, exactly as before.
+//
+// Gated on WiFi *and* PSRAM, because both halves are load-bearing:
+//   - PSRAM: there is nowhere else to put them. A part without it would only be
+//     trading .bss for an identical amount of internal heap, plus a failure path.
+//   - WiFi: only the WiFi/LAN/TLS surface creates the internal-DRAM shortage this
+//     relieves. esp32-N4 uses 77 KB of 327 KB; it does not need this, and leaving
+//     it on .bss keeps its ELF unchanged. Same reasoning as #140 leaving
+//     nrf52840custom byte-identical.
+// That resolves to the seven S3 envs and nothing else -- notably NOT
+// esp32-wrover-e-N4R8, which has PSRAM but no WiFi.
+//
+// Written against the raw -D flags rather than OPENDISPLAY_HAS_WIFI (wifi_service.h)
+// ON PURPOSE: this gate changes the LAYOUT of chunked_write_state_t below, so every
+// translation unit that sees this header must evaluate it identically. Command-line
+// -D flags are visible everywhere; a macro from another header is only visible if
+// that header was included first, and one TU disagreeing about a struct layout is an
+// ODR violation that links cleanly and corrupts memory at runtime.
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_ENABLE_WIFI) && defined(BOARD_HAS_PSRAM)
+#define OD_CONFIG_BUFFERS_IN_PSRAM 1
+#else
+#define OD_CONFIG_BUFFERS_IN_PSRAM 0
+#endif
+
 // Sentinel in the first 4 bytes of /config.bin. Cheap provenance gate checked
 // before data_len is trusted or the CRC is computed: erased flash, a truncated
 // write, or a file from other firmware fails here in 4 bytes.
@@ -41,7 +66,14 @@ typedef struct {
     bool active;
     uint32_t totalSize;
     uint32_t receivedSize;
+#if OD_CONFIG_BUFFERS_IN_PSRAM
+    // Reserved once by odConfigReserveBuffers(); never freed. NOT sizeof-able --
+    // every bound is MAX_CONFIG_SIZE, which is what handleWriteConfigChunk()
+    // already checks against.
+    uint8_t* buffer;
+#else
     uint8_t buffer[MAX_CONFIG_SIZE];
+#endif
     uint32_t expectedChunks;
     uint32_t receivedChunks;
 } chunked_write_state_t;
@@ -83,5 +115,18 @@ void full_config_init();
 // until they return. Do NOT use this for chunkedWriteState -- that buffer stays
 // live across BLE commands while other config work can run.
 uint8_t* getConfigScratch(void);
+
+// Reserve the two 4 KB config buffers (configScratch and chunkedWriteState.buffer)
+// in PSRAM. No-op unless OD_CONFIG_BUFFERS_IN_PSRAM, and idempotent.
+//
+// MUST be called before full_config_init(): loadGlobalConfig() is the first
+// consumer of the scratch buffer and runs there.
+//
+// PSRAM only -- no internal-DRAM fallback and no null handling, deliberately. A
+// failure here means defective PSRAM: the allocation runs at boot with a pristine
+// heap, and a board that cannot hold 4 KB cannot hold FastEPD's 2.6 MB framebuffer
+// either, so the panel is dead regardless. reserveConfigBuffer() logs the fault so
+// it is named at boot; there is no degraded mode worth carrying code for.
+void odConfigReserveBuffers(void);
 
 #endif

@@ -62,6 +62,12 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len);
 void handlePipeWriteData(uint8_t* data, uint16_t len);
 void handlePipeWriteEnd(uint8_t* data, uint16_t len);
 void resetPipeWriteState(void);
+
+// Reserve the PIPE reorder queue (33 x 252 B on S3) in PSRAM. No-op unless the
+// target has both a WiFi surface and PSRAM; idempotent; never freed. Call from
+// setup() before BLE accepts commands. A failure here is defective hardware and is
+// logged, not handled -- see odDisplayReserveBuffers() in display_service.cpp.
+void odDisplayReserveBuffers(void);
 // True while a PIPE_WRITE stream is active (mid-transfer log suppression, resets).
 bool pipeWriteActive(void);
 // True while ANY transfer (DIRECT / PIPE / PARTIAL) is streaming. Use this for
