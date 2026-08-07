@@ -144,6 +144,8 @@ struct PartialStreamContext {
 
 void pwrmgm(bool onoff);
 String getChipIdHex();
+int bbepSetPanelType(BBEPDISP *pBBEP, int iPanel);
+void bbepSetRotation(BBEPDISP *pBBEP, int iRotation);
 void bbepInitIO(BBEPDISP *pBBEP, uint8_t u8DC, uint8_t u8RST, uint8_t u8BUSY, uint8_t u8CS, uint8_t u8MOSI, uint8_t u8SCK, uint32_t u32Speed);
 void bbepWakeUp(BBEPDISP *pBBEP);
 void bbepSendCMDSequence(BBEPDISP *pBBEP, const uint8_t *pSeq);
@@ -359,6 +361,28 @@ static void epdAlignCustomPartialRamMode(void) {
     }
 }
 
+// Sets bbep.type/native dims/rotation and (E1004) e1004GeometryOk from globalConfig.
+static void configureBbepPanelGeometry(void) {
+    memset(&bbep, 0, sizeof(BBEPDISP));
+    int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
+    bbepSetPanelType(&bbep, panelType);
+    int rotation = globalConfig.displays[0].rotation * 90;
+#ifdef BBEP_T133A01
+    e1004GeometryOk = false;
+    if (e1004_panel_used()) {
+        rotation = 0;  // host bakes rotation into packed image
+        if (globalConfig.displays[0].pixel_width != bbep.native_width ||
+            globalConfig.displays[0].pixel_height != bbep.native_height ||
+            globalConfig.displays[0].color_scheme != OD_COLOR_SCHEME_BWGBRY_SPLIT) {
+            od_log_error("ERROR: E1004 requires a 1200x1600 bwgbry_split (8) display config");
+        } else {
+            e1004GeometryOk = true;
+        }
+    }
+#endif
+    bbepSetRotation(&bbep, rotation);
+}
+
 static void initBbepPanelSession() {
     const DisplayConfig& d = globalConfig.displays[0];
 #ifdef BBEP_T133A01
@@ -511,6 +535,7 @@ static bool epdSessionAcquire(bool partialInit) {
         pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
         if (!epdSessionUsesFastepd()) {
             const DisplayConfig& d = globalConfig.displays[0];
+            configureBbepPanelGeometry();
 #ifdef BBEP_T133A01
             if (e1004_panel_used()) {
                 e1004InitPanel();
@@ -1787,24 +1812,7 @@ void initDisplay(){
 #endif
     {
         prepareEpdRailForBoot();
-        memset(&bbep, 0, sizeof(BBEPDISP));
-        int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
-        bbepSetPanelType(&bbep, panelType);
-        int rotation = globalConfig.displays[0].rotation * 90;
-#ifdef BBEP_T133A01
-        e1004GeometryOk = false;
-        if (e1004_panel_used()) {
-            rotation = 0;  // host bakes rotation into packed image
-            if (globalConfig.displays[0].pixel_width != bbep.native_width ||
-                globalConfig.displays[0].pixel_height != bbep.native_height ||
-                globalConfig.displays[0].color_scheme != OD_COLOR_SCHEME_BWGBRY_SPLIT) {
-                od_log_error("ERROR: E1004 requires a 1200x1600 bwgbry_split (8) display config");
-            } else {
-                e1004GeometryOk = true;
-            }
-        }
-#endif
-        bbepSetRotation(&bbep, rotation);
+        configureBbepPanelGeometry();
         od_log_info("Height: %u", globalConfig.displays[0].pixel_height);
         od_log_info("Width: %u", globalConfig.displays[0].pixel_width);
         initBbepPanelSession();
