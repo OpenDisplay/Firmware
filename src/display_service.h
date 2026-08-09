@@ -23,12 +23,6 @@ void epdSessionTick(void);       // millis()-poll from loop()/idleDelay(): expir
 bool epdSessionIsWarm(void);     // true when the panel is powered-idle (PWR_WARM)
 
 bool fastepd_driver_used(void);
-bool e1004_panel_used(void);
-uint8_t e1004_cs2_pin(void);
-bool e1004_begin_plane(void);
-bool e1004_advance_to_cs2(void);
-void e1004_end_plane(void);
-void e1004_write_stream_bytes(const uint8_t* data, uint16_t len);
 int mapEpd(int id);
 bool waitforrefresh(int timeout);
 float readBatteryVoltage();
