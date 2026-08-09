@@ -2,6 +2,10 @@
 
 Guidance for Claude Code when working in the **OpenDisplay `Firmware`** repo (nRF52840 + ESP32-S3/C6/C3 BLE e-paper tags). This is one repo inside the larger OpenDisplay multi-repo workspace; the workspace-level `../CLAUDE.md` covers cross-repo layout and the end-to-end pipeline. Prefer this file for anything Firmware-specific.
 
+## General 
+
+Do not just look at this repo when working on this firmware , always look at https://github.com/OpenDisplay/opendisplay.org and https://github.com/OpenDisplay/py-opendisplay. Do not just create new pio targets for new devices, try to ceck if the existing ones also work with a new config. When adding a new device, do not add a framebuffer if the device use bb_epaper. For a new device, also always add a simple config to the opendisplay.org repo and check if a new device requires firmware changes or could just be added with a simple config preset.
+
 ## Build & flash
 
 PlatformIO (Arduino framework), using the `bb_epaper` display library. Environments are defined in `platformio.ini`.
