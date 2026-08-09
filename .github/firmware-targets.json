@@ -67,15 +67,6 @@
       "bootloader_offset": "0x0000"
     },
     {
-      "env": "esp32-s3-E1004",
-      "family": "esp32",
-      "chip": "esp32-s3",
-      "flash_size": "32MB",
-      "flash_mode": "dio",
-      "flash_freq": "80m",
-      "bootloader_offset": "0x0000"
-    },
-    {
       "env": "esp32-c6-N4",
       "family": "esp32",
       "chip": "esp32-c6",
