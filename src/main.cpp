@@ -1241,6 +1241,19 @@ static void configureDisplayPinsLowPower() {
         pinMode(pin, OUTPUT);
         digitalWrite(pin, LOW);
     }
+    // Second chip select on dual-controller panels (T133A01 / 8.1" Spectra6).
+    // Not in the array above: that loop only skips 0xFF, and an unconfigured
+    // cs_pin_2 reads 0 on most devices -- which would drive GPIO0, a strapping
+    // pin, LOW on the way to sleep. Guarded like the aux pins below instead.
+    //
+    // Left out until now, so CS2 stayed a driven output at whatever level the
+    // last frame left it (HIGH) while the rail went away -- the one panel pin
+    // still able to source into an unpowered controller through its protection
+    // diodes. LOW matches what cs_pin already does.
+    if (d.cs_pin_2 != 0xFF && d.cs_pin_2 != 0) {
+        pinMode(d.cs_pin_2, OUTPUT);
+        digitalWrite(d.cs_pin_2, LOW);
+    }
     if (d.busy_pin != 0xFF) {
         pinMode(d.busy_pin, INPUT);
     }
