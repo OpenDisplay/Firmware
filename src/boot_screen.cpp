@@ -8,6 +8,7 @@
 #include <bb_epaper.h>
 #include "qr/qrcode.h"
 #include "display_service.h"
+#include "split_panel.h"
 #include "od_log.h"
 #if __has_include("logo_bitmap.h")
 #include "logo_bitmap.h"
@@ -905,10 +906,14 @@ bool writeBootScreenWithQr() {
     int textStartY = textY;
     const uint16_t footerInfoY = (uint16_t)(footerY0 + (footerPadTop + footerInfoH - 7 * footerInfoScale) / 2);
 
-    // Dual-controller E1004 (bwgbry_split): left half-plane then right (continuous DTM).
-    const bool e1004Stream = e1004_panel_used();
-    const int e1004HalfPasses = e1004Stream ? 2 : 1;
-    const uint16_t e1004HalfPitch = (uint16_t)(pitch / 2);
+    // Dual-controller panels (bwgbry_split): paint and emit the left half-plane,
+    // then the right. That is exactly the wire order splitPanelSinkBytes() expects,
+    // so the halves land in the right columns of the framebuffer with no extra
+    // bookkeeping here -- and painting one half at a time still avoids rasterising
+    // the full frame twice.
+    const bool splitStream = splitPanelUsed();
+    const int splitHalfPasses = splitStream ? 2 : 1;
+    const uint16_t splitHalfPitch = (uint16_t)(pitch / 2);
 
     uint8_t* row = staticRowBuffer;
     // bb_epaper 4-gray (scheme 5) needs the packed 2bpp image split into two
@@ -925,18 +930,12 @@ bool writeBootScreenWithQr() {
         return false;
     }
     const int planePasses = (gray4Split || colorSwatchPlane1) ? 2 : 1;
-    for (int halfPass = 0; halfPass < e1004HalfPasses; halfPass++) {
-        if (e1004Stream) {
-            if (halfPass == 0) {
-                if (!e1004_begin_plane()) {
-                    od_log_error("Boot screen: E1004 dual-CS plane open failed");
-                    return false;
-                }
-            } else if (!e1004_advance_to_cs2()) {
-                od_log_error("Boot screen: E1004 CS2 advance failed");
-                e1004_end_plane();
-                return false;
-            }
+    for (int halfPass = 0; halfPass < splitHalfPasses; halfPass++) {
+        // Only pass 0 opens the frame; the sink crosses to the right half on its
+        // own once the left half-plane's worth of bytes has arrived.
+        if (splitStream && halfPass == 0 && !splitPanelBeginFrame()) {
+            od_log_error("Boot screen: split panel frame open failed");
+            return false;
         }
     for (int pass = 0; pass < planePasses; pass++) {
         const int bitSel = pass;  // pass 0 -> LSB/PLANE_0, pass 1 -> MSB/PLANE_1
@@ -944,12 +943,12 @@ bool writeBootScreenWithQr() {
                                            : (colorSwatchPlane1 ? (pass == 0 ? PLANE_0 : PLANE_1)
                                                                  : (useBitplanes ? PLANE_0 : getplane()));
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
-        if (!fastepd_driver_used() && !e1004Stream) {
+        if (!fastepd_driver_used() && !splitStream) {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
             bbepStartWrite(&bbep, targetPlane);
         }
 #else
-        if (!e1004Stream) {
+        if (!splitStream) {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
             bbepStartWrite(&bbep, targetPlane);
         }
@@ -963,13 +962,13 @@ bool writeBootScreenWithQr() {
             : (uint16_t)(fwY + ls);
         const uint16_t k2Y   = (uint16_t)(k1Y + ls);
         const bool colorPlanePass = colorSwatchPlane1 && pass == 1;
-        // E1004 half-pass: only paint the half we will stream (avoids 2× full-frame work).
-        const uint16_t xPaint0 = e1004Stream ? (uint16_t)(halfPass * (w / 2u)) : (uint16_t)0;
-        const uint16_t xPaint1 = e1004Stream ? (uint16_t)(xPaint0 + (w / 2u)) : w;
+        // Split half-pass: only paint the half we will emit (avoids 2× full-frame work).
+        const uint16_t xPaint0 = splitStream ? (uint16_t)(halfPass * (w / 2u)) : (uint16_t)0;
+        const uint16_t xPaint1 = splitStream ? (uint16_t)(xPaint0 + (w / 2u)) : w;
         for (uint16_t y_native = 0; y_native < h; y_native++) {
-            if (e1004Stream) {
-                memset(row + (size_t)halfPass * e1004HalfPitch,
-                       colorPlanePass ? 0x00 : whiteValue, e1004HalfPitch);
+            if (splitStream) {
+                memset(row + (size_t)halfPass * splitHalfPitch,
+                       colorPlanePass ? 0x00 : whiteValue, splitHalfPitch);
             } else {
                 memset(row, colorPlanePass ? 0x00 : whiteValue, pitch);
             }
@@ -1030,8 +1029,8 @@ bool writeBootScreenWithQr() {
                 fastepd_boot_write_row(y_native, row, pitch);
             } else if (gray4Split) {
                 writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
-            } else if (e1004Stream) {
-                e1004_write_stream_bytes(row + (size_t)halfPass * e1004HalfPitch, e1004HalfPitch);
+            } else if (splitStream) {
+                splitPanelSinkBytes(row + (size_t)halfPass * splitHalfPitch, splitHalfPitch);
             } else {
                 odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
                 bbepWriteData(&bbep, row, pitch);
@@ -1039,8 +1038,8 @@ bool writeBootScreenWithQr() {
 #else
             if (gray4Split) {
                 writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
-            } else if (e1004Stream) {
-                e1004_write_stream_bytes(row + (size_t)halfPass * e1004HalfPitch, e1004HalfPitch);
+            } else if (splitStream) {
+                splitPanelSinkBytes(row + (size_t)halfPass * splitHalfPitch, splitHalfPitch);
             } else {
                 odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
                 bbepWriteData(&bbep, row, pitch);
@@ -1050,7 +1049,9 @@ bool writeBootScreenWithQr() {
     }
     } // halfPass
 
-    if (e1004Stream) e1004_end_plane();
+    // No close step here: the chip selects stay held until splitPanelCloseFrame()
+    // releases them just before the refresh, in refreshBootScreenFull(). Closing
+    // early would make that call report an already-closed frame and skip the refresh.
 
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (fastepd_driver_used()) {
