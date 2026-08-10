@@ -1019,7 +1019,7 @@ bool writeBootScreenWithQr() {
                     ;
                 if (black) {
                     setBootPixelBlack(row, x_native, pitch, bitsPerPixel, colorScheme);
-                } else if (!useBitplanes) {
+                } else {
                     int si = bootSwatchIndex(lx, ly, swatchY0, swatchY1, swatchW, numSwatches, w_log);
                     if (si >= 0) setBootPixelCode(row, x_native, pitch, bitsPerPixel, swatchCode[si]);
                 }
