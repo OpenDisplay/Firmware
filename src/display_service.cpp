@@ -310,6 +310,20 @@ static uint32_t epdKeepAliveWindowMs(void) {
     return (uint32_t)s * 1000;
 }
 
+static constexpr uint8_t SSD1608_END_OPTION = 0x3f;
+
+static void bbepRefreshForFinalCut(int mode, bool cutAfterSuccess) {
+    if (!cutAfterSuccess || mode != REFRESH_FULL || bbep.type != EP42B_400x300 ||
+        globalConfig.system_config.pwr_pin == 0xff) {
+        bbepRefresh(&bbep, mode);
+        return;
+    }
+    bbepSendCMDSequence(&bbep, bbep.pInitFull);
+    bbepCMD2(&bbep, SSD1608_DISP_CTRL2, 0xf7);
+    bbepCMD2(&bbep, SSD1608_END_OPTION, 0x22);
+    bbepWriteCmd(&bbep, SSD1608_MASTER_ACTIVATE);
+}
+
 // Session try-lock, now UNCONTENDED on both targets and kept as defence in depth.
 //
 // It existed because nRF dispatched commands on the Bluefruit write-callback
@@ -529,7 +543,7 @@ static bool refreshBootScreenFull() {
     // panel must not be refreshed with it.
     if (splitPanelUsed() && !splitPanelCloseFrame()) return false;
     odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
-    bbepRefresh(&bbep, REFRESH_FULL);
+    bbepRefreshForFinalCut(REFRESH_FULL, true);
     const bool ok = waitforrefresh(60);
     splitPanelPowerOff();
     return ok;
@@ -2503,7 +2517,7 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
         if (splitPanelUsed() && !splitPanelCloseFrame()) refreshMode = -1;
         if (refreshMode >= 0) {
             odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
-            bbepRefresh(&bbep, refreshMode);
+            bbepRefreshForFinalCut(refreshMode, epdKeepAliveWindowMs() == 0);
             refreshSuccess = waitforrefresh(60);
             splitPanelPowerOff();
         }
@@ -3365,7 +3379,7 @@ static bool partial_trigger_refresh(int refreshMode) {
         return waitforrefresh(60);
     }
     odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
-    bbepRefresh(&bbep, refreshMode);
+    bbepRefreshForFinalCut(refreshMode, epdKeepAliveWindowMs() == 0);
     return waitforrefresh(60);
 }
 
