@@ -337,6 +337,24 @@ static void pwrmgmLockGive(void) {
     __atomic_store_n(&pwrmgmLock, 0, __ATOMIC_RELEASE);
 }
 
+// After controller power-off / deep-sleep, wait before cutting VDD so board boost
+// caps and VCOM can bleed. 50 ms was too short on EP42B (panel_ic 2 / SSD16xx):
+// refresh looked correct, then the image darkened in over the following minutes.
+static const uint16_t EPD_POST_SLEEP_BLEED_MS = 200;
+
+// SSD16xx bbepSleep() only sends deep-sleep; it does not run the analog/HV
+// shutdown. Force EOPT discharge frames + the GoodDisplay/GxEPD2 power-off
+// sequence (enable clock → disable analog → disable OSC) while SPI is still up.
+static void epdSsd16xxPowerOffDischarge(void) {
+    if (bbep.chip_type != BBEP_CHIP_SSD16xx) return;
+    if (!bbep.is_awake) return;
+    bbepCMD2(&bbep, 0x3F, 0x22); // EOPT: TFT discharge frames + sequenced VCOM/HV
+    bbepCMD2(&bbep, SSD1608_DISP_CTRL2, 0x83);
+    bbepWriteCmd(&bbep, SSD1608_MASTER_ACTIVATE);
+    odWatchdogFeed();
+    bbepWaitBusy(&bbep);
+}
+
 // Lock-held core (callers must hold pwrmgmLock). Split out so Release/Tick can
 // power off without re-taking the non-recursive lock.
 static void epdSessionForceOffLocked(void) {
@@ -355,8 +373,9 @@ static void epdSessionForceOffLocked(void) {
 #endif
     } else {
         odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
+        epdSsd16xxPowerOffDischarge();
         bbepSleep(&bbep, 1);
-        delay(50);
+        delay(EPD_POST_SLEEP_BLEED_MS);
     }
     pwrmgm(false);   // -> PWR_OFF, clears deadline
     epdPlanesPrepared = false;
