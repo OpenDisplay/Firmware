@@ -13,6 +13,10 @@ firmware's config layout.
   boards that flash via USB mass storage.
 - `test_zlib_stream.c` — standalone test harness for the firmware's streaming
   zlib/uzlib decoder (`lib/uzlib`). Not part of the PlatformIO build.
+- `test_sensor_axp2101.cpp` — standalone host test for the AXP2101 battery-
+  voltage helpers in `src/sensor_axp2101.h` (VBAT decoding, targeted ADC-enable,
+  address defaulting, and I2C-failure fall-through). Not part of the PlatformIO
+  build. See the header comment for the exact build line.
 - `ble_crypto.py` / `config_packet.py` — shared helpers. `ble_crypto.py` is
   inlined into `od-device-cli.py` and kept here for reference. `config_packet.py`
   is imported by `provision_firmware.py`.
