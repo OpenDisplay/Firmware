@@ -29,11 +29,12 @@ public:
 };
 
 // OpenDisplay panel_ic_type -> FastEPD native parallel panel id (-1 if not a
-// parallel panel). FastEPD owns the Inkplate bus/PMIC/IO-expanders internally.
+// parallel panel). FastEPD owns the board's bus/PMIC/IO-expanders internally.
 static int fastepd_parallel_panel(uint16_t panel_ic_type) {
     switch (panel_ic_type) {
         case OD_PANEL_IC_INKPLATE5V2_1280X720:   return BB_PANEL_INKPLATE5V2;
         case OD_PANEL_IC_INKPLATE10_1200X825:    return BB_PANEL_INKPLATE10;
+        case OD_PANEL_IC_M5PAPERS3_960X540:      return BB_PANEL_M5PAPERS3;
         default:                                 return -1;
     }
 }

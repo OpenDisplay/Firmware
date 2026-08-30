@@ -19,9 +19,9 @@
  *   type mirrors (see docs/shared-types-plan.md); codegen must carry the prose
  *   through as idiomatic doc comments in each target language.
  *
- *   OD_STRUCTS_VERSION  2.0   (MAJOR.MINOR spec marker for THIS file; see
+ *   OD_STRUCTS_VERSION  2.1   (MAJOR.MINOR spec marker for THIS file; see
  *                              VERSIONING POLICY below -- NOT sent on the wire)
- *   LAST CHANGED        2026-07-18
+ *   LAST CHANGED        2026-08-30
  *
  *   The two version schemes carried here are DISTINCT (see §6 Q2 of the plan):
  *     - OD_STRUCTS_VERSION_* : documents this spec file, like protocol.h's
@@ -66,7 +66,7 @@
  * CHANGELOG  (newest first; entries accrue under "Unreleased" and roll into a
  *            new version heading on each bump -- see AGENT INSTRUCTIONS below)
  * --------------------------------------------------------------------------
- *   Unreleased (since 2.0)
+ *   Unreleased (since 2.1)
  *     - LedFlags bit4: OD_LED_FLAG_BUTTON_PRESS (short LED flash on physical
  *       button press / button-wake synthetic click; default off).
  *     - BuzzerFlags bit1: OD_BUZZER_FLAG_BUTTON_PRESS (short chirp on physical
@@ -74,6 +74,15 @@
  *     - MsdStatusBits bit3: OD_MSD_STATUS_ENCRYPTION_ENABLED (1 = app-layer
  *       encryption active). Firmware sets it when encryption_enabled and master
  *       key are non-zero; dynamic[11] is all 0xFF when no display is configured.
+ *       (Folded back from the Firmware side, PR #157 — parity restore.)
+ *     - Add each payload-layout change here as it lands. On the next version bump,
+ *       move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
+ *
+ *   2.1  (2026-08-30)
+ *     - Add PanelIC value OD_PANEL_IC_M5PAPERS3_960X540 = 3004 (M5Stack PaperS3,
+ *       ED047TC1-class 960x540 parallel panel, 16-gray capable; FastEPD native
+ *       parallel path). Backward-compatible enum addition (@since 1.5); the
+ *       on-wire config-format minor bumps 4 -> 5 (OD_CONFIG_MINOR_VERSION).
  *     - Doc-only: fixed two comment shapes the codegen parser mis-read and added
  *       the CODEGEN AUTHORING RULES banner section to prevent recurrence. Split the
  *       combined BusFlags/PinBitmap @bits comment into one comment per group; folded
@@ -83,8 +92,6 @@
  *       placeholder macros (no wire change; these bits stay reserved-must-be-0):
  *       TransmissionModes bit5/bit6 -> OD_TRANSMISSION_MODE_RESERVED_5/_6;
  *       MsdStatusBits bit3 -> OD_MSD_STATUS_RESERVED_3. Documentation only.
- *     - Add each payload-layout change here as it lands. On the next version bump,
- *       move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
  *   2.0  (2026-07-18)
  *     - Initial canonical shared payload contract: the wire-payload counterpart
@@ -252,8 +259,8 @@
 /* Payload-spec revision, MAJOR.MINOR. Documents THIS file; NOT sent on the wire.
  * Distinct from the on-wire OD_CONFIG_VERSION pair defined in SECTION 1. */
 #define OD_STRUCTS_VERSION_MAJOR       2u
-#define OD_STRUCTS_VERSION_MINOR       0u
-#define OD_STRUCTS_VERSION_STR         "2.0"
+#define OD_STRUCTS_VERSION_MINOR       1u
+#define OD_STRUCTS_VERSION_STR         "2.1"
 
 /* --------------------------------------------------------------------------
  * Portable compile-time size check. Defined once here; every packed struct is
@@ -288,10 +295,10 @@
 
 /* On-wire config-format version. UNLIKE OD_STRUCTS_VERSION / OD_PROTOCOL_VERSION,
  * these ARE transmitted / negotiated: OuterPacketHeader.version carries the
- * MAJOR byte. Frozen at 1.4 by this header (the app's bundled config.yaml is at
+ * MAJOR byte. At 1.5 as of this header (the app's bundled config.yaml is at
  * minor 3 and must catch up). */
 #define OD_CONFIG_VERSION              1u   /* @doc "outer-packet major version byte" */
-#define OD_CONFIG_MINOR_VERSION        4u   /* @doc "config-format minor; backward-compatible additions" */
+#define OD_CONFIG_MINOR_VERSION        5u   /* @doc "config-format minor; backward-compatible additions" */
 
 /* CRC over the outer packet. CRC16-CCITT, poly 0x1021, init 0xFFFF, computed
  * over length+version+packets AS IF the 2-byte length field were 0x0000 (the
@@ -682,7 +689,8 @@ enum PanelIC {
     OD_PANEL_IC_ED103TC2_1872X1404       = 3000, /**< @doc "E Ink ED103TC2 + IT8951 (10.3\", 1872x1404, 1bpp; FastEPD IT8951 path, values 3000+)" */
     OD_PANEL_IC_ED103TC2_1872X1404_4GRAY = 3001, /**< @doc "same panel as 3000; 4bpp (16-level gray via FastEPD)" */
     OD_PANEL_IC_INKPLATE5V2_1280X720     = 3002, /**< @doc "Soldered Inkplate 5 V2 (ED050WROW, 1280x720, 1bpp; FastEPD native parallel path)" */
-    OD_PANEL_IC_INKPLATE10_1200X825      = 3003  /**< @doc "Soldered Inkplate 10 (ED097TC2, 1200x825, 1bpp; FastEPD native parallel path)" */
+    OD_PANEL_IC_INKPLATE10_1200X825      = 3003, /**< @doc "Soldered Inkplate 10 (ED097TC2, 1200x825, 1bpp; FastEPD native parallel path)" */
+    OD_PANEL_IC_M5PAPERS3_960X540        = 3004  /**< @doc "M5Stack PaperS3 (ED047TC1-class, 960x540, 16-gray capable; FastEPD native parallel path)" @since 1.5 */
 };
 
 /* DisplayConfig.transmission_modes @bits TransmissionModes (bits 5-6 reserved --
@@ -1235,7 +1243,7 @@ OD_STATIC_ASSERT(sizeof(struct AuthProof) == 32, "AuthProof wire size");
 #define OD_MSD_STATUS_REBOOT_FLAG          (1u << 1) /* @doc "device rebooted since last read" */
 #define OD_MSD_STATUS_CONNECTION_REQUESTED (1u << 2) /* @doc "device is requesting a connection" */
 #define OD_MSD_STATUS_ENCRYPTION_ENABLED   (1u << 3) /* @doc "application-layer encryption active (encryption_enabled and non-zero master key)" */
-#define OD_MSD_STATUS_RESERVED_3           OD_MSD_STATUS_ENCRYPTION_ENABLED /* legacy doc name */
+#define OD_MSD_STATUS_RESERVED_3           (1u << 3) /* @deprecated @doc "legacy name for OD_MSD_STATUS_ENCRYPTION_ENABLED (same bit)" */
 #define OD_MSD_STATUS_MAIN_LOOP_COUNTER_SHIFT 4u     /* @doc "bits 4-7: free-running main-loop nibble counter (liveness)" */
 #define OD_MSD_STATUS_MAIN_LOOP_COUNTER_MASK  0xF0u  /* @doc "mask for the bits 4-7 main-loop counter nibble" */
 
