@@ -280,7 +280,16 @@ void fastepd_epaper_begin(void) {
 // REFRESH_FULL: parallel panels flash-clear to flush ghosting; IT8951 clears
 // internally (ignores the mode) so it stays CLEAR_NONE.
 static void fastepd_full_refresh_impl(void) {
-    int clear = fastepd_is_parallel() ? CLEAR_FAST : CLEAR_NONE;
+    int clear = CLEAR_NONE;
+    if (fastepd_is_parallel()) {
+        // The PaperS3 needs the library-default 10-pass clear: CLEAR_FAST's
+        // 8 passes leave residual banding on this panel (verified on
+        // hardware 2026-08-31, library-only sketch clean with CLEAR_SLOW).
+        // Inkplates keep the faster clear they were tuned with.
+        clear = (globalConfig.displays[0].panel_ic_type == OD_PANEL_IC_M5PAPERS3_960X540)
+                    ? CLEAR_SLOW
+                    : CLEAR_FAST;
+    }
     g_epd.fullUpdate(clear, true, NULL);
 }
 
