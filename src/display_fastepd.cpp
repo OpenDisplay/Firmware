@@ -113,6 +113,19 @@ static bool fastepd_panel_is_4gray(void) {
     return d.color_scheme == OD_COLOR_SCHEME_GRAY16;
 }
 
+// The effective pixel mode follows the runtime config (color_scheme), which
+// can change between transfers via CONFIG_WRITE without a reboot. FastEPD's
+// mode is sticky per hardware init, so warm transfer paths must re-assert it
+// or incoming data is interpreted in the previous config's depth.
+static void fastepd_apply_mode(void) {
+    if (!s_hw_initialized || !g_epd.currentBuffer()) return;
+    int want = fastepd_panel_is_4gray() ? BB_MODE_4BPP : BB_MODE_1BPP;
+    if (g_epd.getMode() != want) {
+        g_epd.setMode(want);
+        g_epd.setPreviousMode((uint8_t)g_epd.getMode());
+    }
+}
+
 static size_t fb_byte_size(void) {
     uint32_t w = globalConfig.displays[0].pixel_width;
     uint32_t h = globalConfig.displays[0].pixel_height;
@@ -230,6 +243,8 @@ void fastepd_epaper_begin(void) {
             g_epd.setPreviousMode((uint8_t)g_epd.getMode());
         } else {
             g_epd.einkPower(1);
+            s_hw_initialized = true;  // apply_mode requires it; set before the call
+            fastepd_apply_mode();
         }
         s_hw_initialized = true;
         return;
@@ -303,6 +318,7 @@ void fastepd_direct_write_reset(void) {
         fastepd_epaper_begin();
     } else {
         g_epd.einkPower(1);
+        fastepd_apply_mode();
     }
     s_direct_offset = 0;
     uint8_t* p = g_epd.currentBuffer();
@@ -367,6 +383,7 @@ void fastepd_partial_prepare(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
         fastepd_epaper_begin();
     } else {
         g_epd.einkPower(1);
+        fastepd_apply_mode();
     }
     s_partial_x = x;
     s_partial_y = y;
