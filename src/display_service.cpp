@@ -1859,13 +1859,18 @@ void updatemsdata(){
     uint8_t statusByte = (((batteryVoltage10mv >> 8) & 0x01) ? OD_MSD_STATUS_BATTERY_VOLTAGE_BIT8 : 0) |
                          (rebootFlag ? OD_MSD_STATUS_REBOOT_FLAG : 0) |
                          (connectionRequested ? OD_MSD_STATUS_CONNECTION_REQUESTED : 0) |
+                         (isEncryptionEnabled() ? OD_MSD_STATUS_ENCRYPTION_ENABLED : 0) |
                          (((uint8_t)(mloopcounter << OD_MSD_STATUS_MAIN_LOOP_COUNTER_SHIFT)) & OD_MSD_STATUS_MAIN_LOOP_COUNTER_MASK);
     // Build the 16-byte advertisement via the canonical wire struct (all little-endian),
     // then copy into the global msd_payload[16] that the BLE adv APIs below consume.
     struct MsdAdvertisement m;
     memset(&m, 0, sizeof m);
     m.company_id = 0x2446;
-    memcpy(m.dynamic, dynamicreturndata, sizeof m.dynamic);
+    if (globalConfig.display_count == 0) {
+        memset(m.dynamic, 0xFF, sizeof m.dynamic);
+    } else {
+        memcpy(m.dynamic, dynamicreturndata, sizeof m.dynamic);
+    }
     m.chip_temperature = temperatureByte;
     m.battery_voltage_low = batteryVoltageLowByte;
     m.status = statusByte;

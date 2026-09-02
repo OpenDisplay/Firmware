@@ -5,6 +5,10 @@
 
 void reboot();
 void processButtonEvents();
+void buttonPressFeedback(void);
+#if defined(TARGET_ESP32)
+void buttonWakeDeliverSyntheticClick(void);
+#endif
 void flashLed(uint8_t color, uint8_t brightness);
 void processLedFlash();
 void initButtons();

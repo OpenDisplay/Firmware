@@ -272,6 +272,9 @@ void setup() {
     updatemsdata();
     if (is_deep_sleep_wake) { od_log_info("[wake] >> initButtons"); od_log_flush(); }
     initButtons();
+    if (woke_by_button) {
+        buttonWakeDeliverSyntheticClick();
+    }
     if (is_deep_sleep_wake) { od_log_info("[wake] >> initTouchInput"); od_log_flush(); }
     initTouchInput();
     #ifdef TARGET_ESP32
@@ -1054,7 +1057,7 @@ void loop() {
     } else {
         platformIdle();
     }
-    ble.tick();          // no-op on ESP32
+    ble.tick();          // restores ESP32 fast-adv window after button events
     processButtonEvents();
     processTouchInput();
     buzzerService();
@@ -1073,7 +1076,7 @@ void idleDelay(uint32_t delayMs) {
         // which is also what makes WDT CONFIG.SLEEP=1 safe: the CPU sleeps inside
         // delay() below, and the watchdog keeps counting through it.
         odWatchdogFeed();
-        ble.tick();   // no-op on ESP32
+        ble.tick();
         processButtonEvents();
         processTouchInput();
         processLedFlash();

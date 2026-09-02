@@ -3,10 +3,13 @@
 #include "touch_input.h"
 #include "power_latch.h"
 #include "buzzer_control.h"
+#include "display_service.h"
+#include "ble_transport.h"
 #include "od_log.h"
 #include <string.h>
 
 #ifdef TARGET_ESP32
+#include "wake_button.h"
 void enterDeepSleep(bool force = false, uint16_t overrideSleepSeconds = 0);
 #endif
 
@@ -235,6 +238,10 @@ static void pollAdcButtons() {
                                  ((l->press_count & 0x0F) << 3) |
                                  ((state & 0x01) << 7));
         if (l->byte_index < 11) dynamicreturndata[l->byte_index] = data;
+        if (state != 0u) {
+            ble.boostAdvertising();
+            buttonPressFeedback();
+        }
         updatemsdata();
         od_log_debug("ADC btn pin %u adc=%d idx=%d id=%u cnt=%u state=%u",
                     l->pin, adc, btn, l->last_button_id, l->press_count, state);
@@ -330,9 +337,10 @@ static void led_all_off(struct LedConfig* led) {
     if (led == NULL) {
         return;
     }
-    bool invertRed = (led->led_flags & 0x01) != 0;
-    bool invertGreen = (led->led_flags & 0x02) != 0;
-    bool invertBlue = (led->led_flags & 0x04) != 0;
+    bool invertRed = (led->led_flags & OD_LED_FLAG_LED1_INVERT) != 0;
+    bool invertGreen = (led->led_flags & OD_LED_FLAG_LED2_INVERT) != 0;
+    bool invertBlue = (led->led_flags & OD_LED_FLAG_LED3_INVERT) != 0;
+    bool invert4 = (led->led_flags & OD_LED_FLAG_LED4_INVERT) != 0;
     if (led->led_1_r != 0xFF) {
         digitalWrite(led->led_1_r, invertRed ? HIGH : LOW);
     }
@@ -341,6 +349,9 @@ static void led_all_off(struct LedConfig* led) {
     }
     if (led->led_3_b != 0xFF) {
         digitalWrite(led->led_3_b, invertBlue ? HIGH : LOW);
+    }
+    if (led->led_4 != 0xFF) {
+        digitalWrite(led->led_4, invert4 ? HIGH : LOW);
     }
 }
 
@@ -596,6 +607,88 @@ void handleLedStop(uint8_t* data, uint16_t len) {
     sendResponse(successResponse, sizeof(successResponse));
 }
 
+static void led_channels_on(struct LedConfig* led) {
+    if (led == NULL) {
+        return;
+    }
+    const bool invert1 = (led->led_flags & OD_LED_FLAG_LED1_INVERT) != 0;
+    const bool invert2 = (led->led_flags & OD_LED_FLAG_LED2_INVERT) != 0;
+    const bool invert3 = (led->led_flags & OD_LED_FLAG_LED3_INVERT) != 0;
+    const bool invert4 = (led->led_flags & OD_LED_FLAG_LED4_INVERT) != 0;
+    if (led->led_1_r != 0xFF) {
+        digitalWrite(led->led_1_r, invert1 ? LOW : HIGH);
+    }
+    if (led->led_2_g != 0xFF) {
+        digitalWrite(led->led_2_g, invert2 ? LOW : HIGH);
+    }
+    if (led->led_3_b != 0xFF) {
+        digitalWrite(led->led_3_b, invert3 ? LOW : HIGH);
+    }
+    if (led->led_4 != 0xFF) {
+        digitalWrite(led->led_4, invert4 ? LOW : HIGH);
+    }
+}
+
+static void ledButtonPressAlert(void) {
+    if (s_led.active) {
+        return;
+    }
+    struct LedConfig* led = nullptr;
+    for (uint8_t i = 0; i < globalConfig.led_count; i++) {
+        struct LedConfig* cand = &globalConfig.leds[i];
+        if ((cand->led_flags & OD_LED_FLAG_BUTTON_PRESS) == 0u) {
+            continue;
+        }
+        if (cand->led_1_r == 0xFF && cand->led_2_g == 0xFF &&
+            cand->led_3_b == 0xFF && cand->led_4 == 0xFF) {
+            continue;
+        }
+        led = cand;
+        break;
+    }
+    if (!led) {
+        return;
+    }
+    led_channels_on(led);
+    delay(60);
+    led_all_off(led);
+}
+
+void buttonPressFeedback(void) {
+    ledButtonPressAlert();
+    passiveBuzzerButtonPressAlert();
+}
+
+static void publishButtonMsd(ButtonState* btn, uint8_t pressed) {
+    if (btn == nullptr || btn->byte_index >= 11) {
+        return;
+    }
+    btn->current_state = pressed ? 1u : 0u;
+    const uint8_t buttonData = (uint8_t)((btn->button_id & 0x07u) |
+                                         ((btn->press_count & 0x0Fu) << 3) |
+                                         ((btn->current_state & 0x01u) << 7));
+    dynamicreturndata[btn->byte_index] = buttonData;
+    ble.boostAdvertising();
+    updatemsdata();
+}
+
+#if defined(TARGET_ESP32)
+void buttonWakeDeliverSyntheticClick(void) {
+    const int idx = wakeButtonFindIndex();
+    if (idx < 0) {
+        return;
+    }
+    ButtonState* btn = &buttonStates[idx];
+    btn->press_count = (uint8_t)((btn->press_count + 1u) & 0x0Fu);
+    od_log_info("Button wake: synthetic click id=%u pin=%u", btn->button_id, btn->pin);
+    publishButtonMsd(btn, 1u);
+    buttonPressFeedback();
+    delay(80);
+    publishButtonMsd(btn, 0u);
+    ble.tick();
+}
+#endif
+
 void processButtonEvents() {
     powerButtonPoll();
     pollConfiguredPowerOffButtons();   // no-op unless the board declares a latch
@@ -615,24 +708,13 @@ void processButtonEvents() {
             uint8_t logicalState = logicalPressed ? 1 : 0;
             btn->current_state = logicalState;
             od_log_debug("Button: %u, Press count: %u, Current state: %u", btn->button_id, btn->press_count, btn->current_state);
-            uint8_t buttonData = (btn->button_id & 0x07) |
-                                 ((btn->press_count & 0x0F) << 3) |
-                                 ((btn->current_state & 0x01) << 7);
-            if (btn->byte_index < 11) {
-                dynamicreturndata[btn->byte_index] = buttonData;
+            if (logicalState != 0u) {
+                buttonPressFeedback();
             }
+            publishButtonMsd(btn, logicalState);
         }
-        // ORDER IS LOAD-BEARING: boost first, publish second. updatemsdata() ends in
-        // setManufacturerData(), which calls applyAdvInterval() and then restarts
-        // advertising -- so the interval is chosen DURING the publish. Boosting
-        // afterwards set the deadline too late to affect the packet it exists for:
-        // the press went out at the 160 ms slow interval (~1 advertisement in a
-        // typical 230 ms press window, which a passive scanner routinely misses)
-        // while the release 230 ms later got the 20 ms boosted interval, because by
-        // then s_advBoostUntil was set. Net effect: a host saw "not pressed"
-        // reliably and "pressed" almost never.
-        ble.boostAdvertising();   // no-op where the stack has no fast-adv window
-        updatemsdata();
+        // boostAdvertising() runs inside publishButtonMsd(); order is load-bearing
+        // for nRF (interval chosen during setManufacturerData restart).
     }
 }
 

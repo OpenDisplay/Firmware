@@ -44,6 +44,30 @@ static volatile uint16_t s_disconnectReason = 0;
 static volatile uint32_t s_connectedWord = 0;      // identity of the last connect
 static volatile uint32_t s_disconnectedWord = 0;   // identity of the last disconnect
 
+static uint32_t s_advBoostUntil = 0;
+static constexpr uint32_t ESP_ADV_BOOST_MS = 3000u;
+static constexpr uint16_t ESP_ADV_INTERVAL_MIN = 0x0100u;  // 160 ms
+static constexpr uint16_t ESP_ADV_INTERVAL_MAX = 0x0640u;  // 1000 ms
+static constexpr uint16_t ESP_ADV_BOOST_MIN = 0x0020u;     // 20 ms
+static constexpr uint16_t ESP_ADV_BOOST_MAX = 0x0030u;     // 30 ms
+
+static void applyAdvInterval(BLEAdvertising* pAdvertising, bool fast) {
+    if (pAdvertising == nullptr) {
+        return;
+    }
+    if (fast) {
+        pAdvertising->setMinInterval(ESP_ADV_BOOST_MIN);
+        pAdvertising->setMaxInterval(ESP_ADV_BOOST_MAX);
+    } else {
+        pAdvertising->setMinInterval(ESP_ADV_INTERVAL_MIN);
+        pAdvertising->setMaxInterval(ESP_ADV_INTERVAL_MAX);
+    }
+}
+
+static bool advBoostActive(uint32_t now) {
+    return s_advBoostUntil != 0u && now < s_advBoostUntil;
+}
+
 // --- the instance table (CONNECTION_POLICY R3 requirement 5) -----------------
 // Sized by the connection cap. CONFIG_BT_NIMBLE_MAX_CONNECTIONS is 3 in the
 // precompiled sdkconfig.h for S3/C3/C6 and absent for classic ESP32 (NimBLE's own
@@ -381,6 +405,7 @@ void BleTransport::startAdvertising() {
     // name). Scan response is off by default in NimBLE 2.x, so no
     // enableScanResponse() needed.
     pAdvertising->setAdvertisementData(s_advertisementData);
+    applyAdvInterval(pAdvertising, advBoostActive(millis()));
     s_server->getAdvertising()->start();
     od_log_info("=== BLE advertising started successfully ===");
 }
@@ -550,6 +575,7 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
     // enableScanResponse()/setPreferredParams() reset NimBLE's custom-data flag
     // and would make start() drop this manufacturer-data payload.
     pAdvertising->setAdvertisementData(fresh);
+    applyAdvInterval(pAdvertising, advBoostActive(millis()));
     delay(50);
     pAdvertising->start();
 }
@@ -584,11 +610,32 @@ void BleTransport::requestFastLink() {
 }
 
 void BleTransport::boostAdvertising() {
-    // No-op: the temporary fast-advertising interval is nRF-only today.
+    s_advBoostUntil = millis() + ESP_ADV_BOOST_MS;
 }
 
 void BleTransport::tick() {
-    // No-op: nothing periodic to restore, since boostAdvertising() is a no-op.
+    static bool was_boosted = false;
+    const uint32_t now = millis();
+    const bool boosting = advBoostActive(now);
+    if (boosting) {
+        was_boosted = true;
+        return;
+    }
+    if (!was_boosted || s_server == nullptr || connectedCount() > 0) {
+        was_boosted = false;
+        s_advBoostUntil = 0;
+        return;
+    }
+    was_boosted = false;
+    s_advBoostUntil = 0;
+    BLEAdvertising* pAdvertising = s_server->getAdvertising();
+    if (pAdvertising == nullptr) {
+        return;
+    }
+    pAdvertising->stop();
+    applyAdvInterval(pAdvertising, false);
+    delay(50);
+    pAdvertising->start();
 }
 
 bool BleTransport::eventPending() const {
