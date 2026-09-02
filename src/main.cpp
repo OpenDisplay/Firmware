@@ -133,7 +133,9 @@ void setup() {
     }
     // Set only by the ESP32 wake-cause check below; NRF has no deep-sleep wake path.
     bool is_deep_sleep_wake = false;
+#ifdef TARGET_ESP32
     bool woke_by_button = false;
+#endif
     // Decode why we booted, on BOTH targets. On nRF this also reads the retained
     // breadcrumb, so a watchdog reset can name the panel phase that wedged. Must
     // run after od_log_init() (above) or the line is emitted into a dark port, and
@@ -272,9 +274,11 @@ void setup() {
     updatemsdata();
     if (is_deep_sleep_wake) { od_log_info("[wake] >> initButtons"); od_log_flush(); }
     initButtons();
+#if defined(TARGET_ESP32)
     if (woke_by_button) {
         buttonWakeDeliverSyntheticClick();
     }
+#endif
     if (is_deep_sleep_wake) { od_log_info("[wake] >> initTouchInput"); od_log_flush(); }
     initTouchInput();
     #ifdef TARGET_ESP32
