@@ -67,6 +67,13 @@
  *            new version heading on each bump -- see AGENT INSTRUCTIONS below)
  * --------------------------------------------------------------------------
  *   Unreleased (since 2.0)
+ *     - LedFlags bit4: OD_LED_FLAG_BUTTON_PRESS (short LED flash on physical
+ *       button press / button-wake synthetic click; default off).
+ *     - BuzzerFlags bit1: OD_BUZZER_FLAG_BUTTON_PRESS (short chirp on physical
+ *       button press / button-wake synthetic click; default off).
+ *     - MsdStatusBits bit3: OD_MSD_STATUS_ENCRYPTION_ENABLED (1 = app-layer
+ *       encryption active). Firmware sets it when encryption_enabled and master
+ *       key are non-zero; dynamic[11] is all 0xFF when no display is configured.
  *     - Doc-only: fixed two comment shapes the codegen parser mis-read and added
  *       the CODEGEN AUTHORING RULES banner section to prevent recurrence. Split the
  *       combined BusFlags/PinBitmap @bits comment into one comment per group; folded
@@ -735,11 +742,12 @@ enum LedType {
     OD_LED_TYPE_FOUR_SEPARATE = 3  /**< @doc "four separate LEDs" */
 };
 
-/* LedConfig.led_flags @bits LedFlags (bits 4-7 reserved). */
+/* LedConfig.led_flags @bits LedFlags (bits 5-7 reserved). */
 #define OD_LED_FLAG_LED1_INVERT        (1u << 0) /* @doc "invert LED channel 1 polarity" */
 #define OD_LED_FLAG_LED2_INVERT        (1u << 1) /* @doc "invert LED channel 2 polarity" */
 #define OD_LED_FLAG_LED3_INVERT        (1u << 2) /* @doc "invert LED channel 3 polarity" */
 #define OD_LED_FLAG_LED4_INVERT        (1u << 3) /* @doc "invert LED channel 4 polarity" */
+#define OD_LED_FLAG_BUTTON_PRESS       (1u << 4) /* @doc "short flash on physical button press (incl. button-wake synthetic click); default off" */
 
 /** @struct LedConfig  @packet 0x21  @repeatable max=4
  *  @doc "LED channel pins + invert flags. Up to 4 instances. 22 bytes. NOTE: the
@@ -963,8 +971,9 @@ OD_STATIC_ASSERT(sizeof(struct TouchController) == 32, "TouchController wire siz
  * 0x29  buzzer  (config.yaml packet name: passive_buzzer)
  * ----------------------------------------------------------------------- */
 
-/* BuzzerConfig.flags @bits BuzzerFlags (bits 1-7 reserved). */
+/* BuzzerConfig.flags @bits BuzzerFlags (bits 2-7 reserved). */
 #define OD_BUZZER_FLAG_ENABLE_ACTIVE_HIGH (1u << 0) /* @doc "enable pin is active-high when set; otherwise active-low" */
+#define OD_BUZZER_FLAG_BUTTON_PRESS       (1u << 1) /* @doc "short chirp on physical button press (incl. button-wake synthetic click); default off" */
 
 /** @struct BuzzerConfig  @packet 0x29  @repeatable max=4
  *  @doc "Buzzer (passive piezo, PWM-driven). Up to 4 instances. 32 bytes. The tone
@@ -1225,7 +1234,8 @@ OD_STATIC_ASSERT(sizeof(struct AuthProof) == 32, "AuthProof wire size");
 #define OD_MSD_STATUS_BATTERY_VOLTAGE_BIT8 (1u << 0) /* @doc "high bit of the 10-bit battery voltage (units of 10 mV); combine with battery_voltage_low" */
 #define OD_MSD_STATUS_REBOOT_FLAG          (1u << 1) /* @doc "device rebooted since last read" */
 #define OD_MSD_STATUS_CONNECTION_REQUESTED (1u << 2) /* @doc "device is requesting a connection" */
-#define OD_MSD_STATUS_RESERVED_3           (1u << 3) /* @reserved @doc "reserved; must be 0 (placeholder name for a future status flag; sits between the flags and the bits 4-7 counter)" */
+#define OD_MSD_STATUS_ENCRYPTION_ENABLED   (1u << 3) /* @doc "application-layer encryption active (encryption_enabled and non-zero master key)" */
+#define OD_MSD_STATUS_RESERVED_3           OD_MSD_STATUS_ENCRYPTION_ENABLED /* legacy doc name */
 #define OD_MSD_STATUS_MAIN_LOOP_COUNTER_SHIFT 4u     /* @doc "bits 4-7: free-running main-loop nibble counter (liveness)" */
 #define OD_MSD_STATUS_MAIN_LOOP_COUNTER_MASK  0xF0u  /* @doc "mask for the bits 4-7 main-loop counter nibble" */
 

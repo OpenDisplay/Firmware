@@ -248,6 +248,43 @@ bool detectButtonWake(int wakeupCause) {
     }
 }
 
+int wakeButtonFindIndex(void) {
+    uint8_t pin = 0xFF;
+    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+#if SOC_PM_SUPPORT_EXT0_WAKEUP
+    if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+        pin = s_ext0WakePin;
+    }
+#endif
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+    if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+        const uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+        if (mask != 0u) {
+            pin = (uint8_t)__builtin_ctzll(mask);
+        }
+    }
+#endif
+#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+        const uint64_t mask = esp_sleep_get_gpio_wakeup_status();
+        if (mask != 0u) {
+            pin = (uint8_t)__builtin_ctzll(mask);
+        }
+    }
+#endif
+    if (pin == 0xFF) {
+        return -1;
+    }
+    for (uint8_t i = 0; i < buttonStateCount; i++) {
+        if (buttonStates[i].initialized && buttonStates[i].pin == pin) {
+            return (int)i;
+        }
+    }
+    od_log_warn("Button wake: pin %u not in configured buttons", pin);
+    return -1;
+}
+
 #else  // not ESP32
 
 void armButtonWakeSources() {}

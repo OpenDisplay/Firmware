@@ -94,6 +94,7 @@ enum BuzzerNote : uint8_t {
 void initPassiveBuzzers(void);
 void handleBuzzerActivate(uint8_t* data, uint16_t len);
 void passiveBuzzerPowerOffAlert(void);
+void passiveBuzzerButtonPressAlert(void);
 void buzzerService(void);   // non-blocking playback tick, called from loop()
 /**
  * Silence the buzzer immediately. DEEP SLEEP ONLY -- not a session-teardown API.

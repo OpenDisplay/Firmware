@@ -385,3 +385,30 @@ void passiveBuzzerPowerOffAlert(void) {
     buzzer_set_enable(b, false);
     buzzer_drive_off(b);
 }
+
+void passiveBuzzerButtonPressAlert(void) {
+    buzzer_stop_internal();
+    const BuzzerConfig* b = nullptr;
+    for (uint8_t i = 0; i < globalConfig.passive_buzzer_count; i++) {
+        const BuzzerConfig* cand = &globalConfig.passive_buzzers[i];
+        const uint8_t pin = cand->drive_pin;
+        if (pin == 0 || pin == 0xFF) {
+            continue;
+        }
+        if ((cand->flags & OD_BUZZER_FLAG_BUTTON_PRESS) == 0u) {
+            continue;
+        }
+        b = cand;
+        break;
+    }
+    if (!b) {
+        return;
+    }
+    const uint32_t centihz = buzzer_index_to_centihz(nA5);
+    buzzer_set_enable(b, true);
+    buzzer_hw_tone_start(b->drive_pin, centihz, b->duty_percent);
+    delay(60);
+    buzzer_hw_tone_stop(b->drive_pin);
+    buzzer_set_enable(b, false);
+    buzzer_drive_off(b);
+}
