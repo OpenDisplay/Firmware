@@ -240,9 +240,11 @@ static void pollAdcButtons() {
         if (l->byte_index < 11) dynamicreturndata[l->byte_index] = data;
         if (state != 0u) {
             ble.boostAdvertising();
-            buttonPressFeedback();
         }
         updatemsdata();
+        if (state != 0u) {
+            buttonPressFeedback();
+        }
         od_log_debug("ADC btn pin %u adc=%d idx=%d id=%u cnt=%u state=%u",
                     l->pin, adc, btn, l->last_button_id, l->press_count, state);
     }
@@ -681,10 +683,19 @@ void buttonWakeDeliverSyntheticClick(void) {
     ButtonState* btn = &buttonStates[idx];
     btn->press_count = (uint8_t)((btn->press_count + 1u) & 0x0Fu);
     od_log_info("Button wake: synthetic click id=%u pin=%u", btn->button_id, btn->pin);
+    // Publish pressed MSD first so scanners see it before blocking feedback delays.
     publishButtonMsd(btn, 1u);
     buttonPressFeedback();
-    delay(80);
-    publishButtonMsd(btn, 0u);
+
+    // If the finger is still down, leave current_state=1 so the real release edge
+    // can fire the ISR. Only synthesize the up if the pin already released during
+    // boot (otherwise hosts never see a lift after a held wake press).
+    const bool pinState = digitalRead(btn->pin);
+    const bool stillHeld = btn->inverted ? !pinState : pinState;
+    if (!stillHeld) {
+        delay(80);
+        publishButtonMsd(btn, 0u);
+    }
     ble.tick();
 }
 #endif
@@ -708,10 +719,12 @@ void processButtonEvents() {
             uint8_t logicalState = logicalPressed ? 1 : 0;
             btn->current_state = logicalState;
             od_log_debug("Button: %u, Press count: %u, Current state: %u", btn->button_id, btn->press_count, btn->current_state);
+            // Publish before feedback: LED/buzzer use blocking delays and would
+            // otherwise postpone the pressed advertisement.
+            publishButtonMsd(btn, logicalState);
             if (logicalState != 0u) {
                 buttonPressFeedback();
             }
-            publishButtonMsd(btn, logicalState);
         }
         // boostAdvertising() runs inside publishButtonMsd(); order is load-bearing
         // for nRF (interval chosen during setManufacturerData restart).
