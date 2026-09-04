@@ -10,7 +10,7 @@
  *   fully-correct client from THIS FILE ALONE, without reading firmware.
  *
  *   OD_PROTOCOL_VERSION 2.2   (MAJOR.MINOR; see VERSIONING POLICY below)
- *   LAST CHANGED        2026-07-22
+ *   LAST CHANGED        2026-07-25
  *
  * --------------------------------------------------------------------------
  * VERSIONING POLICY
@@ -71,6 +71,11 @@
  *       silently dropped. Breaking only for peers that wrote >253 bytes in a
  *       single GATT write (none deployed -- HA's GATT client caps at 244 and
  *       rejects larger writes outright).
+ *     - DOC-ONLY: expand the CMD_FIRMWARE_VERSION (0x0043) @response layout to
+ *       spell out the [shaLen:1][sha:shaLen] and optional trailing [patch:1]
+ *       bytes (shaLen = ASCII SHA byte count 0..40; missing patch => 0), matching
+ *       what shipped firmware already emits. Backported from Firmware's vendored
+ *       copy. No wire change, no version bump.
  *     - Add each further wire-spec change here as it lands. On the next version
  *       bump, move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *

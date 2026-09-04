@@ -852,10 +852,11 @@ bool fastepd_driver_used(void) {
     // FastEPD IT8951 (SPI) path: E Ink ED103TC2 (Seeed reTerminal).
     const bool it8951 = (d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404 ||
                          d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY);
-    // FastEPD native parallel path: Soldered Inkplate 5V2 / 10.
-    const bool inkplate = (d.panel_ic_type == OD_PANEL_IC_INKPLATE5V2_1280X720 ||
-                           d.panel_ic_type == OD_PANEL_IC_INKPLATE10_1200X825);
-    if (!it8951 && !inkplate) return false;
+    // FastEPD native parallel path: Soldered Inkplate 5V2 / 10, M5Stack PaperS3.
+    const bool parallel = (d.panel_ic_type == OD_PANEL_IC_INKPLATE5V2_1280X720 ||
+                           d.panel_ic_type == OD_PANEL_IC_INKPLATE10_1200X825 ||
+                           d.panel_ic_type == OD_PANEL_IC_M5PAPERS3_960X540);
+    if (!it8951 && !parallel) return false;
     if (d.display_technology != 0 && d.display_technology != 1) return false;
     return true;
 #endif
