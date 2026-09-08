@@ -65,7 +65,6 @@ extern BBEPDISP bbep;
 extern struct GlobalConfig globalConfig;
 extern uint8_t msd_payload[16];
 extern uint8_t dynamicreturndata[11];
-extern uint8_t rebootFlag;
 extern uint8_t activeLedInstance;
 extern bool connectionRequested;
 extern uint8_t mloopcounter;
@@ -1868,7 +1867,7 @@ void updatemsdata(){
     uint8_t temperatureByte = (uint8_t)tempEncoded;
     uint8_t batteryVoltageLowByte = (uint8_t)(batteryVoltage10mv & 0xFF);
     uint8_t statusByte = (((batteryVoltage10mv >> 8) & 0x01) ? OD_MSD_STATUS_BATTERY_VOLTAGE_BIT8 : 0) |
-                         (rebootFlag ? OD_MSD_STATUS_REBOOT_FLAG : 0) |
+                         (getRebootFlag() ? OD_MSD_STATUS_REBOOT_FLAG : 0) |
                          (connectionRequested ? OD_MSD_STATUS_CONNECTION_REQUESTED : 0) |
                          (isEncryptionEnabled() ? OD_MSD_STATUS_ENCRYPTION_ENABLED : 0) |
                          (((uint8_t)(mloopcounter << OD_MSD_STATUS_MAIN_LOOP_COUNTER_SHIFT)) & OD_MSD_STATUS_MAIN_LOOP_COUNTER_MASK);

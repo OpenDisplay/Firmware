@@ -109,9 +109,9 @@ uint8_t mloopcounter = 0;
 #ifdef TARGET_ESP32
 // Persists across deep sleep so a wake is not mistaken for a reboot. Re-armed
 // on the boot-screen path in setup(), which is the only path a real reset takes.
-RTC_DATA_ATTR uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection
+RTC_DATA_ATTR uint8_t rebootFlag = 1;  // Set to 1 on reboot or config write, cleared to 0 on BLE connection
 #else
-uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection
+uint8_t rebootFlag = 1;  // Set to 1 on reboot or config write, cleared to 0 on BLE connection
 #endif
 uint8_t connectionRequested = 0;  // Reserved for future features (connection requested flag)
 uint8_t dynamicreturndata[11] = {0};  // Dynamic return data blocks (bytes 2-12 in advertising payload)
@@ -248,6 +248,7 @@ uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
 uint8_t getFirmwarePatch();
 uint32_t getDeepSleepCount();  // RTC-persisted wake cycle count on ESP32; always 0 on nRF52840
+uint8_t getRebootFlag();  // 1 after reboot or a live config write, cleared to 0 on BLE connection
 float readBatteryVoltage();  // Returns battery voltage in volts, or -1.0 if not configured
 float readChipTemperature();  // Returns chip temperature in degrees Celsius
 int getplane();

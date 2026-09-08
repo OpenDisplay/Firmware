@@ -1051,7 +1051,7 @@ def cmd_read_msd(args: argparse.Namespace) -> int:
     voltage = info["battery_voltage_v"]
     print(f"Battery voltage: {f'{voltage:.2f} V' if voltage is not None else 'unknown (raw=0 - unconfigured or not yet sampled)'}")
     print(f"Chip temperature: {info['temperature_c']:.1f} C")
-    print(f"Reboot flag: {info['reboot_flag']}")
+    print(f"State changed (reboot/config): {info['reboot_flag']}")
     print(f"Connection requested: {info['connection_requested']}")
     print(f"Loop counter: {info['loop_counter']}")
     print(f"Dynamic data (bytes 2-12): {info['dynamic_data_hex']}")
