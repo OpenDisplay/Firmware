@@ -9,6 +9,7 @@
 #include "buzzer_control.h"
 #include "sensor_sht40.h"
 #include "sensor_bq27220.h"
+#include "sensor_axp2101.h"
 #include "communication.h"
 #include "encryption.h"
 #include "boot_screen.h"
@@ -857,10 +858,11 @@ bool fastepd_driver_used(void) {
     // FastEPD IT8951 (SPI) path: E Ink ED103TC2 (Seeed reTerminal).
     const bool it8951 = (d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404 ||
                          d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY);
-    // FastEPD native parallel path: Soldered Inkplate 5V2 / 10.
-    const bool inkplate = (d.panel_ic_type == OD_PANEL_IC_INKPLATE5V2_1280X720 ||
-                           d.panel_ic_type == OD_PANEL_IC_INKPLATE10_1200X825);
-    if (!it8951 && !inkplate) return false;
+    // FastEPD native parallel path: Soldered Inkplate 5V2 / 10, M5Stack PaperS3.
+    const bool parallel = (d.panel_ic_type == OD_PANEL_IC_INKPLATE5V2_1280X720 ||
+                           d.panel_ic_type == OD_PANEL_IC_INKPLATE10_1200X825 ||
+                           d.panel_ic_type == OD_PANEL_IC_M5PAPERS3_960X540);
+    if (!it8951 && !parallel) return false;
     if (d.display_technology != 0 && d.display_technology != 1) return false;
     return true;
 #endif
@@ -1790,6 +1792,10 @@ static float readBatteryVoltageUncached() {
         if (gaugeV >= 0.0f) {
             return gaugeV;
         }
+    }
+    const float pmicV = axp2101BatteryVoltageVolts(globalConfig.sensors, globalConfig.sensor_count);
+    if (pmicV >= 0.0f) {
+        return pmicV;
     }
     if (globalConfig.power_option.battery_sense_pin == 0xFF) return -1.0;
     uint8_t sensePin = globalConfig.power_option.battery_sense_pin;
