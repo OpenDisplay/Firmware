@@ -530,13 +530,8 @@ static void serviceBleDisconnectCleanup() {
 // "not yet" paths so a later pass retries.
 static void serviceBleAdvertisingRestart() {
     if (!s_advertisingRestartPending) return;
-    // Capability gate, and the reason this helper is safe for ANY caller to
-    // raise the flag: where the stack re-arms advertising itself (nRF's
-    // restartOnDisconnect(true)), driving our own stop()/start() would fight it.
-    // Refusing here rather than at each raise site means a new raiser -- the
-    // post-refresh hook in display_service.cpp, or a future portable
-    // requestAdvertisingRestart() -- cannot reintroduce that conflict by
-    // forgetting a target guard.
+    // Capability gate: where the stack re-arms advertising itself, driving our
+    // own stop()/start() would fight it.
     if (ble.restartsAdvertisingOnDisconnect()) {
         s_advertisingRestartPending = false;
         return;
@@ -548,8 +543,8 @@ static void serviceBleAdvertisingRestart() {
     }
     if (epdRefreshInProgress) return;                        // never mid-refresh
     s_advertisingRestartPending = false;
+    // Slow re-arm only — no updatemsdata() (that stop/starts advertising again).
     ble.restartAdvertising();
-    updatemsdata();
 }
 
 // Translate the transport's consume-once connect/disconnect events into the

@@ -413,8 +413,15 @@ void BleTransport::startAdvertising() {
 void BleTransport::restartAdvertising() {
     // Unconditional by contract: the caller owns the "still connected / mid-EPD
     // refresh / stack not up" deferral policy (see serviceBleAdvertisingRestart
-    // in main.cpp). The delay mirrors the historical sequence.
+    // in main.cpp). Force slow intervals so a disconnect restart never inherits
+    // a prior button-boost burst.
     delay(100);
+    s_advBoostUntil = 0;
+    BLEAdvertising* pAdvertising = (s_server != nullptr) ? s_server->getAdvertising()
+                                                         : BLEDevice::getAdvertising();
+    if (pAdvertising != nullptr) {
+        applyAdvInterval(pAdvertising, false);
+    }
     BLEDevice::startAdvertising();
     od_log_info("BLE advertising restarted");
 }
@@ -587,6 +594,10 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
 // Called from loop() when the connect event is consumed, not from the connect
 // callback -- these are host-stack calls, which the callback contract excludes.
 void BleTransport::requestFastLink() {
+    // Connected: drop any button boost so a later advertising restart does not
+    // inherit 20–30 ms intervals from a still-open boost window.
+    s_advBoostUntil = 0;
+
     // Tune the OWNER's link. This used to read the single s_connHandle scalar,
     // which the newest connect overwrote -- so with a contender attached, link
     // tuning targeted the wrong link (one of the shared-scalar defects R3 names).

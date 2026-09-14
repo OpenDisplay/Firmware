@@ -69,6 +69,10 @@
  *   Unreleased (since 2.0)
  *     - LedFlags bit4: OD_LED_FLAG_BUTTON_PRESS (short LED flash on physical
  *       button press / button-wake synthetic click; default off).
+ *     - LedFlags bit5: OD_LED_FLAG_NFC (short white LED flash on NFC field
+ *       detect rising edge; default off).
+ *     - LedFlags bit6: OD_LED_FLAG_NFC_FANCY (multi-colour LED blink on NFC
+ *       field detect; default off; takes precedence over bit5 when both set).
  *     - BuzzerFlags bit1: OD_BUZZER_FLAG_BUTTON_PRESS (short chirp on physical
  *       button press / button-wake synthetic click; default off).
  *     - MsdStatusBits bit3: OD_MSD_STATUS_ENCRYPTION_ENABLED (1 = app-layer
@@ -742,12 +746,14 @@ enum LedType {
     OD_LED_TYPE_FOUR_SEPARATE = 3  /**< @doc "four separate LEDs" */
 };
 
-/* LedConfig.led_flags @bits LedFlags (bits 5-7 reserved). */
+/* LedConfig.led_flags @bits LedFlags (bit 7 reserved). */
 #define OD_LED_FLAG_LED1_INVERT        (1u << 0) /* @doc "invert LED channel 1 polarity" */
 #define OD_LED_FLAG_LED2_INVERT        (1u << 1) /* @doc "invert LED channel 2 polarity" */
 #define OD_LED_FLAG_LED3_INVERT        (1u << 2) /* @doc "invert LED channel 3 polarity" */
 #define OD_LED_FLAG_LED4_INVERT        (1u << 3) /* @doc "invert LED channel 4 polarity" */
 #define OD_LED_FLAG_BUTTON_PRESS       (1u << 4) /* @doc "short flash on physical button press (incl. button-wake synthetic click); default off" */
+#define OD_LED_FLAG_NFC                (1u << 5) /* @doc "short white flash on NFC field-detect rising edge; default off" */
+#define OD_LED_FLAG_NFC_FANCY          (1u << 6) /* @doc "multi-colour blink on NFC field-detect rising edge; default off; overrides OD_LED_FLAG_NFC when both set" */
 
 /** @struct LedConfig  @packet 0x21  @repeatable max=4
  *  @doc "LED channel pins + invert flags. Up to 4 instances. 22 bytes. NOTE: the

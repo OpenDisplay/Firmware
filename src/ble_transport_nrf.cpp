@@ -59,22 +59,25 @@ static volatile bool     s_instanceSubscribed = false;
 static volatile uint32_t s_instanceDecidedWord = 0;
 
 // --- advertising interval policy --------------------------------------------
+// Bluefruit always restarts advertising after disconnect in its "fast" phase
+// (setFastTimeout). Use the slow interval for both phases so a disconnect does
+// not burn a multi-second high-rate burst. Button wakes still call
+// boostAdvertising() for a short 20–30 ms window.
 static uint32_t s_advBoostUntil = 0;
 
-static constexpr uint16_t NRF_ADV_INTERVAL_MIN = 256;   // 160 ms
 static constexpr uint16_t NRF_ADV_INTERVAL_MAX = 1600;  // 1000 ms
 static constexpr uint16_t NRF_ADV_BOOST_MIN = 32;       // 20 ms
 static constexpr uint16_t NRF_ADV_BOOST_MAX = 48;       // 30 ms
 static constexpr uint32_t NRF_ADV_BOOST_MS = 3000;
 
 static void applyAdvInterval() {
-    if (!globalConfig.loaded) {
-        Bluefruit.Advertising.setInterval(NRF_ADV_BOOST_MIN, NRF_ADV_BOOST_MAX);
-    } else if (s_advBoostUntil != 0 && millis() < s_advBoostUntil) {
+    if (!globalConfig.loaded || (s_advBoostUntil != 0 && millis() < s_advBoostUntil)) {
         Bluefruit.Advertising.setInterval(NRF_ADV_BOOST_MIN, NRF_ADV_BOOST_MAX);
     } else {
         s_advBoostUntil = 0;
-        Bluefruit.Advertising.setInterval(NRF_ADV_INTERVAL_MIN, NRF_ADV_INTERVAL_MAX);
+        // Identical fast/slow intervals: restartOnDisconnect starts in "fast"
+        // mode but at the slow rate — no post-disconnect advertising burst.
+        Bluefruit.Advertising.setInterval(NRF_ADV_INTERVAL_MAX, NRF_ADV_INTERVAL_MAX);
     }
 }
 
@@ -249,6 +252,9 @@ bool BleTransport::begin(const char* deviceName) {
     od_log_info("BLE callbacks registered");
     Bluefruit.setName(deviceName);
     od_log_info("Device name set to: %s", deviceName);
+    // Preferred supervision timeout 1 s (was Bluefruit default 2 s). Central may
+    // still negotiate longer; shortens unclean link-loss radio hang when accepted.
+    Bluefruit.Periph.setConnSupervisionTimeoutMS(1000);
     od_log_info("Configuring power management...");
     sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
     sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
@@ -263,20 +269,29 @@ void BleTransport::startAdvertising() {
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     Bluefruit.Advertising.addName();
     // Deliberately kept inside this sequence rather than hoisted to the caller:
-    // updatemsdata() lands in setManufacturerData() below, which itself sets
-    // setFastTimeout(1). Calling it after the setFastTimeout(10) line would leave
-    // the fast-advertising window at 1 s instead of 10 s -- a real behaviour
-    // change. Phase 1 keeps the historical order byte-for-byte.
+    // updatemsdata() lands in setManufacturerData() below.
     updatemsdata();
-    Bluefruit.Advertising.restartOnDisconnect(true);
+    // App-owned restart after disconnect (see restartAdvertising): SoftDevice
+    // auto-restart always began a timed "fast" phase and fought our slow policy.
+    Bluefruit.Advertising.restartOnDisconnect(false);
+    s_advBoostUntil = 0;
     applyAdvInterval();
-    Bluefruit.Advertising.setFastTimeout(10);
+    // duration 0 + equal slow/slow intervals → continuous slow advertising, no
+    // timed burst phase after start or (via restartAdvertising) after disconnect.
+    Bluefruit.Advertising.setFastTimeout(0);
     od_log_info("Starting BLE advertising...");
     Bluefruit.Advertising.start(0);
 }
 
 void BleTransport::restartAdvertising() {
-    Bluefruit.Advertising.stop();
+    // Slow-only re-arm after disconnect. Do not call updatemsdata() here — that
+    // stop/start + possible MSD rebuild is what reintroduced radio bursts.
+    s_advBoostUntil = 0;
+    applyAdvInterval();
+    Bluefruit.Advertising.setFastTimeout(0);
+    if (Bluefruit.Advertising.isRunning()) {
+        Bluefruit.Advertising.stop();
+    }
     Bluefruit.Advertising.start(0);
 }
 
@@ -368,7 +383,16 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
     Bluefruit.Advertising.addName();
     Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, msd, len);
     applyAdvInterval();
-    Bluefruit.Advertising.setFastTimeout(1);
+    // Boost window: short timed phase at boost intervals. Otherwise continuous
+    // slow (fast timeout 0 with equal slow/slow intervals).
+    if (s_advBoostUntil != 0 && millis() < s_advBoostUntil) {
+        Bluefruit.Advertising.setFastTimeout((uint16_t)((NRF_ADV_BOOST_MS + 999) / 1000));
+    } else {
+        Bluefruit.Advertising.setFastTimeout(0);
+    }
+    // Only touch the radio while disconnected. Rebuilding MSD while connected
+    // used to stop/start advertising and could leave a burst after the link dropped.
+    if (Bluefruit.connected()) return;
     Bluefruit.Advertising.stop();
     Bluefruit.Advertising.start(0);
 }
@@ -384,6 +408,11 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
 // nothing -- the central's own request arrives later than this either way, which
 // is why the diagnostics below log twice.
 void BleTransport::requestFastLink() {
+    // Connected: drop any button boost so the next restartOnDisconnect does not
+    // inherit 20–30 ms intervals from a still-open boost window.
+    s_advBoostUntil = 0;
+    Bluefruit.Advertising.setInterval(NRF_ADV_INTERVAL_MAX, NRF_ADV_INTERVAL_MAX);
+
     BLEConnection* conn = Bluefruit.Connection(s_connHandle);
     if (conn == nullptr) return;
 
@@ -427,7 +456,8 @@ void BleTransport::tick() {
     }
     was_boosted = false;
     s_advBoostUntil = 0;
-    Bluefruit.Advertising.setInterval(NRF_ADV_INTERVAL_MIN, NRF_ADV_INTERVAL_MAX);
+    Bluefruit.Advertising.setInterval(NRF_ADV_INTERVAL_MAX, NRF_ADV_INTERVAL_MAX);
+    Bluefruit.Advertising.setFastTimeout(0);
     Bluefruit.Advertising.stop();
     Bluefruit.Advertising.start(0);
 }
@@ -476,10 +506,8 @@ bool BleTransport::takeDisconnectedEvent(uint16_t* reason, uint32_t* instanceWor
 }
 
 bool BleTransport::restartsAdvertisingOnDisconnect() const {
-    // Bluefruit.Advertising.restartOnDisconnect(true) in startAdvertising(): the
-    // SoftDevice re-arms the radio itself, so the application must not also
-    // schedule a restart or the two fight over the advertising state.
-    return true;
+    // restartOnDisconnect(false): loop() owns slow re-arm via restartAdvertising().
+    return false;
 }
 
 const char* BleTransport::addressString() {

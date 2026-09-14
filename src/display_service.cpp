@@ -342,12 +342,17 @@ static void pwrmgmLockGive(void) {
 // refresh looked correct, then the image darkened in over the following minutes.
 static const uint16_t EPD_POST_SLEEP_BLEED_MS = 200;
 
+static bool panel_is_ep426(void) {
+    return bbep.type == EP426_800x480 || bbep.type == EP426_800x480_4GRAY;
+}
+
 // SSD16xx bbepSleep() only sends deep-sleep; it does not run the analog/HV
-// shutdown. Force EOPT discharge frames + the GoodDisplay/GxEPD2 power-off
-// sequence (enable clock → disable analog → disable OSC) while SPI is still up.
+// shutdown. The EOPT + 0x83 discharge ("gray fix") is required on EP42B 400x300
+// but burns ~1 s @ high current on EP426 800x480 — skip the whole sequence there.
 static void epdSsd16xxPowerOffDischarge(void) {
     if (bbep.chip_type != BBEP_CHIP_SSD16xx) return;
     if (!bbep.is_awake) return;
+    if (panel_is_ep426()) return;
     bbepCMD2(&bbep, 0x3F, 0x22); // EOPT: TFT discharge frames + sequenced VCOM/HV
     bbepCMD2(&bbep, SSD1608_DISP_CTRL2, 0x83);
     bbepWriteCmd(&bbep, SSD1608_MASTER_ACTIVATE);
@@ -375,7 +380,7 @@ static void epdSessionForceOffLocked(void) {
         odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
         epdSsd16xxPowerOffDischarge();
         bbepSleep(&bbep, 1);
-        delay(EPD_POST_SLEEP_BLEED_MS);
+        if (!panel_is_ep426()) delay(EPD_POST_SLEEP_BLEED_MS);
     }
     pwrmgm(false);   // -> PWR_OFF, clears deadline
     epdPlanesPrepared = false;
@@ -3375,9 +3380,53 @@ static bool partial_write_stream_bytes(uint8_t* data, uint32_t len) {
     return true;
 }
 
+// EP426 (SSD1677) OTP Mode-2 under-drives W→B. Register LUT follows EP426B's
+// VS row layout (white on row1 / black on row2). Single ~50-frame phase —
+// dual 0x32/0x32 looked settled after the first HV spike, so the second
+// phase was mostly wasted energy. Activate with 0xDC (register LUT, no OTP).
+static const uint8_t epd426_partial_lut[105] = {
+    // VS: same channel order as epd426b_init_part (not WW/BW/WB labels)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // TP/RP groups 0..9 — one ~50-frame pulse (was 0x32,0x32)
+    0x32, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x22, 0x22, 0x22, 0x22, 0x22,
+};
+
+static void epd426_load_custom_partial_lut(void) {
+    uint8_t ctrl1[2] = {0x00, 0x00};
+    uint8_t src[3] = {0x41, 0xa8, 0x32};
+    bbepWriteCmd(&bbep, SSD1608_WRITE_LUT);
+    bbepWriteData(&bbep, (uint8_t *)epd426_partial_lut, (int)sizeof(epd426_partial_lut));
+    bbepCMD2(&bbep, SSD1608_GATE_VOLTAGE, 0x17);
+    bbepWriteCmd(&bbep, SSD1608_SOURCE_VOLTAGE);
+    bbepWriteData(&bbep, src, 3);
+    bbepCMD2(&bbep, SSD1608_WRITE_VCOM, 0x40); // EP426B partial VCOM (0x30 drifts white→gray)
+    bbepWriteCmd(&bbep, SSD1608_DISP_CTRL1);
+    bbepWriteData(&bbep, ctrl1, 2);
+}
+
 static bool partial_trigger_refresh(int refreshMode) {
     if (refreshMode < 0 || refreshMode > 3) refreshMode = REFRESH_PARTIAL;
     if (panel_skips_reinit_on_partial_refresh(&bbep)) {
+        if (refreshMode == REFRESH_PARTIAL && bbep.type == EP426_800x480) {
+            epd426_load_custom_partial_lut();
+            bbepCMD2(&bbep, SSD1608_DISP_CTRL2, 0xdc);
+            bbepWriteCmd(&bbep, SSD1608_MASTER_ACTIVATE);
+            return waitforrefresh(60);
+        }
         if (panel_uses_ep397_y_decrement(&bbep)) {
             static const uint8_t u8CMDz3[4] = {0xf7, 0xd7, 0xff, 0};
             bbepCMD2(&bbep, SSD1608_DISP_CTRL2, u8CMDz3[refreshMode]);
