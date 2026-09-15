@@ -9,6 +9,7 @@ uint16_t calculateCRC16CCITT(uint8_t* data, uint32_t len);
 uint8_t getFirmwareMajor();
 uint8_t getFirmwareMinor();
 uint8_t getFirmwarePatch();
+uint8_t getRebootFlag();  // 1 after reboot or a live config write, cleared to 0 on BLE connection
 const char* getFirmwareShaString();
 void handleFirmwareVersion();
 void handleReadMSD();
@@ -79,5 +80,11 @@ void requestTransferSessionCleanup(void);
 /// Re-arm BLE advertising when it is safe to. Schedules application-owned slow
 /// re-arm on both targets (see BleTransport::restartsAdvertisingOnDisconnect).
 void requestAdvertisingRestart(void);
+
+/// Set rebootFlag and refresh the advertised MSD payload immediately after a
+/// config write. Unlike the two requests above this is not deferred: it is
+/// safe to run synchronously from the command handler, the same way
+/// updatemsdata() already runs synchronously from button/sensor call sites.
+void notifyConfigChangedOverBle(void);
 
 #endif

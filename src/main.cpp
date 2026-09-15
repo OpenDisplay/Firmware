@@ -321,6 +321,10 @@ uint32_t getDeepSleepCount() {
 #endif
 }
 
+uint8_t getRebootFlag() {
+    return rebootFlag;
+}
+
 // Deferred work, serviced by loop(). File-static on purpose: these encode
 // application policy, so nothing outside this file reads them, and the two that
 // other translation units need to RAISE do so through the request functions
@@ -358,6 +362,17 @@ void requestTransferSessionCleanup(void) {
 
 void requestAdvertisingRestart(void) {
     s_advertisingRestartPending = true;
+}
+
+void notifyConfigChangedOverBle(void) {
+    // Mirrors the boot-time meaning of rebootFlag: a scanning hub sees it set in
+    // the advertised MSD payload and knows to reconnect and re-read config
+    // instead of trusting a cached copy (e.g. stale color_scheme). A config
+    // write changes the same on-device state a reboot would, so it must raise
+    // the same flag -- otherwise a live BLE write is invisible to anyone who
+    // isn't the client that just wrote it.
+    rebootFlag = 1;
+    updatemsdata();
 }
 
 #ifdef TARGET_ESP32

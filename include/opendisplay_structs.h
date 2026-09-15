@@ -1246,7 +1246,7 @@ OD_STATIC_ASSERT(sizeof(struct AuthProof) == 32, "AuthProof wire size");
 /* MsdAdvertisement.status @bits MsdStatusBits. bit0 is the 9th (MSB) bit of the
  * 10-bit battery voltage; bits 4-7 are a free-running main-loop nibble counter. */
 #define OD_MSD_STATUS_BATTERY_VOLTAGE_BIT8 (1u << 0) /* @doc "high bit of the 10-bit battery voltage (units of 10 mV); combine with battery_voltage_low" */
-#define OD_MSD_STATUS_REBOOT_FLAG          (1u << 1) /* @doc "device rebooted since last read" */
+#define OD_MSD_STATUS_REBOOT_FLAG          (1u << 1) /* @doc "device state changed since last read (reboot or live config write)" */
 #define OD_MSD_STATUS_CONNECTION_REQUESTED (1u << 2) /* @doc "device is requesting a connection" */
 #define OD_MSD_STATUS_ENCRYPTION_ENABLED   (1u << 3) /* @doc "application-layer encryption active (encryption_enabled and non-zero master key)" */
 #define OD_MSD_STATUS_RESERVED_3           (1u << 3) /* @deprecated @doc "legacy name for OD_MSD_STATUS_ENCRYPTION_ENABLED (same bit)" */

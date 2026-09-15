@@ -595,6 +595,12 @@ void handleWriteConfig(uint8_t* data, uint16_t len) {
         reloadConfigAfterSave();
     }
     sendResponse(ok ? responseOk : responseErr, 4);
+    if (ok) {
+        // Runs after the ACK: unlike the reload above, this only affects what
+        // OTHER scanners see, and updatemsdata() can block tens of ms on a
+        // sensor-cache miss -- no reason to make the writer's own ACK wait on it.
+        notifyConfigChangedOverBle();
+    }
 }
 
 void handleClearConfig(void) {
@@ -644,6 +650,10 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len) {
             reloadConfigAfterSave();
         }
         sendResponse(saved ? ok : err, 4);
+        if (saved) {
+            // See handleWriteConfig(): deferred past the ACK on purpose.
+            notifyConfigChangedOverBle();
+        }
         resetChunkedWriteState();
     } else {
         uint8_t ackResponse[] = {RESP_ACK, RESP_CONFIG_CHUNK, 0x00, 0x00};
