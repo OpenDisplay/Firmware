@@ -56,6 +56,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_WS_PP_INIT   (1 << 2)  // Bit 2: Call ws_pp_init() after config load (Waveshare Photo Printer)
 #define DEVICE_FLAG_BATTERY_LATCH (1 << 3) // Bit 3: Self-holding battery latch on pwr_pin_2; optional active-low long-press shutdown button on pwr_pin_3
 #define DEVICE_FLAG_PWR_LATCH_DFF (1 << 4) // Bit 4: 74AHC1G79 D-FF latch; pwr_pin_2=D, pwr_pin_3=CP; release via command 0x0052
+#define DEVICE_FLAG_NM420_INIT   (1 << 5)  // Bit 5: Call nm420_init() after config load (RockBase NM-EPD-420 -- holds the unused peripheral enable rails LOW)
 
 #ifdef TARGET_NRF
 // The Bluefruit stack objects (BLEDfu / BLEService / BLECharacteristic) are now
@@ -191,7 +192,9 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
 void powerDownExternalFlashFromConfig(void);
 void xiaoinit();
 void ws_pp_init();
+void nm420_init();
 #ifdef TARGET_ESP32
+void nm420HoldForSleep();
 void fullSetupAfterConnection();
 // force: sleep even with a client connected (explicit host request 0x0053).
 // overrideSleepSeconds: nonzero replaces deep_sleep_time_seconds for this one

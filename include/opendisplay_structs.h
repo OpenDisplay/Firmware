@@ -79,6 +79,15 @@
  *       encryption active). Firmware sets it when encryption_enabled and master
  *       key are non-zero; dynamic[11] is all 0xFF when no display is configured.
  *       (Folded back from the Firmware side, PR #157 — parity restore.)
+ *     - DeviceFlags bit5: OD_DEVICE_FLAG_NM420_INIT (apply RockBase NM-EPD-420
+ *       low-power init -- drive the board's unused peripheral enable/gate pins
+ *       LOW after config load: LoRa EN, ES8311 CODEC_EN, audio PA_CTRL, AHT20
+ *       TEMP_CTL and battery ADC_EN; AHT20/ADC_EN pulse on only while sampled).
+ *       Bits 5-7 were reserved, so the DeviceFlags group
+ *       comment now reads bits 6-7 reserved.
+ *     - SensorType 6 is nPM1300 (already used by another OpenDisplay firmware
+ *       family); SensorType 7 is AHT20, publishing the same 3-byte
+ *       temperature/humidity MSD value as SHT40. GPIO40 gates its supply.
  *     - Add each payload-layout change here as it lands. On the next version bump,
  *       move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
@@ -428,12 +437,13 @@ enum ManufacturerId {
 #define OD_COMM_MODE_OEPL              (1u << 1) /* @doc "OEPL (OpenEPaperLink) transfer supported" */
 #define OD_COMM_MODE_WIFI              (1u << 2) /* @doc "WiFi transfer supported" */
 
-/* SystemConfig.device_flags @bits DeviceFlags (bits 5-7 reserved). */
+/* SystemConfig.device_flags @bits DeviceFlags (bits 6-7 reserved). */
 #define OD_DEVICE_FLAG_PWR_PIN         (1u << 0) /* @doc "device has external power management for the display etc." */
 #define OD_DEVICE_FLAG_XIAO_INIT       (1u << 1) /* @doc "apply Seeed XIAO low-power init" */
 #define OD_DEVICE_FLAG_WS_PP_INIT      (1u << 2) /* @doc "apply Waveshare PhotoPainter low-power init" */
 #define OD_DEVICE_FLAG_PWR_LATCH       (1u << 3) /* @doc "self-holding MOSFET latch on pwr_pin_2; optional long-press shutdown button on pwr_pin_3" */
 #define OD_DEVICE_FLAG_PWR_LATCH_DFF   (1u << 4) /* @doc "74AHC1G79 D-FF latch: pwr_pin_2=D (hold), pwr_pin_3=CP (clock); command 0x0052 releases latch" */
+#define OD_DEVICE_FLAG_NM420_INIT      (1u << 5) /* @doc "apply RockBase NM-EPD-420 low-power init: default peripheral and ADC enable pins LOW; hold them LOW in deep sleep" */
 
 /** @struct SystemConfig  @packet 0x01  @required
  *  @doc "Host IC identity, communication capabilities, and power-management pins.
@@ -789,7 +799,9 @@ enum SensorType {
     OD_SENSOR_TYPE_HUMIDITY    = 2, /**< @doc "generic humidity sensor" */
     OD_SENSOR_TYPE_AXP2101     = 3, /**< @doc "AXP2101 power-management IC" */
     OD_SENSOR_TYPE_SHT40       = 4, /**< @doc "Sensirion SHT40 (I2C); writes 3 LE bytes into MSD dynamic data (21 bits: 0.1C, 0.1% RH)" */
-    OD_SENSOR_TYPE_BQ27220     = 5  /**< @doc "TI BQ27220 fuel gauge (I2C 0x55); voltage in MSD bytes 14-15, one packed dynamic byte (bits 0-6 SOC%, bit7 charging)" */
+    OD_SENSOR_TYPE_BQ27220     = 5, /**< @doc "TI BQ27220 fuel gauge (I2C 0x55); voltage in MSD bytes 14-15, one packed dynamic byte (bits 0-6 SOC%, bit7 charging)" */
+    OD_SENSOR_TYPE_NPM1300     = 6, /**< @doc "nPM1300 PMIC (other firmware family; not implemented by this firmware)" */
+    OD_SENSOR_TYPE_AHT20       = 7  /**< @doc "AHT20 (I2C 0x38); wake-time sample in SHT40-compatible 3-byte MSD format. NM-EPD-420 power gate GPIO40 is off between samples." */
 };
 
 /** @struct SensorData  @packet 0x23  @repeatable max=4
@@ -799,8 +811,8 @@ struct SensorData {
     uint8_t  instance_number;    /**< @doc "0-based sensor-block index." */
     uint16_t sensor_type;        /**< @enum SensorType @endian le @doc "sensor type." */
     uint8_t  bus_id;             /**< @doc "data_bus instance this sensor lives on." */
-    uint8_t  i2c_addr_7bit;      /**< @doc "I2C 7-bit address; 0 or 0xFF = per-sensor default (SHT40 0x44, BQ27220 0x55)." @default 0xFF */
-    uint8_t  msd_data_start_byte; /**< @doc "first dynamicreturndata index this sensor publishes into. SHT40 uses 3 bytes (0/0xFF = default 7); BQ27220 uses 1 packed byte (0xFF = do not publish)." @default 0xFF */
+    uint8_t  i2c_addr_7bit;      /**< @doc "I2C 7-bit address; 0 or 0xFF = per-sensor default (SHT40 0x44, BQ27220 0x55, AHT20 0x38)." @default 0xFF */
+    uint8_t  msd_data_start_byte; /**< @doc "first dynamicreturndata index this sensor publishes into. SHT40/AHT20 use 3 bytes (0/0xFF = default 7); BQ27220 uses 1 packed byte (0xFF = do not publish)." @default 0xFF */
     uint8_t  reserved[24];       /**< @reserved @doc "future use; must be 0." */
 } __attribute__((packed));
 OD_STATIC_ASSERT(sizeof(struct SensorData) == 30, "SensorData wire size");

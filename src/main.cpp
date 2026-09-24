@@ -14,6 +14,11 @@
 #include "od_log.h"
 #include "watchdog.h"
 
+#if defined(TARGET_ESP32) && defined(CONFIG_IDF_TARGET_ESP32S3)
+#include "driver/gpio.h"
+static constexpr uint8_t kNm420OffPins[] = {47, 44, 41, 40, 43};
+#endif
+
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_LOG_UART)
 #include <HardwareSerial.h>
 #ifndef OPENDISPLAY_LOG_UART_RX
@@ -1228,6 +1233,7 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     od_log_flush(); // drain UART/Serial prior to deep sleep
     delay(100); // Brief delay to ensure serial output is sent
     powerLatchHoldForSleep();
+    nm420HoldForSleep();
     esp_deep_sleep_start();
 }
 #endif
@@ -1452,6 +1458,53 @@ void ws_pp_init(){
     digitalWrite(45, HIGH);
     od_log_info("Photo Printer initialized");
 }
+
+// RockBase IoT NM-EPD-420 (ESP32-S3 + 4.2" panel), selected by
+// DEVICE_FLAG_NM420_INIT.
+//
+// The board carries a LoRa module, an ES8311 codec, an audio PA and an AHT20
+// temperature sensor. None of them is supported by this firmware, and none of
+// their enable lines can be described in a config packet -- the wire format has
+// no "spare output pin" field, so the pins simply do not appear in any block.
+// Untouched they keep the ESP32 reset default (input, no pull), which leaves each
+// rail at whatever the board's own resistor decides; drive them to their OFF
+// level explicitly instead.
+//
+// All four are active HIGH (HIGH = on):
+//   GPIO47  MODULE_EN  / LoRa EN   LoRa module power
+//   GPIO44  CODEC_EN               ES8311 power
+//   GPIO41  PA_CTRL                external audio amplifier enable
+//   GPIO40  TEMP_CTL               AHT20 power gate
+//
+// GPIO43 (ADC_EN, active HIGH) defaults LOW as well; the battery reader pulses
+// it HIGH only during a measurement, then LOW again while the CPU is awake.
+// The configured pins (panel 1/2/4/5/6/46, I2C 38/39, USER key 45) are driven by
+// their own init blocks and must not be touched here.
+void nm420_init(){
+#if defined(TARGET_ESP32) && defined(CONFIG_IDF_TARGET_ESP32S3)
+    for (uint8_t pin : kNm420OffPins) {
+        gpio_set_level((gpio_num_t)pin, 0);
+        gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+        gpio_hold_dis((gpio_num_t)pin);
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    }
+    od_log_info("NM-EPD-420 init: peripheral enables and battery ADC gate LOW");
+#endif
+}
+
+#ifdef TARGET_ESP32
+void nm420HoldForSleep() {
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    if (!globalConfig.loaded || !(globalConfig.system_config.device_flags & DEVICE_FLAG_NM420_INIT)) return;
+    for (uint8_t pin : kNm420OffPins) {
+        digitalWrite(pin, LOW);
+        gpio_hold_en((gpio_num_t)pin);
+    }
+    gpio_deep_sleep_hold_en();
+#endif
+}
+#endif
 
 #ifdef TARGET_NRF
 void powerDownExternalFlashFromConfig(void) {
