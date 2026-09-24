@@ -271,13 +271,12 @@ void BleTransport::startAdvertising() {
     // Deliberately kept inside this sequence rather than hoisted to the caller:
     // updatemsdata() lands in setManufacturerData() below.
     updatemsdata();
-    // App-owned restart after disconnect (see restartAdvertising): SoftDevice
-    // auto-restart always began a timed "fast" phase and fought our slow policy.
-    Bluefruit.Advertising.restartOnDisconnect(false);
+    // SoftDevice re-arms advertising after disconnect (fail-safe if loop stalls).
+    // Equal slow/slow intervals + setFastTimeout(0) keep that restart from opening
+    // a timed high-rate "fast" phase.
+    Bluefruit.Advertising.restartOnDisconnect(true);
     s_advBoostUntil = 0;
     applyAdvInterval();
-    // duration 0 + equal slow/slow intervals → continuous slow advertising, no
-    // timed burst phase after start or (via restartAdvertising) after disconnect.
     Bluefruit.Advertising.setFastTimeout(0);
     od_log_info("Starting BLE advertising...");
     Bluefruit.Advertising.start(0);
@@ -506,8 +505,8 @@ bool BleTransport::takeDisconnectedEvent(uint16_t* reason, uint32_t* instanceWor
 }
 
 bool BleTransport::restartsAdvertisingOnDisconnect() const {
-    // restartOnDisconnect(false): loop() owns slow re-arm via restartAdvertising().
-    return false;
+    // restartOnDisconnect(true): SoftDevice re-arms; app must not also stop/start.
+    return true;
 }
 
 const char* BleTransport::addressString() {

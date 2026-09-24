@@ -76,8 +76,9 @@ void resetAuthAbuseCounter(void);
 /// transport that OWNS the transfer is confirmed gone.
 void requestTransferSessionCleanup(void);
 
-/// Re-arm BLE advertising when it is safe to. Schedules application-owned slow
-/// re-arm on both targets (see BleTransport::restartsAdvertisingOnDisconnect).
+/// Re-arm BLE advertising when it is safe to. A no-op on targets whose stack
+/// re-arms itself (see BleTransport::restartsAdvertisingOnDisconnect), so
+/// callers need no target guard.
 void requestAdvertisingRestart(void);
 
 #endif

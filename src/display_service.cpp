@@ -1711,6 +1711,19 @@ static void renderChar_1BPP(uint8_t* rowBuffer, const uint8_t* fontData, int fon
 void initDisplay(){
     od_log_info("=== Initializing Display ===");
     if(globalConfig.display_count > 0){
+#ifdef TARGET_ESP32
+        // reTerminal Sticky: MicroSD shares SPI2 with the EPD (Seeed pin map).
+        // Park SD before any EPD SPI so an inserted card cannot steal the bus.
+        {
+            const DisplayConfig& d = globalConfig.displays[0];
+            if (d.clk_pin == 13 && d.data_pin == 14 && d.cs_pin == 15) {
+                pinMode(8, OUTPUT);
+                digitalWrite(8, HIGH);  // SD_CS idle
+                pinMode(10, OUTPUT);
+                digitalWrite(10, LOW);  // SD_EN off
+            }
+        }
+#endif
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (fastepd_driver_used()) {
         pwrmgm(true);

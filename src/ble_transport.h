@@ -124,9 +124,9 @@ public:
     // Each implementation keeps its own restart semantics (see the .cpp).
     void setManufacturerData(const uint8_t* msd, uint8_t len);
 
-    // True where the stack re-arms advertising by itself after a disconnect.
-    // nRF and ESP32 both return false: the app owns slow re-arm so a disconnect
-    // cannot inherit a SoftDevice "fast" advertising phase.
+    // True where the stack re-arms advertising by itself after a disconnect
+    // (nRF: Bluefruit.Advertising.restartOnDisconnect(true)). ESP32 returns
+    // false and the application schedules restartAdvertising() instead.
     bool restartsAdvertisingOnDisconnect() const;
 
     // --- link policy (no-op where the stack does not support it) ---
