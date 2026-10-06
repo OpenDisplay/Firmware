@@ -28,15 +28,14 @@
 #define AXP2101_REG_VBAT_H_ADDR               0x34u  // VBAT high byte; read as 2-byte block with 0x35
 
 // Datasheet reg 0x00: bit 3 = battery presence, bit 5 = VBUS presence.
-// The uncalled readAXP2101Data() diagnostic in display_service.cpp reads these
-// the other way round (0x20 for battery, 0x08 for VBUS). That is a pre-existing
-// defect in unreachable code, flagged in the pull request and left unchanged.
 #define AXP2101_POWER_STATUS_BATT_PRESENT_BIT (1u << 3)
 #define AXP2101_POWER_STATUS_VBUS_PRESENT_BIT (1u << 5)
 
-// Datasheet reg 0x30: bit 0 enables the VBAT-voltage ADC channel. Every other
-// bit is a different channel or an unrelated ADC control and must be preserved.
+// Datasheet reg 0x30: bit 0 enables the VBAT-voltage ADC channel. Bits 5:1 are
+// the other channel enables and must be preserved. Bits 7:6 are reserved (R0,
+// default 0) and are written as 0.
 #define AXP2101_ADC_ENABLE_VBAT_BIT           (1u << 0)
+#define AXP2101_ADC_CTRL_RESERVED_MASK        0xC0u
 
 // Post-enable settling window before the first VBAT read is meaningful. Only
 // applied when the caller has just flipped bit 0 from 0 to 1.
@@ -63,8 +62,9 @@ static inline bool axp2101_vbus_present(uint8_t status_reg) {
     return (status_reg & AXP2101_POWER_STATUS_VBUS_PRESENT_BIT) != 0u;
 }
 
-// Returns the value to write back to reg 0x30 so bit 0 is set, with every other
-// bit preserved. `out_channel_changed` receives `true` iff the caller has just
+// Returns the value to write back to reg 0x30 so bit 0 is set, with the other
+// channel enables preserved and the reserved bits 7:6 written as 0.
+// `out_channel_changed` receives `true` iff the caller has just
 // flipped the channel from disabled to enabled -- the only case where the
 // caller must allow AXP2101_ADC_SETTLING_MS before the first VBAT sample.
 static inline uint8_t axp2101_adc_enable_bit0(uint8_t current, bool* out_channel_changed) {
@@ -72,12 +72,13 @@ static inline uint8_t axp2101_adc_enable_bit0(uint8_t current, bool* out_channel
     if (out_channel_changed != NULL) {
         *out_channel_changed = was_off;
     }
-    return (uint8_t)(current | AXP2101_ADC_ENABLE_VBAT_BIT);
+    return (uint8_t)((current & (uint8_t)~AXP2101_ADC_CTRL_RESERVED_MASK) |
+                     AXP2101_ADC_ENABLE_VBAT_BIT);
 }
 
-// VBAT decoding. Reg 0x34 holds the six valid high bits (bits 7:6 are unused
-// and must be masked), reg 0x35 holds the full low byte. Result is millivolts
-// at 1 mV per count.
+// VBAT decoding. Reg 0x34 bits 5:0 hold the high bits of the reading (bits 7:6
+// are the RW ch_dbg_en[1:0] debug field and must be masked), reg 0x35 holds the
+// full low byte. Result is millivolts at 1 mV per count.
 static inline uint16_t axp2101_decode_vbat_mv(uint8_t hi, uint8_t lo) {
     const uint16_t high_bits = (uint16_t)(hi & 0x3Fu);
     return (uint16_t)((high_bits << 8) | (uint16_t)lo);

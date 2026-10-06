@@ -312,8 +312,8 @@ static constexpr uint32_t DEFAULT_IDLE_HOLD_MS = 10000;
 
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define AXP2101_REG_POWER_STATUS 0x00
-#define AXP2101_REG_POWER_ON_STATUS 0x01
-#define AXP2101_REG_POWER_OFF_STATUS 0x02
+#define AXP2101_REG_POWER_ON_STATUS 0x20
+#define AXP2101_REG_POWER_OFF_STATUS 0x21
 #define AXP2101_REG_DC_ONOFF_DVM_CTRL 0x80
 #define AXP2101_REG_LDO_ONOFF_CTRL0 0x90
 #define AXP2101_REG_DC_VOL0_CTRL 0x82  // DCDC1 voltage
@@ -323,22 +323,20 @@ static constexpr uint32_t DEFAULT_IDLE_HOLD_MS = 10000;
 #define AXP2101_REG_ADC_CHANNEL_CTRL 0x30
 #define AXP2101_REG_ADC_DATA_BAT_VOL_H 0x34
 #define AXP2101_REG_ADC_DATA_BAT_VOL_L 0x35
-#define AXP2101_REG_ADC_DATA_VBUS_VOL_H 0x36
-#define AXP2101_REG_ADC_DATA_VBUS_VOL_L 0x37
-#define AXP2101_REG_ADC_DATA_SYS_VOL_H 0x38
-#define AXP2101_REG_ADC_DATA_SYS_VOL_L 0x39
+#define AXP2101_REG_ADC_DATA_VBUS_VOL_H 0x38
+#define AXP2101_REG_ADC_DATA_VBUS_VOL_L 0x39
+#define AXP2101_REG_ADC_DATA_SYS_VOL_H 0x3A
+#define AXP2101_REG_ADC_DATA_SYS_VOL_L 0x3B
 #define AXP2101_REG_BAT_PERCENT_DATA 0xA4
 #define AXP2101_REG_PWRON_STATUS 0x20
 #define AXP2101_REG_BAT_DETECTION_CTRL 0x68  // Battery detection control
 #define AXP2101_REG_IRQ_ENABLE1 0x40  // IRQ enable register 1
 #define AXP2101_REG_IRQ_ENABLE2 0x41  // IRQ enable register 2
 #define AXP2101_REG_IRQ_ENABLE3 0x42  // IRQ enable register 3
-#define AXP2101_REG_IRQ_ENABLE4 0x43  // IRQ enable register 4
-#define AXP2101_REG_IRQ_STATUS1 0x44  // IRQ status register 1
-#define AXP2101_REG_IRQ_STATUS2 0x45  // IRQ status register 2
-#define AXP2101_REG_IRQ_STATUS3 0x46  // IRQ status register 3
-#define AXP2101_REG_IRQ_STATUS4 0x47  // IRQ status register 4
-#define AXP2101_REG_LDO_ONOFF_CTRL1 0x91  // LDO control register 1 (BLDO1-2, CPUSLDO, DLDO1-2)
+#define AXP2101_REG_IRQ_STATUS1 0x48  // IRQ status register 1
+#define AXP2101_REG_IRQ_STATUS2 0x49  // IRQ status register 2
+#define AXP2101_REG_IRQ_STATUS3 0x4A  // IRQ status register 3
+#define AXP2101_REG_LDO_ONOFF_CTRL1 0x91  // LDO control register 1 (DLDO2)
 
 // The deferred-work flags that used to be defined here are now file-static in
 // main.cpp: nothing outside it reads them, and the two that other translation

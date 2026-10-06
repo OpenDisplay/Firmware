@@ -743,18 +743,16 @@ void cleanupPartialWriteOnDisconnect(void) {
 #define AXP2101_REG_POWER_WAKEUP_CTL 0x26
 #define AXP2101_REG_ADC_CHANNEL_CTRL 0x30
 #define AXP2101_REG_ADC_DATA_BAT_VOL_H 0x34
-#define AXP2101_REG_ADC_DATA_VBUS_VOL_H 0x36
-#define AXP2101_REG_ADC_DATA_SYS_VOL_H 0x38
+#define AXP2101_REG_ADC_DATA_VBUS_VOL_H 0x38
+#define AXP2101_REG_ADC_DATA_SYS_VOL_H 0x3A
 #define AXP2101_REG_BAT_PERCENT_DATA 0xA4
 #define AXP2101_REG_PWRON_STATUS 0x20
 #define AXP2101_REG_IRQ_ENABLE1 0x40
 #define AXP2101_REG_IRQ_ENABLE2 0x41
 #define AXP2101_REG_IRQ_ENABLE3 0x42
-#define AXP2101_REG_IRQ_ENABLE4 0x43
-#define AXP2101_REG_IRQ_STATUS1 0x44
-#define AXP2101_REG_IRQ_STATUS2 0x45
-#define AXP2101_REG_IRQ_STATUS3 0x46
-#define AXP2101_REG_IRQ_STATUS4 0x47
+#define AXP2101_REG_IRQ_STATUS1 0x48
+#define AXP2101_REG_IRQ_STATUS2 0x49
+#define AXP2101_REG_IRQ_STATUS3 0x4A
 #define AXP2101_REG_LDO_ONOFF_CTRL1 0x91
 #define FONT_BASE_WIDTH 8
 #define FONT_BASE_HEIGHT 8
@@ -1355,7 +1353,7 @@ void readAXP2101Data(){
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_ADC_CHANNEL_CTRL);
-    Wire.write(0xFF);
+    Wire.write(0x3F); // all ADC channels; bits 7:6 are reserved
     error = Wire.endTransmission();
     delay(10);
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
@@ -1368,9 +1366,9 @@ void readAXP2101Data(){
             uint8_t status2 = Wire.read();
             od_log_debug("Power Status 1: 0x%02X", status1);
             od_log_debug("Power Status 2: 0x%02X", status2);
-            bool batteryPresent = (status1 & 0x20) != 0;
-            bool charging = (status1 & 0x04) != 0;
-            bool vbusPresent = (status1 & 0x08) != 0;
+            bool batteryPresent = (status1 & 0x08) != 0;
+            bool charging = ((status2 >> 5) & 0x03) == 0x01;
+            bool vbusPresent = (status1 & 0x20) != 0;
             od_log_debug("Battery Present: %s", batteryPresent ? "Yes" : "No");
             od_log_debug("Charging: %s", charging ? "Yes" : "No");
             od_log_debug("VBUS Present: %s", vbusPresent ? "Yes" : "No");
@@ -1394,8 +1392,8 @@ void readAXP2101Data(){
         if(Wire.available() >= 2){
             uint8_t batVolH = Wire.read();
             uint8_t batVolL = Wire.read();
-            uint16_t batVolRaw = ((uint16_t)batVolH << 4) | (batVolL & 0x0F);
-            float batVoltage = batVolRaw * 0.5;
+            uint16_t batVolRaw = ((uint16_t)(batVolH & 0x3F) << 8) | batVolL;
+            float batVoltage = batVolRaw;
             od_log_debug("Battery Voltage: %.1f mV (%.2f V)", batVoltage, batVoltage / 1000.0);
         }
     }
@@ -1407,8 +1405,8 @@ void readAXP2101Data(){
         if(Wire.available() >= 2){
             uint8_t vbusVolH = Wire.read();
             uint8_t vbusVolL = Wire.read();
-            uint16_t vbusVolRaw = ((uint16_t)vbusVolH << 4) | (vbusVolL & 0x0F);
-            float vbusVoltage = vbusVolRaw * 1.7;
+            uint16_t vbusVolRaw = ((uint16_t)(vbusVolH & 0x3F) << 8) | vbusVolL;
+            float vbusVoltage = vbusVolRaw;
             od_log_debug("VBUS Voltage: %.1f mV (%.2f V)", vbusVoltage, vbusVoltage / 1000.0);
         }
     }
@@ -1420,8 +1418,8 @@ void readAXP2101Data(){
         if(Wire.available() >= 2){
             uint8_t sysVolH = Wire.read();
             uint8_t sysVolL = Wire.read();
-            uint16_t sysVolRaw = ((uint16_t)sysVolH << 4) | (sysVolL & 0x0F);
-            float sysVoltage = sysVolRaw * 1.4;
+            uint16_t sysVolRaw = ((uint16_t)(sysVolH & 0x3F) << 8) | sysVolL;
+            float sysVoltage = sysVolRaw;
             od_log_debug("System Voltage: %.1f mV (%.2f V)", sysVoltage, sysVoltage / 1000.0);
         }
     }
@@ -1497,12 +1495,6 @@ void powerDownAXP2101(){
     }
     if(error == 0){
         Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
-        Wire.write(AXP2101_REG_IRQ_ENABLE4);
-        Wire.write(0x00);
-        error = Wire.endTransmission();
-    }
-    if(error == 0){
-        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
         Wire.write(AXP2101_REG_IRQ_STATUS1);
         Wire.write(0xFF);
         error = Wire.endTransmission();
@@ -1516,13 +1508,7 @@ void powerDownAXP2101(){
     if(error == 0){
         Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
         Wire.write(AXP2101_REG_IRQ_STATUS3);
-        Wire.write(0xFF);
-        error = Wire.endTransmission();
-    }
-    if(error == 0){
-        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
-        Wire.write(AXP2101_REG_IRQ_STATUS4);
-        Wire.write(0xFF);
+        Wire.write(0xDF); // bit 5 is reserved
         error = Wire.endTransmission();
         if(error == 0){
             od_log_debug("All IRQs disabled and status cleared");
@@ -1553,29 +1539,18 @@ void powerDownAXP2101(){
     Wire.write(0x00);
     error = Wire.endTransmission();
     if(error == 0){
-        od_log_debug("BLDO1-2, CPUSLDO, DLDO1-2 disabled");
+        od_log_debug("DLDO2 disabled");
     } else {
-        od_log_error("ERROR: Failed to disable BLDO/CPUSLDO/DLDO rails");
+        od_log_error("ERROR: Failed to disable DLDO2");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_LDO_ONOFF_CTRL0);
-    error = Wire.endTransmission();
-    uint8_t aldoEnable = 0x00;
-    if(error == 0){
-        Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
-        if(Wire.available()){
-            aldoEnable = Wire.read();
-        }
-    }
-    aldoEnable &= ~0x0F;
-    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
-    Wire.write(AXP2101_REG_LDO_ONOFF_CTRL0);
-    Wire.write(aldoEnable);
+    Wire.write(0x00);
     error = Wire.endTransmission();
     if(error == 0){
-        od_log_debug("ALDO1-4 disabled");
+        od_log_debug("ALDO1-4, BLDO1-2, CPUSLDO, DLDO1 disabled");
     } else {
-        od_log_error("ERROR: Failed to disable ALDO rails");
+        od_log_error("ERROR: Failed to disable ALDO/BLDO/CPUSLDO/DLDO1 rails");
     }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_POWER_WAKEUP_CTL);
@@ -1596,7 +1571,6 @@ void powerDownAXP2101(){
     if(!(wakeupCtrl & 0x10)) {
         wakeupCtrl |= 0x10;
     }
-    wakeupCtrl |= 0x80;
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_POWER_WAKEUP_CTL);
     Wire.write(wakeupCtrl);

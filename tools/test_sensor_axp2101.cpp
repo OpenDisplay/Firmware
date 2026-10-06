@@ -8,8 +8,8 @@
 // Like tools/test_link_owner.cpp, this is as much a written-down statement of
 // the intended semantics as it is a test. It covers:
 //
-//   - VBAT decoding with upper unused bits clear and set
-//   - ADC bit-0 enable while preserving every other bit
+//   - VBAT decoding with reg 0x34 bits 7:6 (ch_dbg_en) clear and set
+//   - ADC bit-0 enable preserving the other channel enables, reserved 7:6 as 0
 //   - Battery-present status set and clear
 //   - Default address selection for zero and 0xFF
 //   - Configured address preservation
@@ -87,7 +87,7 @@ static int fake_read_vbat_mv(FakeBus& bus, uint8_t addr) {
 }
 
 int main(void) {
-    // ---- VBAT decoding with upper unused bits clear -------------------------
+    // ---- VBAT decoding with reg 0x34 bits 7:6 clear --------------------------
     {
         // 0x0F B8 -- the ESPHome-observed sample -- must decode to 4024 mV.
         check(axp2101_decode_vbat_mv(0x0F, 0xB8) == 4024, "vbat decode 0x0FB8 == 4024 mV");
@@ -97,19 +97,19 @@ int main(void) {
         check(axp2101_decode_vbat_mv(0x3F, 0xFF) == 16383, "vbat decode 0x3FFF == 16383 mV");
     }
 
-    // ---- VBAT decoding with upper unused bits SET ---------------------------
+    // ---- VBAT decoding with reg 0x34 bits 7:6 SET ----------------------------
     {
-        // Bits 7:6 of reg 0x34 are unused; the decoder must mask them off so
-        // spurious garbage in that field cannot inflate the reading.
+        // Bits 7:6 of reg 0x34 are the ch_dbg_en debug field, not part of the
+        // reading; the decoder must mask them off so they cannot inflate it.
         check(axp2101_decode_vbat_mv(0xC0, 0x00) == 0,
-              "vbat unused bits 0xC0 masked -> 0 mV");
+              "vbat ch_dbg_en bits 0xC0 masked -> 0 mV");
         check(axp2101_decode_vbat_mv(0xCF, 0xB8) == 4024,
-              "vbat 0xCFB8 (unused bits set) decodes same as 0x0FB8");
+              "vbat 0xCFB8 (ch_dbg_en set) decodes same as 0x0FB8");
         check(axp2101_decode_vbat_mv(0xFF, 0xFF) == 16383,
               "vbat 0xFFFF decodes as 0x3FFF -> 16383 mV");
     }
 
-    // ---- ADC bit-0 enable while preserving every other bit ------------------
+    // ---- ADC bit-0 enable, preserving the other channel enables ---------------
     {
         // From all-zero: bit 0 flips 0->1, no other bit changes.
         bool changed = false;
@@ -117,10 +117,11 @@ int main(void) {
         check(next == 0x01, "adc enable from 0x00 -> 0x01");
         check(changed, "adc enable from 0x00 flags channel change");
 
-        // From every other bit set: bit 0 flips 0->1, all other bits preserved.
+        // From every other bit set: bit 0 flips 0->1, bits 5..1 preserved,
+        // reserved bits 7:6 written as 0.
         changed = false;
         next = axp2101_adc_enable_bit0(0xFE, &changed);
-        check(next == 0xFF, "adc enable from 0xFE preserves 7..1, sets bit 0 -> 0xFF");
+        check(next == 0x3F, "adc enable from 0xFE preserves 5..1, clears 7:6, sets bit 0 -> 0x3F");
         check(changed, "adc enable from 0xFE flags channel change");
 
         // Already enabled (0x01): value unchanged, no channel-change flag.
@@ -129,10 +130,10 @@ int main(void) {
         check(next == 0x01, "adc enable from 0x01 stays 0x01");
         check(!changed, "adc enable from 0x01 does not flag channel change");
 
-        // Already enabled with siblings set: value unchanged, no flag.
+        // Already enabled with siblings set: no flag; reserved bit 7 written as 0.
         changed = true;
         next = axp2101_adc_enable_bit0(0xA5, &changed);
-        check(next == 0xA5, "adc enable from 0xA5 stays 0xA5 (bit 0 already set)");
+        check(next == 0x25, "adc enable from 0xA5 keeps 5..0, clears reserved 7 -> 0x25");
         check(!changed, "adc enable from 0xA5 does not flag channel change");
 
         // NULL out-pointer must be tolerated.
