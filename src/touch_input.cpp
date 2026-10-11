@@ -7,6 +7,7 @@
 #include <string.h>
 
 #if defined(TARGET_ESP32)
+#include "driver/gpio.h"
 #define TOUCH_ISR_ATTR IRAM_ATTR
 #else
 #define TOUCH_ISR_ATTR
@@ -306,6 +307,60 @@ static void touch_apply_enable_pin(const TouchController* tc) {
     digitalWrite(tc->enable_pin, HIGH);
 }
 
+// A board's touch rail/reset line stays wherever it was last driven across a
+// pinMode/digitalWrite-only boundary. Deep sleep is no exception: bare
+// digitalWrite() is silently discarded at sleep entry on ESP32-S3, so the
+// level must be latched with gpio_hold_en()/gpio_deep_sleep_hold_en(). Without
+// the hold, a GT911 reset line left floating reads HIGH (out of reset, chip
+// powered) even though nothing ever drove it there on purpose.
+#if defined(TARGET_ESP32)
+// pin's only "don't touch" sentinel is 0xFF: rst_pin treats GPIO0 as a valid
+// reset pin, so callers resolve the enable_pin "0 or 0xFF = unused" sentinel
+// themselves before calling in.
+static inline void touch_pad_hold_disable(uint8_t pin) {
+    if (pin == 0xFF) {
+        return;
+    }
+    gpio_hold_dis((gpio_num_t)pin);
+}
+static inline void touch_pad_hold(uint8_t pin) {
+    if (pin == 0xFF) {
+        return;
+    }
+// The ESP32-C6 does not support or need the global hold function, same as
+// padHold() in power_latch.cpp.
+#if !defined(CONFIG_IDF_TARGET_ESP32C6)
+    gpio_deep_sleep_hold_en();
+#endif
+    gpio_hold_en((gpio_num_t)pin);
+}
+#else
+static inline void touch_pad_hold_disable(uint8_t) {}
+static inline void touch_pad_hold(uint8_t) {}
+#endif
+
+// Assert and latch the touch IC's reset/enable lines at their off level so a
+// board whose touch is force-disabled (touch_ic_type == OD_TOUCH_IC_NONE but
+// rst_pin/enable_pin configured) does not leave the chip powered on nothing
+// more than a floating GPIO, and so an actively-used GT911 is also taken down
+// (not left mid-session) for the sleep window. Call right before
+// esp_deep_sleep_start().
+void touchPrepareForDeepSleep(void) {
+    for (uint8_t i = 0; i < globalConfig.touch_controller_count; i++) {
+        const TouchController* tc = &globalConfig.touch_controllers[i];
+        if (tc->rst_pin != 0xFF) {
+            pinMode(tc->rst_pin, OUTPUT);
+            digitalWrite(tc->rst_pin, LOW); // GT911 RST is active-low
+            touch_pad_hold(tc->rst_pin);
+        }
+        if (tc->enable_pin != 0 && tc->enable_pin != 0xFF) {
+            pinMode(tc->enable_pin, OUTPUT);
+            digitalWrite(tc->enable_pin, LOW);
+            touch_pad_hold(tc->enable_pin);
+        }
+    }
+}
+
 static uint8_t gt911_resolve_and_init(const TouchController* t, TouchRuntime* rt) {
     const uint8_t a5d = 0x5D;
     const uint8_t a14 = 0x14;
@@ -490,9 +545,29 @@ void initTouchInput(void) {
     }
     uint8_t enabled = 0;
     for (uint8_t j = 0; j < globalConfig.touch_controller_count; j++) {
-        if (globalConfig.touch_controllers[j].touch_ic_type != OD_TOUCH_IC_NONE) {
-            enabled++;
+        const TouchController* tc = &globalConfig.touch_controllers[j];
+        // A reset/enable line held across the prior deep sleep ignores
+        // digitalWrite() until the hold is released.
+        touch_pad_hold_disable(tc->rst_pin);
+        if (tc->enable_pin != 0) {
+            touch_pad_hold_disable(tc->enable_pin);
         }
+        if (tc->touch_ic_type == OD_TOUCH_IC_NONE) {
+            // Force-disabled: hold the IC in hardware reset instead of
+            // leaving its reset line floating. On this board's GT911, RST is
+            // active-low, so floating reads HIGH (out of reset, chip
+            // powered) even though nothing drove it there on purpose.
+            if (tc->rst_pin != 0xFF) {
+                pinMode(tc->rst_pin, OUTPUT);
+                digitalWrite(tc->rst_pin, LOW);
+            }
+            if (tc->enable_pin != 0 && tc->enable_pin != 0xFF) {
+                pinMode(tc->enable_pin, OUTPUT);
+                digitalWrite(tc->enable_pin, LOW);
+            }
+            continue;
+        }
+        enabled++;
     }
     if (enabled == 0) {
         return;

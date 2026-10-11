@@ -21,4 +21,14 @@ void touchResumeAfterEpdRefresh(void);
  */
 void touchForceResume(void);
 
+/**
+ * Assert and latch the configured reset/enable line(s) at their off level
+ * (gpio_hold_en + gpio_deep_sleep_hold_en) so touch stays powered down
+ * through deep sleep instead of floating back to its idle level. Covers
+ * both an actively-used controller (taken down for the sleep window) and
+ * one force-disabled via touch_ic_type == OD_TOUCH_IC_NONE. Call right
+ * before esp_deep_sleep_start().
+ */
+void touchPrepareForDeepSleep(void);
+
 #endif
