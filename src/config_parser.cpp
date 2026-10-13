@@ -30,6 +30,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DEVICE_FLAG_WS_PP_INIT (1 << 2)
 #define DEVICE_FLAG_BATTERY_LATCH (1 << 3)
 #define DEVICE_FLAG_PWR_LATCH_DFF (1 << 4)
+#define DEVICE_FLAG_NM420_INIT (1 << 5)
 #endif
 
 // The parse-time dumps and printConfigSummary() are od_log_debug, which the
@@ -53,6 +54,7 @@ extern bool wifiInitialized;
 void xiaoinit();
 void powerDownExternalFlashFromConfig(void);
 void ws_pp_init();
+void nm420_init();
 extern bool encryptionInitialized;
 
 // Defined in main.h (the single-inclusion globals header), so it needs an extern
@@ -746,6 +748,7 @@ void printConfigSummary(){
     od_log_debug("  WS_PP_INIT flag: %s", (globalConfig.system_config.device_flags & DEVICE_FLAG_WS_PP_INIT) ? "enabled" : "disabled");
     od_log_debug("  BATTERY_LATCH flag: %s", (globalConfig.system_config.device_flags & DEVICE_FLAG_BATTERY_LATCH) ? "enabled" : "disabled");
     od_log_debug("  PWR_LATCH_DFF flag: %s", (globalConfig.system_config.device_flags & DEVICE_FLAG_PWR_LATCH_DFF) ? "enabled" : "disabled");
+    od_log_debug("  NM420_INIT flag: %s", (globalConfig.system_config.device_flags & DEVICE_FLAG_NM420_INIT) ? "enabled" : "disabled");
     od_log_debug("Power Pin: %u", globalConfig.system_config.pwr_pin);
     od_log_debug("Power Pin 2: %u", globalConfig.system_config.pwr_pin_2);
     od_log_debug("Power Pin 3: %u", globalConfig.system_config.pwr_pin_3);
@@ -949,6 +952,11 @@ void full_config_init() {
             od_log_info("Device flag DEVICE_FLAG_WS_PP_INIT is set, calling ws_pp_init()...");
             ws_pp_init();
             od_log_info("ws_pp_init() completed");
+        }
+        if (globalConfig.loaded && (globalConfig.system_config.device_flags & DEVICE_FLAG_NM420_INIT)) {
+            od_log_info("Device flag DEVICE_FLAG_NM420_INIT is set, calling nm420_init()...");
+            nm420_init();
+            od_log_info("nm420_init() completed");
         }
         // Must run after config load: latch pins/flag come from globalConfig.
         powerLatchBegin();

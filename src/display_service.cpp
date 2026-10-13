@@ -8,6 +8,7 @@
 #include "od_log.h"
 #include "buzzer_control.h"
 #include "sensor_sht40.h"
+#include "sensor_aht20.h"
 #include "sensor_bq27220.h"
 #include "sensor_axp2101.h"
 #include "communication.h"
@@ -842,6 +843,17 @@ int mapEpd(int id){
         case 0x004A: return EP40_SPECTRA_400x600;
         case 0x004B: return EP27_176x264;
         case 0x004C: return EP27_176x264_4GRAY;
+        // Values 1000+ are the M3 / EPD-nRF5 driver line's PanelIC block, which
+        // names the same physical panels by their controller instead of by the
+        // bb_epaper EP* identifier. Only the ones with a bb_epaper equivalent are
+        // mapped; everything else in that range falls through to UNDEFINED.
+        //
+        // 1004 "JD79668 4.2\" B/W/R/Y" is the controller-side name for the same
+        // 4.2" four-colour class as OD_PANEL_IC_EP42YR_400X300 (0x003A): the Good
+        // Display GDEM042F52 / JD79668, and the GDEY0420F51 (HX8717) it replaced.
+        // They share one UC81xx-family command set, so they share one init
+        // sequence. Configs written by the other firmware line then work here.
+        case OD_PANEL_IC_JD79668_420_BWRY: return EP42YR_400x300; // 1004
         default: return EP_PANEL_UNDEFINED;
     }
 }
@@ -1184,6 +1196,9 @@ void initSensors(){
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_SHT40){
             od_log_debug("  SHT40 (I2C + MSD slot)");
+        }
+        else if(sensor->sensor_type == OD_SENSOR_TYPE_AHT20){
+            od_log_debug("  AHT20 (wake-time I2C + MSD slot)");
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_BQ27220){
             od_log_debug("  BQ27220 fuel gauge (MSD voltage + optional dynamic SOC/status bytes)");
@@ -1836,6 +1851,7 @@ float readChipTemperature() {
 
 void updatemsdata(){
     // od_log_debug("updatemsdata() called (mloopcounter: %u)", mloopcounter);
+    pollAht20SensorsForMsd();
     pollSht40SensorsForMsd();
     pollBq27220ForMsd();
     float batteryVoltage = readBatteryVoltage();

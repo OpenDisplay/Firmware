@@ -538,7 +538,7 @@ for _tag, _block in BLOCKS.items():
 # sets only trigger a warning (not an error) on encode - the firmware may define values
 # this tool doesn't know about yet.
 VALID_ENUMS: dict[tuple[str, str], set[int]] = {
-    ("sensors", "sensor_type"): {1, 2, 3, 4, 5},  # SENSOR_TYPE_TEMPERATURE..BQ27220
+    ("sensors", "sensor_type"): {1, 2, 3, 4, 5, 6, 7},  # SENSOR_TYPE_TEMPERATURE..AHT20
     ("displays", "color_scheme"): {0, 1, 2, 3, 4, 5, 6, 7, 8, 100, 101, 102},  # COLOR_SCHEME_MONO..BWGBRY_SPLIT, RGB565/RGB888/RGB16BPC
     ("touch_controllers", "touch_ic_type"): {0, 1},  # TOUCH_IC_NONE, TOUCH_IC_GT911
     ("power_option", "capacity_estimator"): {1, 2, 3, 4, 5},  # CAPACITY_EST_LI_ION..SEEED_LI_ION

@@ -172,7 +172,7 @@ static void sht40_probe_bus_once(uint8_t bus_id) {
     }
 }
 
-static void write_sht40_invalid(uint8_t start) {
+void writeTempHumidityMsdInvalid(uint8_t start) {
     dynamicreturndata[start] = 0xFF;
     dynamicreturndata[start + 1] = 0xFF;
     dynamicreturndata[start + 2] = 0xFF;
@@ -190,7 +190,7 @@ static int round_centi_to_deci(int16_t c) {
 
 // MSD (3 bytes LE): v = rh_deci | (tu << 10); rh_deci 0..1000 = 0..100.0% RH (0.1% steps);
 // tu = temp(0.1°C) + 400. Decode: t_deci = (v>>10 & 0x7FF) - 400; temp_centi = t_deci*10; rh_centi = (v&0x3FF)*10
-static void write_sht40_msd(uint8_t start, int16_t temp_centi, uint16_t rh_centi) {
+void writeTempHumidityMsd(uint8_t start, int16_t temp_centi, uint16_t rh_centi) {
     int t_deci = round_centi_to_deci(temp_centi);
     if (t_deci < -400) {
         t_deci = -400;
@@ -266,10 +266,10 @@ void pollSht40SensorsForMsd(void) {
                     err, bid, globalConfig.data_buses[bid].pin_1, globalConfig.data_buses[bid].pin_2);
                 logged_fail = true;
             }
-            write_sht40_invalid(start);
+            writeTempHumidityMsdInvalid(start);
             continue;
         }
         logged_fail = false;
-        write_sht40_msd(start, tc, rhc);
+        writeTempHumidityMsd(start, tc, rhc);
     }
 }
