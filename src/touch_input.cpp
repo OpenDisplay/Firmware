@@ -152,8 +152,23 @@ static void touch_detach_all_configured_ints(void) {
     }
 }
 
+// ESP32 GPIO34-39 are input-only with no internal pull-up (M5Paper GT911 INT is
+// GPIO36, pulled up on the board): never drive them, read them as plain INPUT.
+static bool touch_pin_can_output(uint8_t pin) {
+#if defined(TARGET_ESP32)
+    return GPIO_IS_VALID_OUTPUT_GPIO(pin);
+#else
+    (void)pin;
+    return true;
+#endif
+}
+
+static uint8_t touch_int_input_mode(uint8_t pin) {
+    return touch_pin_can_output(pin) ? INPUT_PULLUP : INPUT;
+}
+
 static void gt911_int_wake_before_irq(const TouchController* t) {
-    if (t->int_pin == 0xFF) {
+    if (t->int_pin == 0xFF || !touch_pin_can_output(t->int_pin)) {
         return;
     }
     pinMode(t->int_pin, OUTPUT);
@@ -171,7 +186,7 @@ static void attach_touch_int(uint8_t idx, uint8_t pin) {
         od_log_warn("Touch[%u]: digitalPinToInterrupt failed for GPIO %u — using poll only", idx, pin);
         return;
     }
-    pinMode(pin, INPUT_PULLUP);
+    pinMode(pin, touch_int_input_mode(pin));
     attachInterrupt(irq_num, s_touch_isrs[idx], FALLING);
     s_touch_rt[idx].int_irq_attached = 1;
 }
@@ -244,7 +259,7 @@ static void gt911_hw_reset(const TouchController* t, bool int_low_for_addr_5d) {
     if (t->rst_pin == 0xFF) {
         return;
     }
-    if (t->int_pin == 0xFF) {
+    if (t->int_pin == 0xFF || !touch_pin_can_output(t->int_pin)) {
         pinMode(t->rst_pin, OUTPUT);
         digitalWrite(t->rst_pin, LOW);
         delay(10);
