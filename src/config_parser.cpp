@@ -55,6 +55,7 @@ void xiaoinit();
 void powerDownExternalFlashFromConfig(void);
 void ws_pp_init();
 void nm420_init();
+void m5paper_init();
 extern bool encryptionInitialized;
 
 // Defined in main.h (the single-inclusion globals header), so it needs an extern
@@ -957,6 +958,14 @@ void full_config_init() {
             od_log_info("Device flag DEVICE_FLAG_NM420_INIT is set, calling nm420_init()...");
             nm420_init();
             od_log_info("nm420_init() completed");
+        }
+        // The M5Paper panel type identifies the board. Before powerLatchBegin():
+        // that releases the deep-sleep pad hold on pwr_pin_2, and on the M5Paper
+        // that pin (GPIO2) must already be driven HIGH or the board loses power
+        // on battery.
+        if (globalConfig.loaded && globalConfig.display_count > 0 &&
+            globalConfig.displays[0].panel_ic_type == OD_PANEL_IC_M5PAPER_960X540) {
+            m5paper_init();
         }
         // Must run after config load: latch pins/flag come from globalConfig.
         powerLatchBegin();

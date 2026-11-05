@@ -193,6 +193,7 @@ void powerDownExternalFlashFromConfig(void);
 void xiaoinit();
 void ws_pp_init();
 void nm420_init();
+void m5paper_init();
 #ifdef TARGET_ESP32
 void nm420HoldForSleep();
 void fullSetupAfterConnection();

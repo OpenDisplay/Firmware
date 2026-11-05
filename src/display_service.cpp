@@ -888,9 +888,10 @@ bool fastepd_driver_used(void) {
 #else
     if (globalConfig.display_count < 1) return false;
     const struct DisplayConfig& d = globalConfig.displays[0];
-    // FastEPD IT8951 (SPI) path: E Ink ED103TC2 (Seeed reTerminal).
+    // FastEPD IT8951 (SPI) path: E Ink ED103TC2 (Seeed reTerminal), M5Stack M5Paper.
     const bool it8951 = (d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404 ||
-                         d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY);
+                         d.panel_ic_type == OD_PANEL_IC_ED103TC2_1872X1404_4GRAY ||
+                         d.panel_ic_type == OD_PANEL_IC_M5PAPER_960X540);
     // FastEPD native parallel path: Soldered Inkplate 5V2 / 10, M5Stack PaperS3.
     const bool parallel = (d.panel_ic_type == OD_PANEL_IC_INKPLATE5V2_1280X720 ||
                            d.panel_ic_type == OD_PANEL_IC_INKPLATE10_1200X825 ||
@@ -1223,6 +1224,9 @@ void initSensors(){
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_AHT20){
             od_log_debug("  AHT20 (wake-time I2C + MSD slot)");
+        }
+        else if(sensor->sensor_type == OD_SENSOR_TYPE_PCF8563){
+            od_log_debug("  PCF8563/BM8563 RTC (power-off wake source with pwr_latch)");
         }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_BQ27220){
             od_log_debug("  BQ27220 fuel gauge (MSD voltage + optional dynamic SOC/status bytes)");

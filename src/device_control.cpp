@@ -1039,14 +1039,16 @@ void handlePowerOffCommand(const uint8_t* payload, uint16_t payloadLen) {
     (void)payloadLen;
     // powerLatch* are defined on every target (no-op stubs off ESP32; the header
     // guarantees callers need no guards), so no #ifdef TARGET_ESP32 is required here:
-    // powerLatchDffConfigured() returns false off-ESP32 -> falls through to the NACK.
-    if (powerLatchDffConfigured()) {
-        // Fire-and-forget hard rail-cut: queue the ACK, then release the D-FF latch.
-        // On latch HW the rail usually drops before the ACK is actually transmitted.
+    // Both predicates return false off-ESP32 -> falls through to the NACK.
+    if (powerLatchDffConfigured() || powerLatchMosfetConfigured()) {
+        // Fire-and-forget hard rail-cut: queue the ACK, then release the latch (D-FF:
+        // clock D low; MOSFET: drive pwr_pin_2 low, e.g. the M5Paper's GPIO2). On latch
+        // HW the rail usually drops before the ACK is actually transmitted. On USB the
+        // MOSFET path parks in deep sleep until reset (or the pwr_pin_3 button).
         uint8_t ok[] = {RESP_ACK, RESP_POWER_OFF, 0x00, 0x00};
         sendResponse(ok, sizeof(ok));
         delay(100);
-        powerLatchPowerOff();
+        powerLatchTriggerOff();
         return;
     }
     // ANCHOR(power-off-no-latch-fallback): FUTURE WORK for a later agent/implementer.

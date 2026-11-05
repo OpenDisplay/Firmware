@@ -241,6 +241,18 @@ void powerLatchPowerOff() {
     dffLatchRelease();
 }
 
+void powerLatchReleaseForRtcSleep() {
+    if (dffLatchEnabled() || !latchEnabled()) {
+        return;
+    }
+    // padHold, not padIsolateAndHold: the wake pads armed before this keep
+    // their pulls for the USB-powered deep-sleep fallback.
+    padHoldDisable(latchPin());
+    pinMode(latchPin(), OUTPUT);
+    digitalWrite(latchPin(), LOW);
+    padHold(latchPin());
+}
+
 bool powerLatchMosfetConfigured(void) {
     return latchEnabled();
 }

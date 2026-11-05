@@ -6,6 +6,7 @@
 #include "display_service.h"
 #include "power_latch.h"
 #include "wake_button.h"
+#include "rtc_pcf8563.h"
 #include "touch_input.h"
 #include "encryption.h"
 #include "ble_transport.h"
@@ -197,6 +198,20 @@ void setup() {
     // reservation above depends on. One call site serves both the normal-boot and the
     // deep-sleep-wake path, which share this stretch of setup().
     odLanReserveRxBuffer();
+#endif
+#ifdef TARGET_ESP32
+    // A cold boot raised by the RTC (power-off sleep, see enterDeepSleep()) is a
+    // timer wake in all but the ESP32's own wake cause. Always called when an RTC
+    // is configured: it also clears the flag that holds INT (and the rail) on.
+    // RTC memory died with the rail, so displayed_etag is 0 (the host sends a
+    // full image) and rebootFlag is cleared here -- this is not a reboot.
+    if (rtcConsumeWake() && !is_deep_sleep_wake) {
+        is_deep_sleep_wake = true;
+        woke_from_deep_sleep = true;
+        deep_sleep_count++;
+        rebootFlag = 0;
+        od_log_info("=== WOKE FROM RTC POWER-OFF ===");
+    }
 #endif
     if (is_deep_sleep_wake) { od_log_info("[wake] << full_config_init >> initio"); od_log_flush(); }
 #if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
@@ -1242,12 +1257,22 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     // manipulation then cannot disturb freshly configured RTC pulls, and its
     // gpio_hold_en() touches only the latch pin, never the wake pads.
     armButtonWakeSources();
-    od_log_info("Entering deep sleep for %u seconds%s", sleepSeconds,
-                overrideSleepSeconds ? " (host override, one cycle)" : " (config)");
+    // RTC power-off (PCF8563/BM8563 + MOSFET latch): the RTC switches the board
+    // back on, so the latch is released instead of held. On an I2C failure the
+    // rail stays held and this is a plain timer deep sleep. The ESP32 timer
+    // above stays armed either way: it is what wakes a USB-powered board.
+    const bool rtcPowerOff = rtcArmWake(sleepSeconds);
+    od_log_info("Entering deep sleep for %u seconds%s%s", sleepSeconds,
+                overrideSleepSeconds ? " (host override, one cycle)" : " (config)",
+                rtcPowerOff ? ", RTC power-off" : "");
     od_log_info("Heap: free=%u min=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
     od_log_flush(); // drain UART/Serial prior to deep sleep
     delay(100); // Brief delay to ensure serial output is sent
-    powerLatchHoldForSleep();
+    if (rtcPowerOff) {
+        powerLatchReleaseForRtcSleep();
+    } else {
+        powerLatchHoldForSleep();
+    }
     touchPrepareForDeepSleep();
     nm420HoldForSleep();
     esp_deep_sleep_start();
@@ -1506,6 +1531,74 @@ void nm420_init(){
         digitalWrite(pin, LOW);
     }
     od_log_info("NM-EPD-420 init: peripheral enables and battery ADC gate LOW");
+#endif
+}
+
+// Original M5Stack M5Paper (classic ESP32 + IT8951), selected by panel IC
+// OD_PANEL_IC_M5PAPER_960X540 (the panel only ships on this board). The power
+// button only switches the board on while it is held; GPIO2 (main-power hold)
+// must be driven HIGH to keep it on, and GPIO5 enables the external-power rail. GPIO23 (IT8951 power) is driven by
+// FastEPD as the panel's EN pin. Deep-sleep hold and power-off of GPIO2 go
+// through the MOSFET latch (DEVICE_FLAG_BATTERY_LATCH, pwr_pin_2 = 2), so the
+// preset sets both flags.
+//
+// The on-board BM8563 RTC (0x51 on I2C bus 0) runs from VBAT_IN, and its INT
+// line also pulls the power-switch gate low: an alarm or timer left armed (the
+// M5Stack factory firmware leaves a repeating timer) switches the board back
+// on after every power-off, and it survives a flash erase. m5paper_init()
+// therefore turns both interrupts off, clears the flags, stops the timer and
+// disables the alarm, whatever the sensor config says.
+#if defined(TARGET_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
+static bool m5paperRtcWrite(const uint8_t* regAndData, size_t len) {
+    Wire.beginTransmission(0x51);
+    Wire.write(regAndData, len);
+    return Wire.endTransmission() == 0;
+}
+
+static void m5paperRtcQuiesce() {
+    static const uint8_t kCtrl2[] = {0x01, 0x00};                    // AIE/TIE off, AF/TF cleared
+    static const uint8_t kTimer[] = {0x0E, 0x03};                    // timer off, 1/60 Hz
+    static const uint8_t kAlarm[] = {0x09, 0x80, 0x80, 0x80, 0x80};  // every alarm field disabled
+    if (!initOrRestoreWireForBus(0)) {
+        od_log_warn("M5Paper init: no I2C bus 0, RTC left as is");
+        return;
+    }
+    const bool ok = m5paperRtcWrite(kCtrl2, sizeof(kCtrl2)) &&
+                    m5paperRtcWrite(kTimer, sizeof(kTimer)) &&
+                    m5paperRtcWrite(kAlarm, sizeof(kAlarm));
+    if (ok) {
+        od_log_info("M5Paper init: RTC interrupts, timer and alarm cleared");
+    } else {
+        od_log_warn("M5Paper init: RTC not reachable at 0x51");
+    }
+}
+#endif
+
+void m5paper_init(){
+#if defined(TARGET_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
+    // GPIO2 holds main power. Level before direction, then drop the sleep
+    // hold: the pad never glitches LOW on a wake from deep sleep.
+    gpio_set_level(GPIO_NUM_2, 1);
+    gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
+    gpio_hold_dis(GPIO_NUM_2);
+    pinMode(2, OUTPUT);
+    digitalWrite(2, HIGH);
+    // GPIO5 enables the 5 V boost for the Grove ports (A/B/C), which nothing
+    // here uses; M5EPD turns it on by default. Off by default to save power.
+    // Anything plugged into a Grove port is unpowered. To power it, drive
+    // GPIO5 HIGH here instead; no config option exists yet (it would need a
+    // new DeviceFlags bit in opendisplay-protocol).
+    gpio_hold_dis(GPIO_NUM_5);
+    pinMode(5, OUTPUT);
+    digitalWrite(5, LOW);
+    // BLE needs no more than 80 MHz, and the wake window is mostly idle
+    // polling. Switched after the GPIO2 hold so the power-button hold time
+    // does not grow.
+    setCpuFrequencyMhz(80);
+    od_log_info("M5Paper init: main-power hold, EXT power off, CPU %u MHz", (unsigned)getCpuFrequencyMhz());
+    // With RTC power-off configured, rtcConsumeWake() clears it later in
+    // setup() and needs the flags to recognise an RTC wake.
+    if (!rtcWakeConfigured()) m5paperRtcQuiesce();
 #endif
 }
 
