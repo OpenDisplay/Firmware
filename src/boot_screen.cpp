@@ -9,6 +9,7 @@
 #include "qr/qrcode.h"
 #include "display_service.h"
 #include "split_panel.h"
+#include "panel_ssd2677.h"
 #include "od_log.h"
 #if __has_include("logo_bitmap.h")
 #include "logo_bitmap.h"
@@ -532,7 +533,7 @@ static void writeGray4PlaneRow(const uint8_t* row2bpp, int pitch2bpp, int planeP
         uint8_t code = (uint8_t)((~(row2bpp[x >> 2] >> (6 - ((x & 3) << 1)))) & 0x03);
         if ((code >> bitSel) & 0x01) planeRow[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
     }
-    bbepWriteData(&bbep, planeRow, planePitch);
+    epdWriteData(planeRow, planePitch);
 }
 
 static const uint8_t kSchemeWhiteValue[] = {
@@ -826,7 +827,7 @@ bool writeBootScreenWithQr() {
         if (useHighResLayout) {
             formatBootColorSchemeText(colorScheme, footerSchemeStr, sizeof(footerSchemeStr));
             footerSegs[numFooterSegs++] = footerSchemeStr;
-            if (globalConfig.displays[0].partial_update_support) {
+            if (globalConfig.displays[0].partial_update_support && !panelSsd2677Active()) {
                 footerSegs[numFooterSegs++] = "+Partial Refresh";
             }
             snprintf(footerResStr, sizeof(footerResStr), "%ux%u",
@@ -963,12 +964,12 @@ bool writeBootScreenWithQr() {
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
         if (!fastepd_driver_used() && !splitStream) {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
-            bbepStartWrite(&bbep, targetPlane);
+            epdStartWrite(targetPlane);
         }
 #else
         if (!splitStream) {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
-            bbepStartWrite(&bbep, targetPlane);
+            epdStartWrite(targetPlane);
         }
 #endif
         const int ls = bootLineStep(middleScaleText);
@@ -1051,7 +1052,7 @@ bool writeBootScreenWithQr() {
                 splitPanelSinkBytes(row + (size_t)halfPass * splitHalfPitch, splitHalfPitch);
             } else {
                 odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
-                bbepWriteData(&bbep, row, pitch);
+                epdWriteData(row, pitch);
             }
 #else
             if (gray4Split) {
@@ -1060,7 +1061,7 @@ bool writeBootScreenWithQr() {
                 splitPanelSinkBytes(row + (size_t)halfPass * splitHalfPitch, splitHalfPitch);
             } else {
                 odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
-                bbepWriteData(&bbep, row, pitch);
+                epdWriteData(row, pitch);
             }
 #endif
         }
@@ -1080,9 +1081,9 @@ bool writeBootScreenWithQr() {
         if (useBitplanes && !colorSwatchPlane1) {
             memset(row, 0x00, pitch);
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
-            bbepStartWrite(&bbep, PLANE_1);
+            epdStartWrite(PLANE_1);
             odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
-            for (uint16_t y = 0; y < h; y++) bbepWriteData(&bbep, row, pitch);
+            for (uint16_t y = 0; y < h; y++) epdWriteData(row, pitch);
         }
     }
     od_log_info("Boot screen with QR rendered");

@@ -15,6 +15,7 @@
 #include "encryption.h"
 #include "boot_screen.h"
 #include "split_panel.h"
+#include "panel_ssd2677.h"
 #include "link_owner.h"
 #include "session_guard.h"
 #include "touch_input.h"
@@ -203,6 +204,7 @@ static void prepareEpdRailForBoot() {
 // use the pre-change windows. Re-apply those so full and partial share one map.
 static void epdAlignCustomPartialRamMode(void) {
     uint8_t uc[4];
+    panelSsd2677AfterInit();
     if (bbep.type == EP397_800x480 || bbep.type == EP397_800x480_4GRAY) {
         bbepCMD2(&bbep, SSD1608_DATA_MODE, 0x01);
         bbepWriteCmd(&bbep, SSD1608_SET_RAMXPOS);
@@ -240,6 +242,7 @@ static void configureBbepPanelGeometry(void) {
     memset(&bbep, 0, sizeof(BBEPDISP));
     int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
     bbepSetPanelType(&bbep, panelType);
+    panelSsd2677ApplyOverrides();
     int rotation = globalConfig.displays[0].rotation * 90;
     // Dual-controller panels keep native orientation: the host bakes rotation into
     // the packed image, and the framebuffer layout bbepWriteImage4bppDual() reads
@@ -448,6 +451,7 @@ static bool epdSessionAcquire(bool partialInit) {
         pwrmgm(true);   // -> PWR_ACTIVE (guarded; real transition)
         if (!epdSessionUsesFastepd()) {
             const DisplayConfig& d = globalConfig.displays[0];
+            panelVariantResolve();
             configureBbepPanelGeometry();
             if (splitPanelUsed()) {
                 splitPanelInitIo();
@@ -578,7 +582,7 @@ static bool refreshBootScreenFull() {
     // panel must not be refreshed with it.
     if (splitPanelUsed() && !splitPanelCloseFrame()) return false;
     odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
-    bbepRefresh(&bbep, REFRESH_FULL);
+    epdStartRefresh(REFRESH_FULL);
     const bool ok = waitforrefresh(60);
     splitPanelPowerOff();
     return ok;
@@ -931,6 +935,7 @@ bool waitforrefresh(int timeout){
             }
             od_log_raw(".\n");
             od_log_info("Refresh took %.2f seconds", (float)i / 100);
+            panelSsd2677AfterRefresh();
 //            delay(200);   // EXTRA DELAY HERE IS UNNEEDED AND JUST SLOWS THINGS DOWN
             return true;
         }
@@ -1716,15 +1721,7 @@ void initDisplay(){
 #ifdef TARGET_ESP32
         // reTerminal Sticky: MicroSD shares SPI2 with the EPD (Seeed pin map).
         // Park SD before any EPD SPI so an inserted card cannot steal the bus.
-        {
-            const DisplayConfig& d = globalConfig.displays[0];
-            if (d.clk_pin == 13 && d.data_pin == 14 && d.cs_pin == 15) {
-                pinMode(8, OUTPUT);
-                digitalWrite(8, HIGH);  // SD_CS idle
-                pinMode(10, OUTPUT);
-                digitalWrite(10, LOW);  // SD_EN off
-            }
-        }
+        panelStickySdPark();
 #endif
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
     if (fastepd_driver_used()) {
@@ -1758,6 +1755,7 @@ void initDisplay(){
 #endif
     {
         prepareEpdRailForBoot();
+        panelVariantResolve();
         configureBbepPanelGeometry();
         od_log_info("Height: %u", globalConfig.displays[0].pixel_height);
         od_log_info("Width: %u", globalConfig.displays[0].pixel_width);
@@ -2113,15 +2111,15 @@ static void streamGray4Bytes(const uint8_t* buf, uint32_t len) {
     while (off < len && directWriteBytesWritten < 2u * planeBytes) {
         if (directWriteBytesWritten == 0u) {
             bbepSetAddrWindow(&bbep, 0, 0, directWriteWidth, directWriteHeight);
-            bbepStartWrite(&bbep, PLANE_0);
+            epdStartWrite(PLANE_0);
         } else if (directWriteBytesWritten == planeBytes) {
             bbepSetAddrWindow(&bbep, 0, 0, directWriteWidth, directWriteHeight);
-            bbepStartWrite(&bbep, PLANE_1);
+            epdStartWrite(PLANE_1);
         }
         const uint32_t limit = (directWriteBytesWritten < planeBytes) ? planeBytes : 2u * planeBytes;
         uint32_t take = len - off;
         if (directWriteBytesWritten + take > limit) take = limit - directWriteBytesWritten;
-        bbepWriteData(&bbep, (uint8_t*)(buf + off), (int)take);
+        epdWriteData(buf + off, (int)take);
         off += take;
         directWriteBytesWritten += take;
     }
@@ -2134,7 +2132,7 @@ static void directWriteSinkBytes(uint8_t* data, uint32_t len) {
     if (splitPanelUsed()) {
         splitPanelSinkBytes(data, len);
     } else {
-        bbepWriteData(&bbep, data, (int)len);
+        epdWriteData(data, (int)len);
     }
     directWriteBytesWritten += len;
 }
@@ -2231,7 +2229,7 @@ static void directWriteActivatePanel(void) {
         }
     } else {
         bbepSetAddrWindow(&bbep, 0, 0, globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height);
-        bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
+        epdStartWrite(directWriteBitplanes ? PLANE_0 : getplane());
     }
     if (directWriteCompressed) {
         od_zlib_stream_reset(directWriteDecompressedTotal);
@@ -2336,7 +2334,7 @@ void handlePartialWriteStart(uint8_t* data, uint16_t len) {
 
     uint16_t dispW = globalConfig.displays[0].pixel_width;
     uint16_t dispH = globalConfig.displays[0].pixel_height;
-    if (getBitsPerPixel() != 1) {
+    if (getBitsPerPixel() != 1 || panelSsd2677Active()) {
         // bb_epaper partial refresh support is effectively non-existent for
         // 2bpp+ panels, and physical panels may not support that mode either.
         // This protocol uses two 1bpp controller planes as old/new image memory.
@@ -2574,7 +2572,7 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
         if (splitPanelUsed() && !splitPanelCloseFrame()) refreshMode = -1;
         if (refreshMode >= 0) {
             odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
-            bbepRefresh(&bbep, refreshMode);
+            epdStartRefresh(refreshMode);
             refreshSuccess = waitforrefresh(60);
             splitPanelPowerOff();
         }
@@ -2879,7 +2877,7 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
         // and applies a row-band update; 2bpp+ remains unsupported. Dual-controller
         // panels are bwgbry_split (4 bpp), so this excludes them without a clause of
         // their own.
-        if (getBitsPerPixel() != 1) {
+        if (getBitsPerPixel() != 1 || panelSsd2677Active()) {
             displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_PARTIAL_UNSUPPORTED); return;
         }
         // 6: etag gate — nonzero and must match what is currently on the panel.
