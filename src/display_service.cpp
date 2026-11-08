@@ -271,6 +271,30 @@ static void initBbepPanelSession() {
     delay(200);
 }
 
+// Boot-time panel presence check. After a hardware reset every controller reports
+// idle on BUSY within milliseconds (the GoodDisplay samples wait for exactly that).
+// A BUSY line that stays busy means no panel, or one that does not respond; every
+// later BUSY wait would then run into its timeout (~10 min for the boot screen).
+static const uint32_t EPD_BOOT_PROBE_TIMEOUT_MS = 2000;
+
+static bool bootPanelResponds() {
+    const DisplayConfig& d = globalConfig.displays[0];
+    // Dual chip-select panels are not covered (untested).
+    if ((bbep.iFlags & BBEP_SPLIT_BUFFER) || d.busy_pin == 0xFF || d.reset_pin == 0xFF) return true;
+    pinMode(d.busy_pin, INPUT);
+    pinMode(d.reset_pin, OUTPUT);
+    digitalWrite(d.reset_pin, LOW);
+    delay(20);
+    digitalWrite(d.reset_pin, HIGH);
+    const uint8_t busyIdle = (bbep.chip_type == BBEP_CHIP_UC81xx) ? HIGH : LOW;
+    const uint32_t start = millis();
+    do {
+        delay(10);
+        if (digitalRead(d.busy_pin) == busyIdle) return true;
+    } while (millis() - start < EPD_BOOT_PROBE_TIMEOUT_MS);
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // EPD panel power session (keep-alive) — see the state-machine design.
 // pwrmgm() owns the OFF<->(ACTIVE) rail transitions and is the sole rail actuator;
@@ -1736,6 +1760,11 @@ void initDisplay(){
         configureBbepPanelGeometry();
         od_log_info("Height: %u", globalConfig.displays[0].pixel_height);
         od_log_info("Width: %u", globalConfig.displays[0].pixel_width);
+        if (!bootPanelResponds()) {
+            od_log_warn("Panel not responding (BUSY stays busy after reset) - skipping boot screen");
+            pwrmgm(false);   // raw rail cut: epdSessionForceOff() would send sleep commands and wait on BUSY
+            return;
+        }
         initBbepPanelSession();
         if (! (globalConfig.displays[0].transmission_modes & OD_TRANSMISSION_MODE_CLEAR_ON_BOOT)){
             bool bootOk = refreshBootScreenFull();
