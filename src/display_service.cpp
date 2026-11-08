@@ -867,6 +867,7 @@ int mapEpd(int id){
         case 0x004A: return EP40_SPECTRA_400x600;
         case 0x004B: return EP27_176x264;
         case 0x004C: return EP27_176x264_4GRAY;
+        case 0x004D: return EP42R3_400x300; // DEPG0420 / GDEY042Z98 4.2" B/W/R (SSD1683)
         // Values 1000+ are the M3 / EPD-nRF5 driver line's PanelIC block, which
         // names the same physical panels by their controller instead of by the
         // bb_epaper EP* identifier. Only the ones with a bb_epaper equivalent are
