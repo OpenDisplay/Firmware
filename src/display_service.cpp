@@ -1225,6 +1225,9 @@ void initSensors(){
         else if(sensor->sensor_type == OD_SENSOR_TYPE_AHT20){
             od_log_debug("  AHT20 (wake-time I2C + MSD slot)");
         }
+        else if(sensor->sensor_type == OD_SENSOR_TYPE_PCF8563){
+            od_log_debug("  PCF8563/BM8563 RTC (power-off wake source with pwr_latch)");
+        }
         else if(sensor->sensor_type == OD_SENSOR_TYPE_BQ27220){
             od_log_debug("  BQ27220 fuel gauge (MSD voltage + optional dynamic SOC/status bytes)");
         }

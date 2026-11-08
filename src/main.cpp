@@ -6,6 +6,7 @@
 #include "display_service.h"
 #include "power_latch.h"
 #include "wake_button.h"
+#include "rtc_pcf8563.h"
 #include "touch_input.h"
 #include "encryption.h"
 #include "ble_transport.h"
@@ -197,6 +198,20 @@ void setup() {
     // reservation above depends on. One call site serves both the normal-boot and the
     // deep-sleep-wake path, which share this stretch of setup().
     odLanReserveRxBuffer();
+#endif
+#ifdef TARGET_ESP32
+    // A cold boot raised by the RTC (power-off sleep, see enterDeepSleep()) is a
+    // timer wake in all but the ESP32's own wake cause. Always called when an RTC
+    // is configured: it also clears the flag that holds INT (and the rail) on.
+    // RTC memory died with the rail, so displayed_etag is 0 (the host sends a
+    // full image) and rebootFlag is cleared here -- this is not a reboot.
+    if (rtcConsumeWake() && !is_deep_sleep_wake) {
+        is_deep_sleep_wake = true;
+        woke_from_deep_sleep = true;
+        deep_sleep_count++;
+        rebootFlag = 0;
+        od_log_info("=== WOKE FROM RTC POWER-OFF ===");
+    }
 #endif
     if (is_deep_sleep_wake) { od_log_info("[wake] << full_config_init >> initio"); od_log_flush(); }
 #if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
@@ -1242,12 +1257,22 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     // manipulation then cannot disturb freshly configured RTC pulls, and its
     // gpio_hold_en() touches only the latch pin, never the wake pads.
     armButtonWakeSources();
-    od_log_info("Entering deep sleep for %u seconds%s", sleepSeconds,
-                overrideSleepSeconds ? " (host override, one cycle)" : " (config)");
+    // RTC power-off (PCF8563/BM8563 + MOSFET latch): the RTC switches the board
+    // back on, so the latch is released instead of held. On an I2C failure the
+    // rail stays held and this is a plain timer deep sleep. The ESP32 timer
+    // above stays armed either way: it is what wakes a USB-powered board.
+    const bool rtcPowerOff = rtcArmWake(sleepSeconds);
+    od_log_info("Entering deep sleep for %u seconds%s%s", sleepSeconds,
+                overrideSleepSeconds ? " (host override, one cycle)" : " (config)",
+                rtcPowerOff ? ", RTC power-off" : "");
     od_log_info("Heap: free=%u min=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
     od_log_flush(); // drain UART/Serial prior to deep sleep
     delay(100); // Brief delay to ensure serial output is sent
-    powerLatchHoldForSleep();
+    if (rtcPowerOff) {
+        powerLatchReleaseForRtcSleep();
+    } else {
+        powerLatchHoldForSleep();
+    }
     touchPrepareForDeepSleep();
     nm420HoldForSleep();
     esp_deep_sleep_start();
@@ -1571,7 +1596,9 @@ void m5paper_init(){
     // does not grow.
     setCpuFrequencyMhz(80);
     od_log_info("M5Paper init: main-power hold, EXT power off, CPU %u MHz", (unsigned)getCpuFrequencyMhz());
-    m5paperRtcQuiesce();
+    // With RTC power-off configured, rtcConsumeWake() clears it later in
+    // setup() and needs the flags to recognise an RTC wake.
+    if (!rtcWakeConfigured()) m5paperRtcQuiesce();
 #endif
 }
 

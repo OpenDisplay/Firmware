@@ -93,6 +93,10 @@
  *       Backward-compatible enum addition. Firmware treats the panel type as
  *       identifying the board (as with 3002-3004) and drives the M5Paper's
  *       main-power hold and external-power enable itself.
+ *     - SensorType 8: OD_SENSOR_TYPE_PCF8563 (PCF8563 / BM8563 RTC, I2C 0x51).
+ *       Together with OD_DEVICE_FLAG_PWR_LATCH, deep sleep arms the RTC and
+ *       releases the latch; the RTC INT powers the board back on (M5Paper).
+ *       Backward-compatible enum addition; publishes no MSD data.
  *     - Add each payload-layout change here as it lands. On the next version bump,
  *       move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
@@ -807,7 +811,8 @@ enum SensorType {
     OD_SENSOR_TYPE_SHT40       = 4, /**< @doc "Sensirion SHT40 (I2C); writes 3 LE bytes into MSD dynamic data (21 bits: 0.1C, 0.1% RH)" */
     OD_SENSOR_TYPE_BQ27220     = 5, /**< @doc "TI BQ27220 fuel gauge (I2C 0x55); voltage in MSD bytes 14-15, one packed dynamic byte (bits 0-6 SOC%, bit7 charging)" */
     OD_SENSOR_TYPE_NPM1300     = 6, /**< @doc "nPM1300 PMIC (other firmware family; not implemented by this firmware)" */
-    OD_SENSOR_TYPE_AHT20       = 7  /**< @doc "AHT20 (I2C 0x38); wake-time sample in SHT40-compatible 3-byte MSD format. NM-EPD-420 power gate GPIO40 is off between samples." */
+    OD_SENSOR_TYPE_AHT20       = 7, /**< @doc "AHT20 (I2C 0x38); wake-time sample in SHT40-compatible 3-byte MSD format. NM-EPD-420 power gate GPIO40 is off between samples." */
+    OD_SENSOR_TYPE_PCF8563     = 8  /**< @doc "NXP PCF8563 / BM8563 RTC (I2C 0x51) as a power-off wake source; with pwr_latch, deep sleep releases the latch and the RTC INT powers the board back on. Publishes no MSD data." */
 };
 
 /** @struct SensorData  @packet 0x23  @repeatable max=4
@@ -817,7 +822,7 @@ struct SensorData {
     uint8_t  instance_number;    /**< @doc "0-based sensor-block index." */
     uint16_t sensor_type;        /**< @enum SensorType @endian le @doc "sensor type." */
     uint8_t  bus_id;             /**< @doc "data_bus instance this sensor lives on." */
-    uint8_t  i2c_addr_7bit;      /**< @doc "I2C 7-bit address; 0 or 0xFF = per-sensor default (SHT40 0x44, BQ27220 0x55, AHT20 0x38)." @default 0xFF */
+    uint8_t  i2c_addr_7bit;      /**< @doc "I2C 7-bit address; 0 or 0xFF = per-sensor default (SHT40 0x44, BQ27220 0x55, AHT20 0x38, PCF8563 0x51)." @default 0xFF */
     uint8_t  msd_data_start_byte; /**< @doc "first dynamicreturndata index this sensor publishes into. SHT40/AHT20 use 3 bytes (0/0xFF = default 7); BQ27220 uses 1 packed byte (0xFF = do not publish)." @default 0xFF */
     uint8_t  reserved[24];       /**< @reserved @doc "future use; must be 0." */
 } __attribute__((packed));
