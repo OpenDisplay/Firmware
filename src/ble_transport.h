@@ -129,6 +129,14 @@ public:
     // false and the application schedules restartAdvertising() instead.
     bool restartsAdvertisingOnDisconnect() const;
 
+    // Silences the radio at this one choke point instead of gating every
+    // caller: while suppressed, startAdvertising()/restartAdvertising() are
+    // no-ops and setManufacturerData() stores the payload but never touches
+    // advertising. There is no unsuppress path in practice -- recovery is a
+    // reset. Does NOT disconnect an already-connected central -- callers
+    // must drop any live link themselves (ble.end(), abortToKnownState()).
+    void setRadioSuppressed(bool suppress);
+
     // --- link policy (no-op where the stack does not support it) ---
     void requestFastLink();        // nRF: 2M PHY + 251-octet DLE on the live link
     void boostAdvertising();       // nRF: temporary fast advertising interval

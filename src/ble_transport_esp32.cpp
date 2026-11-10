@@ -45,6 +45,7 @@ static volatile uint32_t s_connectedWord = 0;      // identity of the last conne
 static volatile uint32_t s_disconnectedWord = 0;   // identity of the last disconnect
 
 static uint32_t s_advBoostUntil = 0;
+static bool s_radioSuppressed = false;
 static constexpr uint32_t ESP_ADV_BOOST_MS = 3000u;
 static constexpr uint16_t ESP_ADV_INTERVAL_MIN = 0x0100u;  // 160 ms
 static constexpr uint16_t ESP_ADV_INTERVAL_MAX = 0x0640u;  // 1000 ms
@@ -394,6 +395,7 @@ bool BleTransport::begin(const char* deviceName) {
 }
 
 void BleTransport::startAdvertising() {
+    if (s_radioSuppressed) return;
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
     if (pAdvertising == nullptr || s_server == nullptr) {
         return;
@@ -411,6 +413,7 @@ void BleTransport::startAdvertising() {
 }
 
 void BleTransport::restartAdvertising() {
+    if (s_radioSuppressed) return;
     // Unconditional by contract: the caller owns the "still connected / mid-EPD
     // refresh / stack not up" deferral policy (see serviceBleAdvertisingRestart
     // in main.cpp). Force slow intervals so a disconnect restart never inherits
@@ -432,6 +435,13 @@ void BleTransport::stopAdvertising() {
     if (pAdvertising != nullptr) {
         pAdvertising->stop();
         od_log_info("BLE advertising stopped");
+    }
+}
+
+void BleTransport::setRadioSuppressed(bool suppress) {
+    s_radioSuppressed = suppress;
+    if (suppress) {
+        stopAdvertising();
     }
 }
 
@@ -562,6 +572,7 @@ uint16_t BleTransport::connIntervalMs(uint16_t handle) const {
 
 void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
     s_advertisementData.setManufacturerData(msd, len);
+    if (s_radioSuppressed) return;
     BLEAdvertising* pAdvertising = (s_server != nullptr) ? s_server->getAdvertising()
                                                          : BLEDevice::getAdvertising();
     if (pAdvertising == nullptr || connectedCount() > 0) {
