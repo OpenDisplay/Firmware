@@ -197,12 +197,6 @@ void m5paper_init();
 #ifdef TARGET_ESP32
 void nm420HoldForSleep();
 void fullSetupAfterConnection();
-// force: sleep even with a client connected (explicit host request 0x0053).
-// overrideSleepSeconds: nonzero replaces deep_sleep_time_seconds for this one
-// sleep cycle (0x0053 duration payload); never changes sleep eligibility.
-// lowBattery: low-battery callers only; skips the deep_sleep_time_seconds == 0
-// guard and arms the charge-pin wake source (see armButtonWakeSources()).
-void enterDeepSleep(bool force = false, uint16_t overrideSleepSeconds = 0, bool lowBattery = false);
 extern bool advertising_timeout_active;
 extern uint32_t advertising_start_time;
 #endif

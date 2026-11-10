@@ -2,9 +2,15 @@
 #include "structs.h"
 #include "sensor_bq27220.h"
 #include "display_service.h"
+#include "device_control.h"
 #include "od_log.h"
+#include "ble_transport.h"
 
 #include <Arduino.h>
+
+#ifdef TARGET_ESP32
+#include <esp_system.h>
+#endif
 
 extern struct GlobalConfig globalConfig;
 
@@ -172,4 +178,67 @@ void batteryLowPoll(void) {
     s_latch.low = true;
     s_latch.screenDrawn = false; // forces the low-battery screen to draw once
     s_latch.lowStrikes = 0;
+}
+
+bool lowBatteryBootCheck(void) {
+    // Polled here (rather than left to the first updatemsdata()) so s_soc is
+    // fresh before isBatteryLow() reads it, and so the voltage cache it also
+    // fills is reused for free by the later updatemsdata() call.
+    pollBq27220ForMsd();
+
+    const bool wasLatched = s_latch.low;
+    const bool lowNow = isBatteryLow();
+
+    if (wasLatched && !lowNow) {
+#ifdef TARGET_ESP32
+        // Only reachable on an ESP32 deep-sleep wake: that is the only boot
+        // where the RTC latch survives. The reset turns the wake into a
+        // normal cold boot, which redraws the boot screen and starts Wi-Fi.
+        od_log_info("Battery low: recovered at boot, resetting");
+        esp_restart();
+#endif
+        // nRF: s_latch is a plain static and never survives a reset, so this
+        // branch cannot be reached there.
+        return false;
+    }
+
+    if (!lowNow) {
+        return false;
+    }
+
+    s_latch.low = true;
+
+#ifdef TARGET_ESP32
+    // s_latch.screenDrawn true means we expect the low-battery screen to
+    // already be on the panel from a previous wake, so skip redrawing it.
+    if (!s_latch.screenDrawn) {
+        // The refresh that caused a brownout would cause it again. RTC_DATA_ATTR
+        // does not survive a brownout reset, so leaving screenDrawn false here
+        // retries the draw on the next timer wake instead of looping.
+        const esp_reset_reason_t reason = esp_reset_reason();
+        if (reason != ESP_RST_BROWNOUT) {
+            const bool drawn = refreshLowBatteryScreenFull();
+            if (drawn) {
+                s_latch.screenDrawn = true;
+            }
+        }
+    }
+    enterDeepSleep(true, 3600, true);
+    // enterDeepSleep() is void and does not actually return here (the chip
+    // resets from sleep), but it is not declared [[noreturn]], so a return
+    // value is still required to satisfy the compiler.
+    return true;
+#else
+    ble.setRadioSuppressed(true);
+    // nRF cannot tell a brownout from a power-on reset, so it always draws.
+    // s_latch.screenDrawn true means we expect the low-battery screen to
+    // already be on the panel from a previous call, so skip redrawing it.
+    if (!s_latch.screenDrawn) {
+        const bool drawn = refreshLowBatteryScreenFull();
+        if (drawn) {
+            s_latch.screenDrawn = true;
+        }
+    }
+    return true;
+#endif
 }

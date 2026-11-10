@@ -4,5 +4,6 @@
 bool isBatteryLow(void);
 bool batteryLowStateActive(void);
 void batteryLowPoll(void);
+bool lowBatteryBootCheck(void);
 
 #endif

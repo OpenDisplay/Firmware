@@ -14,6 +14,7 @@
 #include "session_guard.h"
 #include "od_log.h"
 #include "watchdog.h"
+#include "battery_low.h"
 
 #if defined(TARGET_ESP32) && defined(CONFIG_IDF_TARGET_ESP32S3)
 #include "driver/gpio.h"
@@ -256,16 +257,23 @@ void setup() {
         // or a DFU instead of being bricked until someone pulls the battery.
         od_log_warn("[WDT] safe mode - skipping initDisplay()");
         rebootFlag = 1;
-    } else if (!is_deep_sleep_wake) {
-        // Arm here rather than at declaration: this branch is the boot screen
-        // redraw, and every real reset (power-on, panic, WDT, SW) clears the
-        // wake cause and lands here. A deep-sleep wake skips it and keeps the
-        // pre-sleep flag, so a wake never advertises as a reboot.
-        rebootFlag = 1;
-        // Wake keeps the panel image; skipping initDisplay() (EPD rail power +
-        // full refresh) is the wake path's main energy saving.
-        initDisplay();
-        od_log_info("Display initialized");
+    } else {
+        // ESP32 never returns from lowBatteryBootCheck() when the battery is
+        // low. It deep-sleeps instead, so only nRF reaches the branches below.
+        const bool lowBat = lowBatteryBootCheck();
+        if (lowBat) {
+            rebootFlag = 1;
+        } else if (!is_deep_sleep_wake) {
+            // Arm here rather than at declaration: this branch is the boot screen
+            // redraw, and every real reset (power-on, panic, WDT, SW) clears the
+            // wake cause and lands here. A deep-sleep wake skips it and keeps the
+            // pre-sleep flag, so a wake never advertises as a reboot.
+            rebootFlag = 1;
+            // Wake keeps the panel image; skipping initDisplay() (EPD rail power +
+            // full refresh) is the wake path's main energy saving.
+            initDisplay();
+            od_log_info("Display initialized");
+        }
     }
 #ifdef TARGET_ESP32
     // Full BLE after display: ESP32 queues commands for loop() until setup returns.

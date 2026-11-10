@@ -20,6 +20,7 @@
 #include "session_guard.h"
 #include "touch_input.h"
 #include "watchdog.h"
+#include "battery_low.h"
 #include "uzlib.h"
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
 #include "display_fastepd.h"
@@ -1953,8 +1954,11 @@ float readChipTemperature() {
 
 void updatemsdata(){
     // od_log_debug("updatemsdata() called (mloopcounter: %u)", mloopcounter);
-    pollAht20SensorsForMsd();
-    pollSht40SensorsForMsd();
+    const bool lowActive = batteryLowStateActive();
+    if (!lowActive) {
+        pollAht20SensorsForMsd();
+        pollSht40SensorsForMsd();
+    }
     pollBq27220ForMsd();
     float batteryVoltage = readBatteryVoltage();
     float chipTemperature = readChipTemperature();
