@@ -1170,12 +1170,12 @@ void fullSetupAfterConnection() {
     od_log_info("=== Full setup completed ===");
 }
 
-void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
+void enterDeepSleep(bool force, uint16_t overrideSleepSeconds, bool lowBattery) {
     if (globalConfig.power_option.power_mode != 1) {
         od_log_debug("Skipping deep sleep - not battery powered (power_mode: %u)", globalConfig.power_option.power_mode);
         return;
     }
-    if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
+    if (!lowBattery && globalConfig.power_option.deep_sleep_time_seconds == 0) {
         od_log_debug("Skipping deep sleep - deep_sleep_time_seconds is 0");
         return;
     }
@@ -1242,21 +1242,32 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     buzzerStopForSleep();
     ledStopForSleep();
     woke_from_deep_sleep = true; // Will be true on next boot
-    ble.stopAdvertising();
-    delay(200);
-    ble.end();
-    delay(100);
-    od_log_info("BLE deinitialized");
+    if (ble.isReady()) {
+        ble.stopAdvertising();
+        delay(200);
+        ble.end();
+        delay(100);
+        od_log_info("BLE deinitialized");
+    } else {
+        od_log_debug("BLE never started - nothing to deinitialize");
+    }
     // Host override (0x0053 payload) applies to this one cycle only: it is a
     // parameter, never stored, so an aborted or later sleep reverts to config.
     uint16_t sleepSeconds = overrideSleepSeconds ? overrideSleepSeconds
                                                  : globalConfig.power_option.deep_sleep_time_seconds;
+    if (lowBattery && sleepSeconds == 0) {
+        // lowBattery bypassed the deep_sleep_time_seconds == 0 guard above; a
+        // caller that also omits overrideSleepSeconds would otherwise arm a
+        // zero-length timer with no guaranteed wake source.
+        sleepSeconds = 3600;
+        od_log_debug("Low battery: no sleep duration configured - defaulting to %u seconds", sleepSeconds);
+    }
     uint64_t sleep_timeout_us = (uint64_t)sleepSeconds * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleep_timeout_us);
     // After the timer arm, before powerLatchHoldForSleep(): the latch-hold
     // manipulation then cannot disturb freshly configured RTC pulls, and its
     // gpio_hold_en() touches only the latch pin, never the wake pads.
-    armButtonWakeSources();
+    armButtonWakeSources(lowBattery);
     // RTC power-off (PCF8563/BM8563 + MOSFET latch): the RTC switches the board
     // back on, so the latch is released instead of held. On an I2C failure the
     // rail stays held and this is a plain timer deep sleep. The ESP32 timer

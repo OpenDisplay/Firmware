@@ -13,12 +13,17 @@
 // Never fails; logs each pin's disposition. Call from enterDeepSleep() after
 // esp_sleep_enable_timer_wakeup() — the timer stays armed alongside — and
 // before powerLatchHoldForSleep().
-void armButtonWakeSources();
+// includeChargePin: low-battery sleeps only. Also arms power_option.charge_state_pin
+// at its charging level, so plugging in a charger wakes the device early.
+void armButtonWakeSources(bool includeChargePin = false);
 
 // Classify the wake cause and log it with the waking pin(s). Call once, early
 // in setup(); safe pre-config (reads sleep registers only). Returns true for
-// the button causes (EXT0/EXT1/GPIO). Takes esp_sleep_wakeup_cause_t as int so
-// this header also compiles on targets without esp_sleep.h.
+// the button causes (EXT0/EXT1/GPIO), but false when the only waking pin is
+// the charge pin armed by armButtonWakeSources(true), so a charger plug-in is
+// never delivered to the host as a synthetic button click. Takes
+// esp_sleep_wakeup_cause_t as int so this header also compiles on targets
+// without esp_sleep.h.
 bool detectButtonWake(int wakeupCause);
 
 #if defined(TARGET_ESP32)

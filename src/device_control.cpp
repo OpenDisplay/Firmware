@@ -10,7 +10,7 @@
 
 #ifdef TARGET_ESP32
 #include "wake_button.h"
-void enterDeepSleep(bool force = false, uint16_t overrideSleepSeconds = 0);
+void enterDeepSleep(bool force = false, uint16_t overrideSleepSeconds = 0, bool lowBattery = false);
 #endif
 
 #ifdef TARGET_NRF
