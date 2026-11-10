@@ -159,6 +159,10 @@ struct GlobalConfig {
     bool loaded;                // True if config was successfully loaded
 };
 
+static inline bool isEstimatorLithiumPrimary(uint8_t estimator) {
+    return estimator == OD_CAPACITY_EST_LITHIUM_PRIMARY;
+}
+
 #define MAX_BUTTONS 32  // Up to 4 instances * 8 pins = 32 buttons max
 struct ButtonState {
     uint8_t button_id;          // Button ID (0-7, from instance_number + pin offset)

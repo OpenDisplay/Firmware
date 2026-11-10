@@ -44,6 +44,12 @@ void initAXP2101(uint8_t busId);
 void readAXP2101Data();
 void powerDownAXP2101();
 void initDisplay();
+// Full bring-up + render + refresh + power-down cycle for the low-battery
+// screen. Brings the panel up itself (cold boot or deep-sleep wake), so unlike
+// refreshBootScreenFull() it needs no caller-side prepareEpdRailForBoot() /
+// initBbepPanelSession(). Returns false if the panel never comes up or the
+// refresh does not complete.
+bool refreshLowBatteryScreenFull(void);
 void writeTextAndFill(const char* text);
 void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);

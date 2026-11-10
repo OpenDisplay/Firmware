@@ -65,9 +65,9 @@ bool isBatteryLow(void) {
 
     // LITHIUM_PRIMARY cells are not rechargeable, so a charge-pin reading is
     // meaningless for them and must not suppress the low check.
-    const bool isLithiumPrimary = estimator == OD_CAPACITY_EST_LITHIUM_PRIMARY;
+    const bool lithiumPrimary = isEstimatorLithiumPrimary(estimator);
     const bool charging = chargerIsCharging();
-    if (charging && !isLithiumPrimary) {
+    if (charging && !lithiumPrimary) {
         s_latch.low = false;
         return false;
     }
@@ -78,7 +78,7 @@ bool isBatteryLow(void) {
         // A primary cell rebounds at rest after load, so a voltage recovery
         // would cycle the device through reset and re-trip. Only a battery
         // swap (power-on reset) clears this latch.
-        if (isLithiumPrimary) {
+        if (lithiumPrimary) {
             return true;
         }
         if (gaugeHealthy) {
