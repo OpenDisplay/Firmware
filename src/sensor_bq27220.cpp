@@ -117,7 +117,7 @@ static bool charger_gpio_charging(void) {
     }
     const bool activeLow = (globalConfig.power_option.charger_flags & OD_CHARGER_FLAG_STATE_ACTIVE_LOW) != 0;
     const int level = digitalRead(st);
-    return activeLow ? (level == HIGH) : (level == LOW);
+    return activeLow ? (level == LOW) : (level == HIGH);
 }
 
 void initBq27220Sensors(void) {
