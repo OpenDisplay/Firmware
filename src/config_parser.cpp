@@ -776,6 +776,7 @@ void printConfigSummary(){
     od_log_debug("Battery Sense Enable Pin: %u", globalConfig.power_option.battery_sense_enable_pin);
     od_log_debug("Battery Sense Flags: 0x%02X", globalConfig.power_option.battery_sense_flags);
     od_log_debug("  ENABLE_INVERTED: %s", (globalConfig.power_option.battery_sense_flags & OD_BATTERY_SENSE_FLAG_ENABLE_INVERTED) ? "yes" : "no");
+    od_log_debug("  CALIBRATED_MV: %s", (globalConfig.power_option.battery_sense_flags & OD_BATTERY_SENSE_FLAG_CALIBRATED_MV) ? "yes" : "no");
     od_log_debug("Capacity Estimator: %u", globalConfig.power_option.capacity_estimator);
     od_log_debug("Voltage Scaling Factor: %u", globalConfig.power_option.voltage_scaling_factor);
     od_log_debug("Deep Sleep Current: %u uA", (unsigned)globalConfig.power_option.deep_sleep_current_ua);
