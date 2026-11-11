@@ -964,6 +964,40 @@ async def _do_read_msd(ctx: _BleCtx, timeout: float) -> bytes:
     return data[2:18]
 
 
+def _normalize_ble_name(name: str) -> str:
+    """Accept the on-screen ID verbatim (``OD1A2B3C``) or just its hex suffix (``1A2B3C``)."""
+    name = name.strip().upper()
+    if not name.startswith("OD") and re.fullmatch(r"[0-9A-F]{6}", name):
+        name = "OD" + name
+    return name
+
+
+async def ble_discover_by_name(name: str, timeout: float = 10.0) -> str:
+    """Scan for the BLE advertisement matching `name` (the ID shown on the device's own
+    screen) and return its address, for use where this tool otherwise wants --addr."""
+    target = _normalize_ble_name(name)
+    _status(f"Scanning for a BLE device advertising as {target} ({timeout:.0f}s)...")
+    devices = await bleak.BleakScanner.discover(timeout=timeout)
+    matches = [d for d in devices if d.name and d.name.strip().upper() == target]
+    if not matches:
+        seen = sorted({d.name for d in devices if d.name})
+        raise RuntimeError(
+            f"no BLE device advertising as {target} found in {timeout:.0f}s"
+            + (f" (nearby devices seen: {', '.join(seen)})" if seen else "")
+        )
+    if len(matches) > 1:
+        raise RuntimeError(f"multiple BLE devices advertising as {target}: {[d.address for d in matches]}")
+    _status(f"Found {target} at {matches[0].address}.")
+    return matches[0].address
+
+
+def resolve_addr(args: argparse.Namespace, timeout: float = 10.0) -> str:
+    """Return args.addr directly, or resolve args.name to an address via a BLE scan."""
+    if getattr(args, "name", None):
+        return asyncio.run(ble_discover_by_name(args.name, timeout=timeout))
+    return args.addr
+
+
 async def ble_read_msd(addr: str, timeout: float = 10.0, key: bytes | None = None) -> bytes:
     async with _ble_connection(addr, key=key) as ctx:
         return await _do_read_msd(ctx, timeout)
@@ -1011,19 +1045,21 @@ def _write_output(text: str, output: Path | None) -> None:
 
 
 def cmd_read_config(args: argparse.Namespace) -> int:
+    addr = resolve_addr(args)
     key = _parse_key_arg(args.key)
-    packet = asyncio.run(ble_read_config(args.addr, key=key))
+    packet = asyncio.run(ble_read_config(addr, key=key))
     doc = decode_packet(packet)
     _write_output(dump_yaml(doc), args.output)
     return 0
 
 
 def cmd_write_config(args: argparse.Namespace) -> int:
+    addr = resolve_addr(args)
     key = _parse_key_arg(args.key)
     doc = load_yaml_doc(args.input.read_text())
     packet = encode_packet(doc)
-    asyncio.run(ble_write_config(args.addr, packet, key=key))
-    print(f"Wrote config to {args.addr} ({len(packet)} bytes)")
+    asyncio.run(ble_write_config(addr, packet, key=key))
+    print(f"Wrote config to {addr} ({len(packet)} bytes)")
     return 0
 
 
@@ -1042,8 +1078,9 @@ def cmd_encode_config(args: argparse.Namespace) -> int:
 
 
 def cmd_read_msd(args: argparse.Namespace) -> int:
+    addr = resolve_addr(args)
     key = _parse_key_arg(args.key)
-    payload = asyncio.run(ble_read_msd(args.addr, key=key))
+    payload = asyncio.run(ble_read_msd(addr, key=key))
     if args.raw:
         print(payload.hex())
         return 0
@@ -1059,8 +1096,8 @@ def cmd_read_msd(args: argparse.Namespace) -> int:
 
 
 def cmd_add_sensor(args: argparse.Namespace) -> int:
-    if not args.addr and not (args.config_hex or args.config_file):
-        raise ValueError("specify --addr or --config-hex/--config-file")
+    if not (args.addr or args.name) and not (args.config_hex or args.config_file):
+        raise ValueError("specify --addr/--name or --config-hex/--config-file")
     key = _parse_key_arg(args.key)
 
     def add_sensor(doc: dict[str, Any]) -> None:
@@ -1077,10 +1114,11 @@ def cmd_add_sensor(args: argparse.Namespace) -> int:
             }
         )
 
-    if args.addr:
-        new_packet = asyncio.run(_ble_read_modify_write(args.addr, add_sensor, key=key))
+    if args.addr or args.name:
+        addr = resolve_addr(args)
+        new_packet = asyncio.run(_ble_read_modify_write(addr, add_sensor, key=key))
         doc = decode_packet(new_packet)
-        print(f"Wrote updated config to {args.addr} ({len(new_packet)} bytes, {len(doc.get('sensors', []))} sensor(s))")
+        print(f"Wrote updated config to {addr} ({len(new_packet)} bytes, {len(doc.get('sensors', []))} sensor(s))")
     else:
         packet = read_hex_arg(args.config_hex, str(args.config_file) if args.config_file else None)
         doc = decode_packet(packet)
@@ -1093,6 +1131,15 @@ def cmd_add_sensor(args: argparse.Namespace) -> int:
 def add_hex_input_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config-hex", help="Existing config packet as hex bytes")
     parser.add_argument("--config-file", type=Path, help="Read the existing packet from a file")
+
+
+def add_device_target_args(parser: argparse.ArgumentParser, required: bool = True) -> None:
+    group = parser.add_mutually_exclusive_group(required=required)
+    group.add_argument("--addr", help="BLE device address (as shown by your OS's BLE stack)")
+    group.add_argument(
+        "--name",
+        help="Device ID as shown on its own screen, e.g. OD1A2B3C (scans to resolve the address)",
+    )
 
 
 def main() -> int:
@@ -1113,9 +1160,12 @@ Examples:
     od-device-cli.py read-config --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71
         Same, for a device with BLE encryption enabled (security_config.encryption_enabled) -
         authenticates via the 0x0050 handshake first, then prints YAML to stdout.
+
+    od-device-cli.py read-config --name OD1A2B3C -o config.yaml
+        Same, but resolve the address by scanning for the ID shown on the device's own screen.
 """,
     )
-    p_read.add_argument("--addr", required=True, help="BLE device address")
+    add_device_target_args(p_read)
     p_read.add_argument("-o", "--output", type=Path, help="Write YAML to a file instead of stdout")
     p_read.add_argument("--key", metavar="HEX", help="16-byte master key (32 hex chars) for encrypted BLE")
     p_read.set_defaults(func=cmd_read_config)
@@ -1133,9 +1183,12 @@ Examples:
 
     od-device-cli.py write-config --addr AA:BB:CC:DD:EE:FF --input config.yaml --key 1e6d01ca00803339d31ee98ca052da71
         Same, authenticating first for a device with BLE encryption enabled.
+
+    od-device-cli.py write-config --name OD1A2B3C --input config.yaml
+        Same, but resolve the address by scanning for the ID shown on the device's own screen.
 """,
     )
-    p_write.add_argument("--addr", required=True, help="BLE device address")
+    add_device_target_args(p_write)
     p_write.add_argument("-i", "--input", required=True, type=Path, help="YAML config file")
     p_write.add_argument("--key", metavar="HEX", help="16-byte master key (32 hex chars) for encrypted BLE")
     p_write.set_defaults(func=cmd_write_config)
@@ -1189,9 +1242,13 @@ Examples:
     od-device-cli.py add-sensor --config-hex "1D 00 01 ... EC 58" --sensor-type 0x0005 --bus-id 0
         Offline: add a sensor entry to a hex packet and print the updated hex, without
         touching a live device.
+
+    od-device-cli.py add-sensor --name OD1A2B3C --sensor-type 0x0003 --bus-id 0
+        Same as the --addr example, but resolve the address by scanning for the ID shown
+        on the device's own screen.
 """,
     )
-    p_add.add_argument("--addr", help="BLE device address (reads and writes back over BLE)")
+    add_device_target_args(p_add, required=False)
     add_hex_input_args(p_add)
     p_add.add_argument("--instance", type=auto_int, default=0, help="instance_number (default: 0)")
     p_add.add_argument("--sensor-type", type=auto_int, required=True, help="sensor_type, e.g. 0x0003 for AXP2101")
@@ -1216,9 +1273,12 @@ Examples:
     od-device-cli.py read-msd --addr AA:BB:CC:DD:EE:FF --key 1e6d01ca00803339d31ee98ca052da71 --raw
         Same, for a device with BLE encryption enabled, printing the raw 16-byte payload
         as hex instead of decoding it.
+
+    od-device-cli.py read-msd --name OD1A2B3C
+        Same, but resolve the address by scanning for the ID shown on the device's own screen.
 """,
     )
-    p_msd.add_argument("--addr", required=True, help="BLE device address")
+    add_device_target_args(p_msd)
     p_msd.add_argument("--key", metavar="HEX", help="16-byte master key (32 hex chars) for encrypted BLE")
     p_msd.add_argument("--raw", action="store_true", help="Print the raw 16-byte MSD payload as hex instead of decoding")
     p_msd.set_defaults(func=cmd_read_msd)
