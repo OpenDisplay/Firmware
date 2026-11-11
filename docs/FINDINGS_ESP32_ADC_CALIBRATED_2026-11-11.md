@@ -38,6 +38,25 @@ branch `feat/esp32-adc-calibrated-battery`).
   boot and clears by the next 30 s refresh. Not investigated; possibly the
   divider/charger settling at power-up.
 
+## On battery (charger out of the loop)
+
+Same board, unplugged at ~09:29:40 after charging, 120 s sleep so each RTC
+wake takes a fresh reading. The method was switched over BLE while on
+battery, then switched back to bracket any drift of the cell.
+
+| Time | Method | Advertised battery |
+|---|---|---|
+| 09:32:35 | calibrated | 4.20 V |
+| 09:37:04 | calibrated | 4.19 V |
+| 09:44:13 | calibrated | 4.20 V |
+| 09:46:42 - 09:53:48 | legacy (factor 174) | 4.11, 4.10, 4.11, 4.10 V |
+| 09:56:21 | calibrated | 4.19 V |
+
+The calibrated path reads 4.19-4.20 V on a cell 3-27 min off the charger,
+which is where a fully charged Li-ion rests; the legacy path reads 4.10-4.11
+V on this chip (about 2.2 % low). The bracket rules out cell drift. Still no
+multimeter reading.
+
 ## Not verified
 
 - Absolute accuracy against a multimeter.
