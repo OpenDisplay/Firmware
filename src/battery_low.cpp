@@ -5,6 +5,9 @@
 #include "device_control.h"
 #include "od_log.h"
 #include "ble_transport.h"
+#include "link_owner.h"
+#include "session_guard.h"
+#include "wifi_service.h"
 
 #include <Arduino.h>
 
@@ -233,6 +236,62 @@ bool lowBatteryBootCheck(void) {
     // nRF cannot tell a brownout from a power-on reset, so it always draws.
     // s_latch.screenDrawn true means we expect the low-battery screen to
     // already be on the panel from a previous call, so skip redrawing it.
+    if (!s_latch.screenDrawn) {
+        const bool drawn = refreshLowBatteryScreenFull();
+        if (drawn) {
+            s_latch.screenDrawn = true;
+        }
+    }
+    return true;
+#endif
+}
+
+bool batteryLowLoopCheck(void) {
+    // Set once per trip, so a sustained low state does not re-run the radio
+    // suppression / abort / screen-draw sequence on every platformIdle() pass.
+    static bool s_tripHandled = false;
+
+    batteryLowPoll();
+
+    if (!s_latch.low) {
+        if (s_tripHandled) {
+            // ESP32 never reaches this: every ESP32 low path ends in
+            // enterDeepSleep(), and recovery is checked at the next wake
+            // instead, in lowBatteryBootCheck().
+            od_log_info("Battery low: recovered in loop, resetting");
+            reboot();
+        }
+        return false;
+    }
+
+    if (s_tripHandled) {
+        return true;
+    }
+
+    s_tripHandled = true;
+    ble.setRadioSuppressed(true);
+#ifdef OPENDISPLAY_HAS_WIFI
+    opendisplay_lan_teardown();
+#endif
+
+#ifdef TARGET_ESP32
+    if (!s_latch.screenDrawn) {
+        const bool drawn = refreshLowBatteryScreenFull();
+        if (drawn) {
+            s_latch.screenDrawn = true;
+        }
+    }
+    enterDeepSleep(true, 3600, true);
+    // enterDeepSleep() does not actually return here (the chip resets from
+    // sleep), but it is not declared [[noreturn]], so a return value is
+    // still required to satisfy the compiler.
+    return true;
+#else
+    // Mirrors enterDeepSleep()'s own terminal-mark-then-abort sequence: the
+    // admission gate goes up, then the owner's link is dropped, before the
+    // (potentially slow) panel refresh starts.
+    const LinkId displaced = linkMarkTerminal();
+    abortToKnownState("low battery", true, displaced);
     if (!s_latch.screenDrawn) {
         const bool drawn = refreshLowBatteryScreenFull();
         if (drawn) {

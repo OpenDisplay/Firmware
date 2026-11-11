@@ -1072,6 +1072,25 @@ void loop() {
     // outcome for a mechanism whose entire value is speed.
     serviceBleAuthAbuseDisconnect();
 
+    // Runs here, unconditionally, rather than inside platformIdle(): that hook
+    // is only reached when workInFlight is false below, and ble.isConnected()
+    // alone makes workInFlight true, so a battery check gated behind it would
+    // never fire while a central stays connected -- exactly the case this is
+    // for. Placed after every R7d session-policy step above, so a trip never
+    // pre-empts a command that arrived this same pass.
+    const bool batteryLow = batteryLowLoopCheck();
+    if (batteryLow) {
+#ifndef TARGET_ESP32
+        // nRF stays awake while low (no deep-sleep path); keep the loop
+        // responsive and keep polling BQ27220/ADC so recovery is detected.
+        idleDelay(500);
+        updatemsdata();
+#endif
+        // ESP32 never reaches here while actually low: the first trip goes
+        // straight into enterDeepSleep(), which never returns.
+        return;
+    }
+
     // Work in flight *this iteration* only. Every term is transient and most are
     // cleared earlier in this same pass, so this must never be the sole gate on
     // deep sleep — lastActivityMs supplies the quiet window. The terms that only
