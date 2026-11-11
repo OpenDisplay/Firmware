@@ -1293,7 +1293,7 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds, bool lowBattery) 
         // lowBattery bypassed the deep_sleep_time_seconds == 0 guard above; a
         // caller that also omits overrideSleepSeconds would otherwise arm a
         // zero-length timer with no guaranteed wake source.
-        sleepSeconds = 3600;
+        sleepSeconds = kLowBatterySleepSeconds;
         od_log_debug("Low battery: no sleep duration configured - defaulting to %u seconds", sleepSeconds);
     }
     uint64_t sleep_timeout_us = (uint64_t)sleepSeconds * 1000000ULL;

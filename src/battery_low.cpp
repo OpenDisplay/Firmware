@@ -226,7 +226,7 @@ bool lowBatteryBootCheck(void) {
             }
         }
     }
-    enterDeepSleep(true, 3600, true);
+    enterDeepSleep(true, kLowBatterySleepSeconds, true);
     // enterDeepSleep() is void and does not actually return here (the chip
     // resets from sleep), but it is not declared [[noreturn]], so a return
     // value is still required to satisfy the compiler.
@@ -281,7 +281,7 @@ bool batteryLowLoopCheck(void) {
             s_latch.screenDrawn = true;
         }
     }
-    enterDeepSleep(true, 3600, true);
+    enterDeepSleep(true, kLowBatterySleepSeconds, true);
     // enterDeepSleep() does not actually return here (the chip resets from
     // sleep), but it is not declared [[noreturn]], so a return value is
     // still required to satisfy the compiler.
