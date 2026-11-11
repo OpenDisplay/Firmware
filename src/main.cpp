@@ -1242,6 +1242,13 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds, bool lowBattery) 
     buzzerStopForSleep();
     ledStopForSleep();
     woke_from_deep_sleep = true; // Will be true on next boot
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Mirrors esp32_ble_deinit_before_restart()'s ordering (device_control.cpp):
+    // WiFi/LAN torn down before BLE, since esp_deep_sleep_start() cuts power to
+    // both radios but a graceful teardown first avoids leaving sockets/TLS state
+    // dangling across the sleep-wake boundary.
+    opendisplay_lan_teardown();
+#endif
     if (ble.isReady()) {
         ble.stopAdvertising();
         delay(200);
