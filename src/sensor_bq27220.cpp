@@ -96,6 +96,14 @@ float bq27220BatteryVoltageVolts(void) {
     return s_gauge_ok ? s_batt_v : -1.0f;
 }
 
+uint8_t bq27220Soc(void) {
+    return s_soc;
+}
+
+bool bq27220GaugeHealthy(void) {
+    return s_gauge_ok && s_soc <= 100;
+}
+
 void initChargerGpio(void) {
     const uint8_t flags = globalConfig.power_option.charger_flags;
     const uint8_t en = globalConfig.power_option.charge_enable_pin;
@@ -118,6 +126,10 @@ static bool charger_gpio_charging(void) {
     const bool activeLow = (globalConfig.power_option.charger_flags & OD_CHARGER_FLAG_STATE_ACTIVE_LOW) != 0;
     const int level = digitalRead(st);
     return activeLow ? (level == LOW) : (level == HIGH);
+}
+
+bool chargerIsCharging(void) {
+    return charger_gpio_charging();
 }
 
 void initBq27220Sensors(void) {

@@ -1,0 +1,303 @@
+#include "battery_low.h"
+#include "structs.h"
+#include "sensor_bq27220.h"
+#include "display_service.h"
+#include "device_control.h"
+#include "od_log.h"
+#include "ble_transport.h"
+#include "link_owner.h"
+#include "session_guard.h"
+#include "wifi_service.h"
+
+#include <Arduino.h>
+
+#ifdef TARGET_ESP32
+#include <esp_system.h>
+#endif
+
+extern struct GlobalConfig globalConfig;
+
+static constexpr float kHysteresisV = 0.10f;
+static constexpr uint8_t kSocTripThreshold = 5;
+static constexpr uint8_t kSocRecoverThreshold = 10;
+static constexpr uint8_t kDebounceStrikes = 3;
+static constexpr uint32_t kPollIntervalMs = 60000u;
+
+// Indexed by CapacityEstimator. Index 0 (unset) is 0.0f, meaning "never low".
+static constexpr float kCutoffVolts[6] = {
+    0.0f,   // unset
+    3.350f, // OD_CAPACITY_EST_LI_ION
+    3.000f, // OD_CAPACITY_EST_LIFEPO4
+    3.600f, // OD_CAPACITY_EST_SUPERCAP
+    2.700f, // OD_CAPACITY_EST_LITHIUM_PRIMARY
+    3.300f, // OD_CAPACITY_EST_SEEED_LI_ION
+};
+
+struct BatteryLowLatch {
+    bool low;
+    bool screenDrawn;
+    uint8_t lowStrikes;
+};
+
+// RTC_DATA_ATTR on ESP32 so the latch survives a deep-sleep reboot.
+// Without it the low-battery screen would redraw on every wake, and the
+// debounce strike count would never accumulate across the short wake windows
+// between deep sleeps. nRF never deep sleeps, so a plain static is enough
+// there.
+#ifdef TARGET_ESP32
+RTC_DATA_ATTR static BatteryLowLatch s_latch = {false, false, 0};
+#else
+static BatteryLowLatch s_latch = {false, false, 0};
+#endif
+
+static float cutoffForEstimator(uint8_t estimator) {
+    if (estimator >= (sizeof(kCutoffVolts) / sizeof(kCutoffVolts[0]))) {
+        return 0.0f;
+    }
+    return kCutoffVolts[estimator];
+}
+
+bool isBatteryLow(void) {
+    if (globalConfig.power_option.power_mode != OD_POWER_MODE_BATTERY) {
+        s_latch.low = false;
+        s_latch.lowStrikes = 0;
+        return false;
+    }
+
+    const uint8_t estimator = globalConfig.power_option.capacity_estimator;
+    const float cutoff = cutoffForEstimator(estimator);
+    if (cutoff <= 0.0f) {
+        s_latch.low = false;
+        s_latch.lowStrikes = 0;
+        return false;
+    }
+
+    // LITHIUM_PRIMARY cells are not rechargeable, so a charge-pin reading is
+    // meaningless for them and must not suppress the low check.
+    const bool lithiumPrimary = isEstimatorLithiumPrimary(estimator);
+    const bool charging = chargerIsCharging();
+    if (charging && !lithiumPrimary) {
+        s_latch.low = false;
+        return false;
+    }
+
+    const bool gaugeHealthy = bq27220IsConfigured() && bq27220GaugeHealthy();
+
+    if (s_latch.low) {
+        // A primary cell rebounds at rest after load, so a voltage recovery
+        // would cycle the device through reset and re-trip. Only a battery
+        // swap (power-on reset) clears this latch.
+        if (lithiumPrimary) {
+            return true;
+        }
+        if (gaugeHealthy) {
+            const uint8_t soc = bq27220Soc();
+            if (soc >= kSocRecoverThreshold) {
+                od_log_info("Battery low: recovered (SOC %u%%)", soc);
+                s_latch.low = false;
+                return false;
+            }
+            // Mirrors the trip path's unlearned-gauge fallback: a gauge that
+            // has not learned the pack's real capacity can keep reporting a
+            // low SOC long after voltage has genuinely recovered, which would
+            // otherwise latch the device low forever.
+            const float gaugeVoltage = readBatteryVoltage();
+            const bool unlearned = gaugeVoltage >= 0.0f &&
+                                   gaugeVoltage > (cutoff + kHysteresisV);
+            if (unlearned) {
+                od_log_info("Battery low: recovered (unlearned gauge, %d mV)",
+                            (int)(gaugeVoltage * 1000.0f));
+                s_latch.low = false;
+                return false;
+            }
+            return true;
+        }
+        const float voltage = readBatteryVoltage();
+        if (voltage >= 0.0f && voltage > (cutoff + kHysteresisV)) {
+            od_log_info("Battery low: recovered (%d mV)", (int)(voltage * 1000.0f));
+            s_latch.low = false;
+            return false;
+        }
+        return true;
+    }
+
+    if (gaugeHealthy) {
+        const uint8_t soc = bq27220Soc();
+        if (soc > kSocTripThreshold) {
+            return false;
+        }
+        // A gauge that has not yet learned the pack's real capacity can report
+        // a low SOC while its own voltage reading is nowhere near empty.
+        // Distrust the SOC in that case and fall back to the voltage table.
+        const float gaugeVoltage = readBatteryVoltage();
+        const bool unlearned = gaugeVoltage >= 0.0f && gaugeVoltage > (cutoff + kHysteresisV);
+        if (unlearned) {
+            return false;
+        }
+        return true;
+    }
+
+    const float voltage = readBatteryVoltage();
+    if (voltage < 0.0f) {
+        return false;
+    }
+    return voltage <= cutoff;
+}
+
+bool batteryLowStateActive(void) {
+    return s_latch.low;
+}
+
+void batteryLowPoll(void) {
+    static uint32_t lastPollMs = 0;
+    static bool havePolled = false;
+
+    if (havePolled && (uint32_t)(millis() - lastPollMs) < kPollIntervalMs) {
+        return;
+    }
+    lastPollMs = millis();
+    havePolled = true;
+
+    // isBatteryLow() already applies the recovery hysteresis, so a false
+    // result here is trusted immediately. Debounce only guards against a
+    // single sagged reading tripping the latch, not against recovery.
+    const bool lowNow = isBatteryLow();
+    if (!lowNow) {
+        s_latch.lowStrikes = 0;
+        return;
+    }
+
+    if (s_latch.low) {
+        return;
+    }
+
+    s_latch.lowStrikes++;
+    if (s_latch.lowStrikes < kDebounceStrikes) {
+        od_log_debug("Battery low: strike %u/%u", s_latch.lowStrikes, kDebounceStrikes);
+        return;
+    }
+
+    od_log_info("Battery low: tripped");
+    s_latch.low = true;
+    s_latch.screenDrawn = false; // forces the low-battery screen to draw once
+    s_latch.lowStrikes = 0;
+}
+
+bool lowBatteryBootCheck(void) {
+    // Polled here (rather than left to the first updatemsdata()) so s_soc is
+    // fresh before isBatteryLow() reads it, and so the voltage cache it also
+    // fills is reused for free by the later updatemsdata() call.
+    pollBq27220ForMsd();
+
+    const bool wasLatched = s_latch.low;
+    const bool lowNow = isBatteryLow();
+
+    if (wasLatched && !lowNow) {
+#ifdef TARGET_ESP32
+        // Only reachable on an ESP32 deep-sleep wake: that is the only boot
+        // where the RTC latch survives. The reset turns the wake into a
+        // normal cold boot, which redraws the boot screen and starts Wi-Fi.
+        od_log_info("Battery low: recovered at boot, resetting");
+        esp_restart();
+#endif
+        // nRF: s_latch is a plain static and never survives a reset, so this
+        // branch cannot be reached there.
+        return false;
+    }
+
+    if (!lowNow) {
+        return false;
+    }
+
+    s_latch.low = true;
+
+#ifdef TARGET_ESP32
+    // s_latch.screenDrawn true means we expect the low-battery screen to
+    // already be on the panel from a previous wake, so skip redrawing it.
+    if (!s_latch.screenDrawn) {
+        // The refresh that caused a brownout would cause it again. RTC_DATA_ATTR
+        // does not survive a brownout reset, so leaving screenDrawn false here
+        // retries the draw on the next timer wake instead of looping.
+        const esp_reset_reason_t reason = esp_reset_reason();
+        if (reason != ESP_RST_BROWNOUT) {
+            const bool drawn = refreshLowBatteryScreenFull();
+            if (drawn) {
+                s_latch.screenDrawn = true;
+            }
+        }
+    }
+    enterDeepSleep(true, kLowBatterySleepSeconds, true);
+    // enterDeepSleep() is void and does not actually return here (the chip
+    // resets from sleep), but it is not declared [[noreturn]], so a return
+    // value is still required to satisfy the compiler.
+    return true;
+#else
+    ble.setRadioSuppressed(true);
+    // nRF cannot tell a brownout from a power-on reset, so it always draws.
+    // s_latch.screenDrawn true means we expect the low-battery screen to
+    // already be on the panel from a previous call, so skip redrawing it.
+    if (!s_latch.screenDrawn) {
+        const bool drawn = refreshLowBatteryScreenFull();
+        if (drawn) {
+            s_latch.screenDrawn = true;
+        }
+    }
+    return true;
+#endif
+}
+
+bool batteryLowLoopCheck(void) {
+    // Set once per trip, so a sustained low state does not re-run the radio
+    // suppression / abort / screen-draw sequence on every platformIdle() pass.
+    static bool s_tripHandled = false;
+
+    batteryLowPoll();
+
+    if (!s_latch.low) {
+        if (s_tripHandled) {
+            // ESP32 never reaches this: every ESP32 low path ends in
+            // enterDeepSleep(), and recovery is checked at the next wake
+            // instead, in lowBatteryBootCheck().
+            od_log_info("Battery low: recovered in loop, resetting");
+            reboot();
+        }
+        return false;
+    }
+
+    if (s_tripHandled) {
+        return true;
+    }
+
+    s_tripHandled = true;
+    ble.setRadioSuppressed(true);
+#ifdef OPENDISPLAY_HAS_WIFI
+    opendisplay_lan_teardown();
+#endif
+
+#ifdef TARGET_ESP32
+    if (!s_latch.screenDrawn) {
+        const bool drawn = refreshLowBatteryScreenFull();
+        if (drawn) {
+            s_latch.screenDrawn = true;
+        }
+    }
+    enterDeepSleep(true, kLowBatterySleepSeconds, true);
+    // enterDeepSleep() does not actually return here (the chip resets from
+    // sleep), but it is not declared [[noreturn]], so a return value is
+    // still required to satisfy the compiler.
+    return true;
+#else
+    // Mirrors enterDeepSleep()'s own terminal-mark-then-abort sequence: the
+    // admission gate goes up, then the owner's link is dropped, before the
+    // (potentially slow) panel refresh starts.
+    const LinkId displaced = linkMarkTerminal();
+    abortToKnownState("low battery", true, displaced);
+    if (!s_latch.screenDrawn) {
+        const bool drawn = refreshLowBatteryScreenFull();
+        if (drawn) {
+            s_latch.screenDrawn = true;
+        }
+    }
+    return true;
+#endif
+}

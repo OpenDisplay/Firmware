@@ -27,6 +27,11 @@ extern uint8_t buttonStateCount;
 // sleep for detectButtonWake() to name. 0xFF = ext0 not armed this cycle.
 RTC_DATA_ATTR static uint8_t s_ext0WakePin = 0xFF;
 
+// Remembers which pin (if any) was armed as the charge-pin wake source, so
+// detectButtonWake() can tell a charger plug-in apart from a real button.
+// 0xFF = not armed this cycle.
+RTC_DATA_ATTR static uint8_t s_chargeWakePin = 0xFF;
+
 namespace {
 
 bool validPin(uint8_t pin) { return pin != 0 && pin != 0xFF; }
@@ -67,43 +72,76 @@ void warnUnarmedPins(uint64_t mask, const char* reason) {
 
 }  // namespace
 
-void armButtonWakeSources() {
-    if (globalConfig.power_option.sleep_flags & OD_SLEEP_FLAG_BUTTON_WAKE_DISABLE) {
+void armButtonWakeSources(bool includeChargePin) {
+    const bool buttonWakeDisabled = (globalConfig.power_option.sleep_flags & OD_SLEEP_FLAG_BUTTON_WAKE_DISABLE) != 0;
+    if (buttonWakeDisabled && !includeChargePin) {
         od_log_info("Button wake disabled (sleep_flags) - timer-only deep sleep");
         return;
     }
     const uint8_t deviceFlags = globalConfig.system_config.device_flags;
     const uint8_t pwrPin2 = globalConfig.system_config.pwr_pin_2;
     const uint8_t pwrPin3 = globalConfig.system_config.pwr_pin_3;
+    const uint8_t chargePin = globalConfig.power_option.charge_state_pin;
 
     // Candidates: every initialized button (initButtons() already excluded 0xFF
-    // and the GT911 INT pin), plus the MOSFET-latch power button so it wakes
-    // from timer sleep the same way it wakes from powerOff().
-    WakeCandidate candidates[MAX_BUTTONS + 1];
+    // and the GT911 INT pin), the MOSFET-latch power button so it wakes from
+    // timer sleep the same way it wakes from powerOff(), and (low-battery sleeps
+    // only) the charger STAT pin so plugging in a charger wakes the device early.
+    WakeCandidate candidates[MAX_BUTTONS + 2];
     uint8_t candidateCount = 0;
-    for (uint8_t i = 0; i < buttonStateCount && i < MAX_BUTTONS; i++) {
-        const ButtonState& btn = buttonStates[i];
-        if (!btn.initialized || btn.instance_index >= 4) continue;
-        const BinaryInputs& input = globalConfig.binary_inputs[btn.instance_index];
-        WakeCandidate& c = candidates[candidateCount++];
-        c.pin = btn.pin;
-        c.wakeHigh = !btn.inverted;
-        c.pullup = (input.pullups & (1 << btn.pin_offset)) != 0;
-        c.pulldown = (input.pulldowns & (1 << btn.pin_offset)) != 0;
+    // OD_SLEEP_FLAG_BUTTON_WAKE_DISABLE is about buttons; the charge pin below is
+    // armed regardless, so button candidates are skipped here instead of bailing
+    // out of the whole function above.
+    if (!buttonWakeDisabled) {
+        for (uint8_t i = 0; i < buttonStateCount && i < MAX_BUTTONS; i++) {
+            const ButtonState& btn = buttonStates[i];
+            if (!btn.initialized || btn.instance_index >= 4) continue;
+            const BinaryInputs& input = globalConfig.binary_inputs[btn.instance_index];
+            WakeCandidate& c = candidates[candidateCount++];
+            c.pin = btn.pin;
+            c.wakeHigh = !btn.inverted;
+            c.pullup = (input.pullups & (1 << btn.pin_offset)) != 0;
+            c.pulldown = (input.pulldowns & (1 << btn.pin_offset)) != 0;
+        }
+        if ((deviceFlags & DEVICE_FLAG_BATTERY_LATCH) && validPin(pwrPin3)) {
+            WakeCandidate& c = candidates[candidateCount++];
+            c.pin = pwrPin3;
+            c.wakeHigh = false;      // shutdown button is active-low
+            c.pullup = true;         // powerLatchBegin() keeps it INPUT_PULLUP
+            c.pulldown = false;
+        }
     }
-    if ((deviceFlags & DEVICE_FLAG_BATTERY_LATCH) && validPin(pwrPin3)) {
-        WakeCandidate& c = candidates[candidateCount++];
-        c.pin = pwrPin3;
-        c.wakeHigh = false;      // shutdown button is active-low
-        c.pullup = true;         // powerLatchBegin() keeps it INPUT_PULLUP
-        c.pulldown = false;
+    if (includeChargePin && validPin(chargePin)) {
+        bool collides = false;
+        for (uint8_t i = 0; i < candidateCount; i++) {
+            if (candidates[i].pin == chargePin) {
+                collides = true;
+                break;
+            }
+        }
+        if (collides) {
+            // charge_state_pin shares a GPIO with a button/latch candidate above.
+            // Leave that candidate as the sole owner of the pin instead of adding
+            // a second one with possibly different polarity, which would also
+            // make detectButtonWake() misattribute a real button wake to the
+            // charger.
+            od_log_debug("Wake: charge pin %u collides with a button/latch pin - not armed separately", chargePin);
+        } else {
+            const bool activeLow = (globalConfig.power_option.charger_flags & OD_CHARGER_FLAG_STATE_ACTIVE_LOW) != 0;
+            WakeCandidate& c = candidates[candidateCount++];
+            c.pin = chargePin;
+            c.wakeHigh = !activeLow;  // wake at the charging level
+            c.pullup = true;          // initChargerGpio() keeps it INPUT_PULLUP
+            c.pulldown = false;
+        }
     }
 
     uint64_t lowMask = 0;
     uint64_t highMask = 0;
-    WakeCandidate eligible[MAX_BUTTONS + 1];
+    WakeCandidate eligible[MAX_BUTTONS + 2];
     uint8_t eligibleCount = 0;
     s_ext0WakePin = 0xFF;
+    s_chargeWakePin = 0xFF;
     for (uint8_t i = 0; i < candidateCount; i++) {
         const WakeCandidate& c = candidates[i];
         if (validPin(pwrPin2) && c.pin == pwrPin2) {
@@ -131,6 +169,12 @@ void armButtonWakeSources() {
         if (c.wakeHigh) highMask |= 1ULL << c.pin;
         else lowMask |= 1ULL << c.pin;
         eligible[eligibleCount++] = c;
+        if (includeChargePin && c.pin == chargePin) {
+            // May still lose its ext0 slot to a lower-numbered button below on
+            // classic ESP32/S2/S3; if so it is simply never the real wake cause,
+            // so the detectButtonWake() comparison is never exercised.
+            s_chargeWakePin = chargePin;
+        }
     }
 
     if (lowMask == 0 && highMask == 0) {
@@ -226,18 +270,34 @@ bool detectButtonWake(int wakeupCause) {
         // hardware is absent — the default case covers them defensively.
 #if SOC_PM_SUPPORT_EXT0_WAKEUP
         case ESP_SLEEP_WAKEUP_EXT0:
+            if (validPin(s_chargeWakePin) && s_ext0WakePin == s_chargeWakePin) {
+                od_log_info("Wake-up reason: EXT0 charge pin %u - not a button", s_ext0WakePin);
+                return false;
+            }
             od_log_info("Wake-up reason: EXT0 button (pin %u)", s_ext0WakePin);
             return true;
 #endif
 #if SOC_PM_SUPPORT_EXT1_WAKEUP
-        case ESP_SLEEP_WAKEUP_EXT1:
-            od_log_info("Wake-up reason: EXT1 button (pin mask 0x%llX)", (unsigned long long)esp_sleep_get_ext1_wakeup_status());
+        case ESP_SLEEP_WAKEUP_EXT1: {
+            const uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+            if (validPin(s_chargeWakePin) && mask == (1ULL << s_chargeWakePin)) {
+                od_log_info("Wake-up reason: EXT1 charge pin %u - not a button", s_chargeWakePin);
+                return false;
+            }
+            od_log_info("Wake-up reason: EXT1 button (pin mask 0x%llX)", (unsigned long long)mask);
             return true;
+        }
 #endif
 #if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
-        case ESP_SLEEP_WAKEUP_GPIO:
-            od_log_info("Wake-up reason: GPIO button (pin mask 0x%llX)", (unsigned long long)esp_sleep_get_gpio_wakeup_status());
+        case ESP_SLEEP_WAKEUP_GPIO: {
+            const uint64_t mask = esp_sleep_get_gpio_wakeup_status();
+            if (validPin(s_chargeWakePin) && mask == (1ULL << s_chargeWakePin)) {
+                od_log_info("Wake-up reason: GPIO charge pin %u - not a button", s_chargeWakePin);
+                return false;
+            }
+            od_log_info("Wake-up reason: GPIO button (pin mask 0x%llX)", (unsigned long long)mask);
             return true;
+        }
 #endif
         case ESP_SLEEP_WAKEUP_TIMER:
             od_log_info("Wake-up reason: timer");
@@ -287,7 +347,7 @@ int wakeButtonFindIndex(void) {
 
 #else  // not ESP32
 
-void armButtonWakeSources() {}
+void armButtonWakeSources(bool includeChargePin) { (void)includeChargePin; }
 
 bool detectButtonWake(int wakeupCause) {
     (void)wakeupCause;

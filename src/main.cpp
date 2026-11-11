@@ -14,6 +14,7 @@
 #include "session_guard.h"
 #include "od_log.h"
 #include "watchdog.h"
+#include "battery_low.h"
 
 #if defined(TARGET_ESP32) && defined(CONFIG_IDF_TARGET_ESP32S3)
 #include "driver/gpio.h"
@@ -256,16 +257,23 @@ void setup() {
         // or a DFU instead of being bricked until someone pulls the battery.
         od_log_warn("[WDT] safe mode - skipping initDisplay()");
         rebootFlag = 1;
-    } else if (!is_deep_sleep_wake) {
-        // Arm here rather than at declaration: this branch is the boot screen
-        // redraw, and every real reset (power-on, panic, WDT, SW) clears the
-        // wake cause and lands here. A deep-sleep wake skips it and keeps the
-        // pre-sleep flag, so a wake never advertises as a reboot.
-        rebootFlag = 1;
-        // Wake keeps the panel image; skipping initDisplay() (EPD rail power +
-        // full refresh) is the wake path's main energy saving.
-        initDisplay();
-        od_log_info("Display initialized");
+    } else {
+        // ESP32 never returns from lowBatteryBootCheck() when the battery is
+        // low. It deep-sleeps instead, so only nRF reaches the branches below.
+        const bool lowBat = lowBatteryBootCheck();
+        if (lowBat) {
+            rebootFlag = 1;
+        } else if (!is_deep_sleep_wake) {
+            // Arm here rather than at declaration: this branch is the boot screen
+            // redraw, and every real reset (power-on, panic, WDT, SW) clears the
+            // wake cause and lands here. A deep-sleep wake skips it and keeps the
+            // pre-sleep flag, so a wake never advertises as a reboot.
+            rebootFlag = 1;
+            // Wake keeps the panel image; skipping initDisplay() (EPD rail power +
+            // full refresh) is the wake path's main energy saving.
+            initDisplay();
+            od_log_info("Display initialized");
+        }
     }
 #ifdef TARGET_ESP32
     // Full BLE after display: ESP32 queues commands for loop() until setup returns.
@@ -1064,6 +1072,25 @@ void loop() {
     // outcome for a mechanism whose entire value is speed.
     serviceBleAuthAbuseDisconnect();
 
+    // Runs here, unconditionally, rather than inside platformIdle(): that hook
+    // is only reached when workInFlight is false below, and ble.isConnected()
+    // alone makes workInFlight true, so a battery check gated behind it would
+    // never fire while a central stays connected -- exactly the case this is
+    // for. Placed after every R7d session-policy step above, so a trip never
+    // pre-empts a command that arrived this same pass.
+    const bool batteryLow = batteryLowLoopCheck();
+    if (batteryLow) {
+#ifndef TARGET_ESP32
+        // nRF stays awake while low (no deep-sleep path); keep the loop
+        // responsive and keep polling BQ27220/ADC so recovery is detected.
+        idleDelay(500);
+        updatemsdata();
+#endif
+        // ESP32 never reaches here while actually low: the first trip goes
+        // straight into enterDeepSleep(), which never returns.
+        return;
+    }
+
     // Work in flight *this iteration* only. Every term is transient and most are
     // cleared earlier in this same pass, so this must never be the sole gate on
     // deep sleep — lastActivityMs supplies the quiet window. The terms that only
@@ -1170,12 +1197,12 @@ void fullSetupAfterConnection() {
     od_log_info("=== Full setup completed ===");
 }
 
-void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
+void enterDeepSleep(bool force, uint16_t overrideSleepSeconds, bool lowBattery) {
     if (globalConfig.power_option.power_mode != 1) {
         od_log_debug("Skipping deep sleep - not battery powered (power_mode: %u)", globalConfig.power_option.power_mode);
         return;
     }
-    if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
+    if (!lowBattery && globalConfig.power_option.deep_sleep_time_seconds == 0) {
         od_log_debug("Skipping deep sleep - deep_sleep_time_seconds is 0");
         return;
     }
@@ -1242,21 +1269,39 @@ void enterDeepSleep(bool force, uint16_t overrideSleepSeconds) {
     buzzerStopForSleep();
     ledStopForSleep();
     woke_from_deep_sleep = true; // Will be true on next boot
-    ble.stopAdvertising();
-    delay(200);
-    ble.end();
-    delay(100);
-    od_log_info("BLE deinitialized");
+#ifdef OPENDISPLAY_HAS_WIFI
+    // Mirrors esp32_ble_deinit_before_restart()'s ordering (device_control.cpp):
+    // WiFi/LAN torn down before BLE, since esp_deep_sleep_start() cuts power to
+    // both radios but a graceful teardown first avoids leaving sockets/TLS state
+    // dangling across the sleep-wake boundary.
+    opendisplay_lan_teardown();
+#endif
+    if (ble.isReady()) {
+        ble.stopAdvertising();
+        delay(200);
+        ble.end();
+        delay(100);
+        od_log_info("BLE deinitialized");
+    } else {
+        od_log_debug("BLE never started - nothing to deinitialize");
+    }
     // Host override (0x0053 payload) applies to this one cycle only: it is a
     // parameter, never stored, so an aborted or later sleep reverts to config.
     uint16_t sleepSeconds = overrideSleepSeconds ? overrideSleepSeconds
                                                  : globalConfig.power_option.deep_sleep_time_seconds;
+    if (lowBattery && sleepSeconds == 0) {
+        // lowBattery bypassed the deep_sleep_time_seconds == 0 guard above; a
+        // caller that also omits overrideSleepSeconds would otherwise arm a
+        // zero-length timer with no guaranteed wake source.
+        sleepSeconds = kLowBatterySleepSeconds;
+        od_log_debug("Low battery: no sleep duration configured - defaulting to %u seconds", sleepSeconds);
+    }
     uint64_t sleep_timeout_us = (uint64_t)sleepSeconds * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleep_timeout_us);
     // After the timer arm, before powerLatchHoldForSleep(): the latch-hold
     // manipulation then cannot disturb freshly configured RTC pulls, and its
     // gpio_hold_en() touches only the latch pin, never the wake pads.
-    armButtonWakeSources();
+    armButtonWakeSources(lowBattery);
     // RTC power-off (PCF8563/BM8563 + MOSFET latch): the RTC switches the board
     // back on, so the latch is released instead of held. On an I2C failure the
     // rail stays held and this is a plain timer deep sleep. The ESP32 timer

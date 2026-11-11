@@ -64,6 +64,7 @@ static volatile uint32_t s_instanceDecidedWord = 0;
 // not burn a multi-second high-rate burst. Button wakes still call
 // boostAdvertising() for a short 20–30 ms window.
 static uint32_t s_advBoostUntil = 0;
+static bool s_radioSuppressed = false;
 
 static constexpr uint16_t NRF_ADV_INTERVAL_MAX = 1600;  // 1000 ms
 static constexpr uint16_t NRF_ADV_BOOST_MIN = 32;       // 20 ms
@@ -264,6 +265,7 @@ bool BleTransport::begin(const char* deviceName) {
 }
 
 void BleTransport::startAdvertising() {
+    if (s_radioSuppressed) return;
     od_log_info("Configuring BLE advertising...");
     Bluefruit.Advertising.clearData();
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
@@ -283,6 +285,7 @@ void BleTransport::startAdvertising() {
 }
 
 void BleTransport::restartAdvertising() {
+    if (s_radioSuppressed) return;
     // Slow-only re-arm after disconnect. Do not call updatemsdata() here — that
     // stop/start + possible MSD rebuild is what reintroduced radio bursts.
     s_advBoostUntil = 0;
@@ -296,6 +299,16 @@ void BleTransport::restartAdvertising() {
 
 void BleTransport::stopAdvertising() {
     Bluefruit.Advertising.stop();
+}
+
+void BleTransport::setRadioSuppressed(bool suppress) {
+    s_radioSuppressed = suppress;
+    if (suppress) {
+        // Otherwise the SoftDevice re-arms advertising on its own after the
+        // next disconnect, defeating the suppression.
+        Bluefruit.Advertising.restartOnDisconnect(false);
+        stopAdvertising();
+    }
 }
 
 void BleTransport::end() {
@@ -391,6 +404,7 @@ void BleTransport::setManufacturerData(const uint8_t* msd, uint8_t len) {
     }
     // Only touch the radio while disconnected. Rebuilding MSD while connected
     // used to stop/start advertising and could leave a burst after the link dropped.
+    if (s_radioSuppressed) return;
     if (Bluefruit.connected()) return;
     Bluefruit.Advertising.stop();
     Bluefruit.Advertising.start(0);

@@ -174,6 +174,14 @@ static void bootFormatKeyLine(char* out, size_t outSize, const char* label,
     }
 }
 
+// Row stride in bytes for a row of `w` pixels at `bitsPerPixel` bpp, rounded
+// up so the last partial byte is included.
+static inline int bootRowPitch(uint16_t w, int bitsPerPixel) {
+    if (bitsPerPixel == 4) return (int)((w + 1u) / 2u);
+    if (bitsPerPixel == 2) return (int)((w + 3u) / 4u);
+    return (int)((w + 7u) / 8u);
+}
+
 static inline void setBootPixelBlack(uint8_t* row, uint16_t x, int pitch, int bitsPerPixel, uint8_t colorScheme) {
     if (bitsPerPixel == 1) {
         int bytePos = x / 8;
@@ -536,6 +544,60 @@ static void writeGray4PlaneRow(const uint8_t* row2bpp, int pitch2bpp, int planeP
     epdWriteData(planeRow, planePitch);
 }
 
+// Emits one already-painted row through whichever sink the active panel path
+// uses. Shared by writeBootScreenWithQr() and showLowBatteryScreen(), whose
+// row loops differ only in how they paint `row`, not in how they send it.
+static void bootSinkRow(uint16_t y_native, uint8_t* row, int pitch, int planePitch, uint16_t w, int bitSel,
+                        bool gray4Split, bool splitStream, int halfPass, uint16_t splitHalfPitch) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_boot_write_row(y_native, row, pitch);
+        return;
+    }
+#endif
+    if (gray4Split) {
+        writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
+    } else if (splitStream) {
+        splitPanelSinkBytes(row + (size_t)halfPass * splitHalfPitch, splitHalfPitch);
+    } else {
+        odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
+        epdWriteData(row, pitch);
+    }
+}
+
+// Closes out the per-row streaming loop. On FastEPD the controller already
+// has every plane it needs, so the boot driver just marks them done. On
+// bb_epaper, BWR/BWY panels need an explicit blank PLANE_1 write unless the
+// caller already painted PLANE_1 itself. writeBootScreenWithQr()'s color
+// swatches do that. showLowBatteryScreen() never does.
+static void bootFinishBitplane1(uint8_t* row, int pitch, uint16_t w, uint16_t h, bool writeBlankPlane1) {
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_boot_skip_planes();
+        return;
+    }
+#endif
+    if (writeBlankPlane1) {
+        memset(row, 0x00, pitch);
+        bbepSetAddrWindow(&bbep, 0, 0, w, h);
+        epdStartWrite(PLANE_1);
+        odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
+        for (uint16_t y = 0; y < h; y++) epdWriteData(row, pitch);
+    }
+}
+
+// Maps a native (pre-rotation) pixel coordinate to the logical, user-visible
+// one. Shared by every row-streaming screen in this file.
+static inline void bootRotateNativeToLogical(uint16_t x_native, uint16_t y_native, uint8_t rotation,
+                                             uint16_t w_log, uint16_t h_log, uint16_t* lx, uint16_t* ly) {
+    switch (rotation) {
+        case 1:  *lx = y_native; *ly = (uint16_t)(h_log - 1u - x_native); break; // 90° CW
+        case 2:  *lx = (uint16_t)(w_log - 1u - x_native); *ly = (uint16_t)(h_log - 1u - y_native); break; // 180°
+        case 3:  *lx = (uint16_t)(w_log - 1u - y_native); *ly = x_native; break; // 270° CW
+        default: *lx = x_native; *ly = y_native; break;
+    }
+}
+
 static const uint8_t kSchemeWhiteValue[] = {
     0xFF,  // 0: OD_COLOR_SCHEME_MONO   — 1bpp, bit 1 = white
     0xFF,  // 1: OD_COLOR_SCHEME_BWR    — 1bpp bitplane, all-ones = white plane
@@ -603,10 +665,7 @@ bool writeBootScreenWithQr() {
     const uint8_t colorScheme = globalConfig.displays[0].color_scheme;
     const bool useBitplanes = (colorScheme == OD_COLOR_SCHEME_BWR || colorScheme == OD_COLOR_SCHEME_BWY);
     const int bitsPerPixel = getBitsPerPixel();
-    int pitch;
-    if (bitsPerPixel == 4) pitch = w / 2;
-    else if (bitsPerPixel == 2) pitch = (w + 3) / 4;
-    else pitch = (w + 7) / 8;
+    const int pitch = bootRowPitch(w, bitsPerPixel);
     uint8_t whiteValue = (colorScheme < sizeof(kSchemeWhiteValue))
         ? kSchemeWhiteValue[colorScheme]
         : 0xFF;
@@ -999,12 +1058,7 @@ bool writeBootScreenWithQr() {
             for (uint16_t x_native = xPaint0; !colorRowOutsideBand && x_native < xPaint1; x_native++) {
                 // Map native pixel to logical (user-visible) coordinates
                 uint16_t lx, ly;
-                switch (rotation) {
-                    case 1:  lx = y_native; ly = (uint16_t)(h_log - 1u - x_native); break; // 90° CW
-                    case 2:  lx = (uint16_t)(w_log - 1u - x_native); ly = (uint16_t)(h_log - 1u - y_native); break; // 180°
-                    case 3:  lx = (uint16_t)(w_log - 1u - y_native); ly = x_native; break; // 270° CW
-                    default: lx = x_native; ly = y_native; break;
-                }
+                bootRotateNativeToLogical(x_native, y_native, rotation, w_log, h_log, &lx, &ly);
 
                 if (colorPlanePass) {
                     // BWR/BWY color plane: only colored swatch interiors get bit=1.
@@ -1043,27 +1097,8 @@ bool writeBootScreenWithQr() {
                     if (si >= 0) setBootPixelCode(row, x_native, pitch, bitsPerPixel, swatchCode[si]);
                 }
             }
-#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
-            if (fastepd_driver_used()) {
-                fastepd_boot_write_row(y_native, row, pitch);
-            } else if (gray4Split) {
-                writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
-            } else if (splitStream) {
-                splitPanelSinkBytes(row + (size_t)halfPass * splitHalfPitch, splitHalfPitch);
-            } else {
-                odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
-                epdWriteData(row, pitch);
-            }
-#else
-            if (gray4Split) {
-                writeGray4PlaneRow(row, pitch, planePitch, w, bitSel);
-            } else if (splitStream) {
-                splitPanelSinkBytes(row + (size_t)halfPass * splitHalfPitch, splitHalfPitch);
-            } else {
-                odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
-                epdWriteData(row, pitch);
-            }
-#endif
+            bootSinkRow(y_native, row, pitch, planePitch, w, bitSel,
+                       gray4Split, splitStream, halfPass, splitHalfPitch);
         }
     }
     } // halfPass
@@ -1072,20 +1107,188 @@ bool writeBootScreenWithQr() {
     // releases them just before the refresh, in refreshBootScreenFull(). Closing
     // early would make that call report an already-closed frame and skip the refresh.
 
+    bootFinishBitplane1(row, pitch, w, h, useBitplanes && !colorSwatchPlane1);
+    od_log_info("Boot screen with QR rendered");
+    return true;
+}
+
+// True when logical pixel (lx, ly) lands on the battery outline border, inside
+// the terminal nub, or inside the near-empty fill bar.
+static bool bootBatteryIconPixelBlack(uint16_t lx, uint16_t ly,
+                                      uint16_t bodyX, uint16_t bodyY, uint16_t bodyW, uint16_t bodyH, uint16_t border,
+                                      uint16_t nubX, uint16_t nubY, uint16_t nubW, uint16_t nubH,
+                                      uint16_t fillX, uint16_t fillY, uint16_t fillW, uint16_t fillH) {
+    bool inBody = lx >= bodyX && lx < bodyX + bodyW &&
+                  ly >= bodyY && ly < bodyY + bodyH;
+    if (inBody) {
+        bool inBorder = lx < bodyX + border || lx >= bodyX + bodyW - border ||
+                        ly < bodyY + border || ly >= bodyY + bodyH - border;
+        if (inBorder) return true;
+    }
+    bool inNub = lx >= nubX && lx < nubX + nubW &&
+                 ly >= nubY && ly < nubY + nubH;
+    if (inNub) return true;
+    bool inFill = lx >= fillX && lx < fillX + fillW &&
+                  ly >= fillY && ly < fillY + fillH;
+    return inFill;
+}
+
+// Kindle-style low-battery screen: a centered battery-outline icon with a
+// near-empty fill bar, and two centered text lines below it. Streams through
+// staticRowBuffer exactly like writeBootScreenWithQr() with no framebuffer
+// allocation. It does not call bbepRefresh(). The caller refreshes.
+//
+// Shares its row-streaming scaffolding with writeBootScreenWithQr() via
+// bootRotateNativeToLogical(), bootSinkRow(), and bootFinishBitplane1(). The
+// per-pixel paint logic stays separate: that function's inner loop is
+// inseparable from its QR/swatch/header/footer painting (color-plane passes
+// keyed off swatch state, zone layout, logo), while this screen only needs
+// the battery icon and two text lines.
+bool showLowBatteryScreen() {
+    const uint16_t w = globalConfig.displays[0].pixel_width;
+    const uint16_t h = globalConfig.displays[0].pixel_height;
+    const uint8_t rotation = globalConfig.displays[0].rotation; // 0=0°,1=90°,2=180°,3=270°
+    const bool is90or270 = (rotation == 1 || rotation == 3);
+    const uint16_t w_log = is90or270 ? h : w;
+    const uint16_t h_log = is90or270 ? w : h;
+    const uint8_t colorScheme = globalConfig.displays[0].color_scheme;
+    const bool useBitplanes = (colorScheme == OD_COLOR_SCHEME_BWR || colorScheme == OD_COLOR_SCHEME_BWY);
+    const int bitsPerPixel = getBitsPerPixel();
+    const int pitch = bootRowPitch(w, bitsPerPixel);
+    uint8_t whiteValue = (colorScheme < sizeof(kSchemeWhiteValue))
+        ? kSchemeWhiteValue[colorScheme]
+        : 0xFF;
+
+    uint16_t pad = (uint16_t)(w_log / 20);
+    if (pad < 4) pad = 4;
+
+    // Icon scale: nominal size from panel's smaller logical dimension, shrunk
+    // until the body+nub fits the panel width (covers 200x200-class panels).
+    uint16_t s = (uint16_t)((w_log < h_log ? w_log : h_log) / 35u);
+    if (s < 1) s = 1;
+    if (s > 36) s = 36;
+    while (s > 1 && (24 * s + 3 * s) > (int)w_log - 2 * pad) s--;
+    const uint16_t border = (uint16_t)((s > 2) ? s : 2);
+    const uint16_t bodyW = (uint16_t)(24 * s);
+    const uint16_t bodyH = (uint16_t)(14 * s);
+    const uint16_t nubW = (uint16_t)(3 * s);
+    const uint16_t nubH = (uint16_t)(6 * s);
+
+    const uint8_t estimator = globalConfig.power_option.capacity_estimator;
+    const bool lithiumPrimary = isEstimatorLithiumPrimary(estimator);
+    const char* line1 = "Low battery.";
+    const char* line2 = lithiumPrimary ? "Replace battery." : "Please charge.";
+
+    // Text scale is sized off the panel directly rather than off the icon
+    // scale, so the icon can be made bigger without dragging the font up too.
+    uint16_t textScale = (uint16_t)((w_log < h_log ? w_log : h_log) / 150u);
+    if (textScale < 1) textScale = 1;
+    if (textScale > 10) textScale = 10;
+    uint16_t line1W = bootTextWidth(line1, (uint8_t)textScale);
+    uint16_t line2W = bootTextWidth(line2, (uint8_t)textScale);
+    uint16_t maxTextW = (line1W > line2W) ? line1W : line2W;
+    while (textScale > 1 && maxTextW > (uint16_t)((int)w_log - 2 * pad)) {
+        textScale--;
+        line1W = bootTextWidth(line1, (uint8_t)textScale);
+        line2W = bootTextWidth(line2, (uint8_t)textScale);
+        maxTextW = (line1W > line2W) ? line1W : line2W;
+    }
+
+    const int lineStep = bootLineStep(textScale);
+    const int textBlockH = lineStep + 7 * textScale;
+    const uint16_t gap = (uint16_t)(2 * s);
+    const int totalBlockH = bodyH + gap + textBlockH;
+    // Signed on purpose: a block taller/wider than the panel must go negative
+    // here so the clamp below can detect it and pin the origin to 0.
+    int blockY0 = ((int)h_log - totalBlockH) / 2;
+    if (blockY0 < 0) blockY0 = 0;
+
+    int bodyX = ((int)w_log - (bodyW + nubW)) / 2;
+    if (bodyX < 0) bodyX = 0;
+    const int bodyY = blockY0;
+    const uint16_t nubX = (uint16_t)(bodyX + bodyW);
+    const uint16_t nubY = (uint16_t)(bodyY + (bodyH - nubH) / 2);
+    const uint16_t fillMargin = (uint16_t)(border + s);
+    const uint16_t fillX = (uint16_t)(bodyX + fillMargin);
+    const uint16_t fillY = (uint16_t)(bodyY + fillMargin);
+    const uint16_t fillW = (uint16_t)(3 * s);
+    // Signed on purpose: bodyH can be smaller than 2*fillMargin at the
+    // minimum icon scale, and the clamp below needs that to go negative.
+    int fillH = bodyH - 2 * fillMargin;
+    if (fillH < 1) fillH = 1;
+
+    int line1X = ((int)w_log - (int)line1W) / 2;
+    int line2X = ((int)w_log - (int)line2W) / 2;
+    if (line1X < 0) line1X = 0;
+    if (line2X < 0) line2X = 0;
+    const uint16_t line1Y = (uint16_t)(blockY0 + bodyH + gap);
+    const uint16_t line2Y = (uint16_t)(line1Y + lineStep);
+
+    const bool splitStream = splitPanelUsed();
+    const int splitHalfPasses = splitStream ? 2 : 1;
+    const uint16_t splitHalfPitch = (uint16_t)(pitch / 2);
+
+    uint8_t* row = staticRowBuffer;
+    const bool gray4Split = (colorScheme == OD_COLOR_SCHEME_GRAY4)
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
-    if (fastepd_driver_used()) {
-        fastepd_boot_skip_planes();
-    } else
+        && !fastepd_driver_used()
 #endif
-    {
-        if (useBitplanes && !colorSwatchPlane1) {
-            memset(row, 0x00, pitch);
+        ;
+    const int planePitch = (w + 7) / 8;
+    const size_t rowBytesNeeded = gray4Split ? (size_t)(pitch + planePitch) : (size_t)pitch;
+    if (rowBytesNeeded > sizeof(staticRowBuffer)) {
+        return false;
+    }
+    const int planePasses = gray4Split ? 2 : 1;
+
+    for (int halfPass = 0; halfPass < splitHalfPasses; halfPass++) {
+        if (splitStream && halfPass == 0 && !splitPanelBeginFrame()) {
+            od_log_error("Low battery screen: split panel frame open failed");
+            return false;
+        }
+    for (int pass = 0; pass < planePasses; pass++) {
+        const int bitSel = pass;
+        const int targetPlane = gray4Split ? (pass == 0 ? PLANE_0 : PLANE_1)
+                                           : (useBitplanes ? PLANE_0 : getplane());
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+        if (!fastepd_driver_used() && !splitStream) {
             bbepSetAddrWindow(&bbep, 0, 0, w, h);
-            epdStartWrite(PLANE_1);
-            odWatchdogBreadcrumb(OD_WDT_PHASE_STREAM);
-            for (uint16_t y = 0; y < h; y++) epdWriteData(row, pitch);
+            epdStartWrite(targetPlane);
+        }
+#else
+        if (!splitStream) {
+            bbepSetAddrWindow(&bbep, 0, 0, w, h);
+            epdStartWrite(targetPlane);
+        }
+#endif
+        const uint16_t xPaint0 = splitStream ? (uint16_t)(halfPass * (w / 2u)) : (uint16_t)0;
+        const uint16_t xPaint1 = splitStream ? (uint16_t)(xPaint0 + (w / 2u)) : w;
+        for (uint16_t y_native = 0; y_native < h; y_native++) {
+            if (splitStream) {
+                memset(row + (size_t)halfPass * splitHalfPitch, whiteValue, splitHalfPitch);
+            } else {
+                memset(row, whiteValue, pitch);
+            }
+            for (uint16_t x_native = xPaint0; x_native < xPaint1; x_native++) {
+                uint16_t lx, ly;
+                bootRotateNativeToLogical(x_native, y_native, rotation, w_log, h_log, &lx, &ly);
+
+                bool black =
+                    bootBatteryIconPixelBlack(lx, ly, (uint16_t)bodyX, (uint16_t)bodyY, bodyW, bodyH, border,
+                                              nubX, nubY, nubW, nubH, fillX, fillY, fillW, (uint16_t)fillH) ||
+                    bootTextPixelBlack(lx, ly, (uint16_t)line1X, line1Y, line1, (uint8_t)textScale, w_log, (int)w_log) ||
+                    bootTextPixelBlack(lx, ly, (uint16_t)line2X, line2Y, line2, (uint8_t)textScale, w_log, (int)w_log);
+                if (black) {
+                    setBootPixelBlack(row, x_native, pitch, bitsPerPixel, colorScheme);
+                }
+            }
+            bootSinkRow(y_native, row, pitch, planePitch, w, bitSel,
+                       gray4Split, splitStream, halfPass, splitHalfPitch);
         }
     }
-    od_log_info("Boot screen with QR rendered");
+    } // halfPass
+
+    bootFinishBitplane1(row, pitch, w, h, useBitplanes);
+    od_log_info("Low battery screen rendered");
     return true;
 }

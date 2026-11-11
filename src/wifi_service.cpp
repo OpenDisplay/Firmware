@@ -1190,7 +1190,7 @@ void handleWiFiServer() {
             // No stamp here: imageDataWritten() stamps the shared clock itself,
             // and only for a RECOGNISED command from the owner -- which is the
             // whole of R4's definition and what this site could not enforce.
-            imageDataWritten(NULL, NULL, tcpReceiveBuffer + 2, flen);
+            imageDataWritten(0, nullptr, tcpReceiveBuffer + 2, flen);
             g_commandInstance = 0;
             g_commandOrigin = ORIGIN_BLE;   // restore default for any subsequent BLE drain
             uint32_t consumed = 2u + (uint32_t)flen;

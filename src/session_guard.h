@@ -19,6 +19,7 @@
 //   checkTransferTimeouts() fires                     true       2
 //   serviceIdleTimeout() (BLE owner silent)           true       3
 //   auth-abuse threshold, after the TX barrier        true       4
+//   low battery (nRF loop), after linkMarkTerminal()  true       -
 //
 // NOT a caller: refusing a contender. Refusal disconnects the newcomer and does
 // nothing else -- no abort, no cleanup flag, no release. The incumbent's session

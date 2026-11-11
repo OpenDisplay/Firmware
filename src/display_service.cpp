@@ -20,6 +20,7 @@
 #include "session_guard.h"
 #include "touch_input.h"
 #include "watchdog.h"
+#include "battery_low.h"
 #include "uzlib.h"
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
 #include "display_fastepd.h"
@@ -585,6 +586,76 @@ static bool refreshBootScreenFull() {
     epdStartRefresh(REFRESH_FULL);
     const bool ok = waitforrefresh(60);
     splitPanelPowerOff();
+    return ok;
+}
+
+// Unlike refreshBootScreenFull(), which assumes the caller already brought the
+// panel up, this brings the panel up itself: a cold-boot caller may replace
+// initDisplay() entirely, and a deep-sleep-wake caller has no panel session up
+// at all. Mirrors the two bring-up paths initDisplay() uses (FastEPD vs
+// bb_epaper) and always ends powered off.
+bool refreshLowBatteryScreenFull(void) {
+    if (globalConfig.display_count == 0) {
+        od_log_warn("Low battery screen: no display configured");
+        return false;
+    }
+    if (pwrmgmState != PWR_OFF) {
+        // Cold-boot/deep-sleep-wake callers should always arrive here PWR_OFF.
+        // Tear down defensively so pwrmgm(true) below isn't a no-op.
+        od_log_warn("Low battery screen: panel session already active, tearing down first");
+        epdSessionForceOff();
+    }
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        pwrmgm(true);
+        fastepd_epaper_begin();
+        if (fastepd_init_failed()) {
+            od_log_warn("Low battery screen: FastEPD init failed");
+            fastepd_mark_hw_deinitialized();
+            pwrmgm(false);
+            return false;
+        }
+        bool ok = showLowBatteryScreen();
+        if (ok) {
+            od_log_info("EPD refresh: FULL (low battery, FastEPD)");
+            touchSuspendForEpdRefresh();
+            fastepd_full_update();
+            ok = waitforrefresh(60);
+            touchResumeAfterEpdRefresh();
+        } else {
+            od_log_warn("Low battery screen render failed");
+        }
+        epdSessionForceOff();
+        return ok;
+    }
+#endif
+    prepareEpdRailForBoot();
+    panelVariantResolve();
+    configureBbepPanelGeometry();
+    if (!bootPanelResponds()) {
+        od_log_warn("Low battery screen: panel not responding - skipping draw");
+        pwrmgm(false);   // raw rail cut: epdSessionForceOff() would send sleep commands and wait on BUSY
+        return false;
+    }
+    initBbepPanelSession();
+    bool ok = showLowBatteryScreen();
+    if (ok) {
+        odWatchdogBreadcrumb(OD_WDT_PHASE_BOOT_REFRESH);
+        od_log_info("EPD refresh: FULL (low battery)");
+        touchSuspendForEpdRefresh();
+        if (splitPanelUsed() && !splitPanelCloseFrame()) {
+            ok = false;
+        } else {
+            odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
+            epdStartRefresh(REFRESH_FULL);
+            ok = waitforrefresh(60);
+            splitPanelPowerOff();
+        }
+        touchResumeAfterEpdRefresh();
+    } else {
+        od_log_warn("Low battery screen render failed");
+    }
+    epdSessionForceOff();
     return ok;
 }
 
@@ -1883,8 +1954,11 @@ float readChipTemperature() {
 
 void updatemsdata(){
     // od_log_debug("updatemsdata() called (mloopcounter: %u)", mloopcounter);
-    pollAht20SensorsForMsd();
-    pollSht40SensorsForMsd();
+    const bool lowActive = batteryLowStateActive();
+    if (!lowActive) {
+        pollAht20SensorsForMsd();
+        pollSht40SensorsForMsd();
+    }
     pollBq27220ForMsd();
     float batteryVoltage = readBatteryVoltage();
     float chipTemperature = readChipTemperature();
