@@ -21,7 +21,7 @@
  *
  *   OD_STRUCTS_VERSION  2.1   (MAJOR.MINOR spec marker for THIS file; see
  *                              VERSIONING POLICY below -- NOT sent on the wire)
- *   LAST CHANGED        2026-10-26
+ *   LAST CHANGED        2026-11-11
  *
  *   The two version schemes carried here are DISTINCT (see §6 Q2 of the plan):
  *     - OD_STRUCTS_VERSION_* : documents this spec file, like protocol.h's
@@ -97,6 +97,13 @@
  *       Together with OD_DEVICE_FLAG_PWR_LATCH, deep sleep arms the RTC and
  *       releases the latch; the RTC INT powers the board back on (M5Paper).
  *       Backward-compatible enum addition; publishes no MSD data.
+ *     - BatterySenseFlags bit1: OD_BATTERY_SENSE_FLAG_CALIBRATED_MV. When set,
+ *       ESP32 firmware reads the battery-sense pin with the core's eFuse-
+ *       calibrated analogReadMilliVolts() and voltage_scaling_factor becomes the
+ *       divider ratio x1000 (V = mV * factor / 1e6; 2000 = 2:1). Clear keeps the
+ *       legacy raw-count meaning (V = count * factor / 1e5), so every deployed
+ *       config is unchanged. Non-ESP32 targets report the voltage as unknown
+ *       when the bit is set. Opt-in bit carved from reserved; no layout change.
  *     - Add each payload-layout change here as it lands. On the next version bump,
  *       move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
@@ -512,9 +519,10 @@ enum CapacityEstimator {
  * Firmware ships bit0; config.yaml still lists it reserved_0 (yaml is behind). */
 #define OD_SLEEP_FLAG_BUTTON_WAKE_DISABLE   (1u << 0) /* @doc "opt out of button wake from timer deep sleep (buttons sharing wake-hostile pads)" */
 
-/* PowerOption.battery_sense_flags @bits BatterySenseFlags (bits 1-7 reserved).
- * Firmware ships bit0; config.yaml still lists it reserved_0 (yaml is behind). */
+/* PowerOption.battery_sense_flags @bits BatterySenseFlags (bits 2-7 reserved).
+ * Firmware ships bit0 and bit1; config.yaml still lists them reserved_0/1 (yaml is behind). */
 #define OD_BATTERY_SENSE_FLAG_ENABLE_INVERTED (1u << 0) /* @doc "battery-sense enable is active-low (e.g. XIAO ~READ_BAT on P0.14)" */
+#define OD_BATTERY_SENSE_FLAG_CALIBRATED_MV   (1u << 1) /* @doc "voltage_scaling_factor is a divider ratio x1000 applied to factory-calibrated pin millivolts (ESP32 only): V = mV * factor / 1e6. Clear = legacy raw-count formula" */
 
 /* PowerOption.charger_flags @bits ChargerFlags (bits 2-7 reserved). */
 #define OD_CHARGER_FLAG_ENABLE_ACTIVE_LOW   (1u << 0) /* @doc "charge-enable (/CE) is active-low" */
@@ -533,7 +541,7 @@ struct PowerOption {
     uint8_t  battery_sense_enable_pin; /**< @doc "pin enabling the battery-sense divider; 0xFF = none." @default 0xFF */
     uint8_t  battery_sense_flags;      /**< @bits BatterySenseFlags @doc "battery-sense flags (bitfield)." */
     uint8_t  capacity_estimator;       /**< @enum CapacityEstimator @doc "battery chemistry model." */
-    uint16_t voltage_scaling_factor;   /**< @endian le @doc "ADC voltage scaling / divider factor (implementation-specific)." */
+    uint16_t voltage_scaling_factor;   /**< @endian le @doc "ADC voltage scaling / divider factor. battery_sense_flags bit1 clear (legacy): V = raw_adc_count * factor / 100000. Bit1 set (ESP32 only): divider ratio x1000, V = calibrated_pin_mV * factor / 1000000 (2000 = 2:1 divider)." */
     uint32_t deep_sleep_current_ua;    /**< @endian le @unit uA @doc "board deep-sleep current excl. MCU; 0 = unknown." */
     uint16_t deep_sleep_time_seconds;  /**< @endian le @unit s @doc "timer deep-sleep duration (ESP32 on battery); 0 = disabled." */
     uint8_t  charge_enable_pin;        /**< @doc "BQ25616 charge-enable GPIO; 0 or 0xFF = unused." @default 0xFF */

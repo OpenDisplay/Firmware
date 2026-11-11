@@ -1834,6 +1834,27 @@ static float readBatteryVoltageUncached() {
     uint8_t sensePin = globalConfig.power_option.battery_sense_pin;
     uint8_t enablePin = globalConfig.power_option.battery_sense_enable_pin;
     uint16_t scalingFactor = globalConfig.power_option.voltage_scaling_factor;
+    if (scalingFactor == 0) return -1.0;
+    // OD_BATTERY_SENSE_FLAG_CALIBRATED_MV selects the factor's meaning:
+    //   clear (legacy): volts = raw_adc_count * factor / 100000
+    //   set:            volts = calibrated_pin_mV * factor / 1000000
+    //                   (factor = divider ratio x1000, e.g. 2000 for 2:1)
+    // The calibrated path uses the ESP32 core's eFuse ADC calibration
+    // (analogReadMilliVolts), so one factor fits every board of a model. Other
+    // targets have no calibrated read: report "unknown" instead of applying a
+    // x1000 ratio to a raw count, which would be wildly wrong.
+    const bool calibratedMv =
+        (globalConfig.power_option.battery_sense_flags & OD_BATTERY_SENSE_FLAG_CALIBRATED_MV) != 0;
+#if !defined(TARGET_ESP32)
+    if (calibratedMv) {
+        static bool warned = false;
+        if (!warned) {
+            od_log_warn("Battery sense: CALIBRATED_MV flag is ESP32-only; voltage unavailable");
+            warned = true;
+        }
+        return -1.0;
+    }
+#endif
     pinMode(sensePin, INPUT);
     if (enablePin != 0xFF) {
         pinMode(enablePin, OUTPUT);
@@ -1843,15 +1864,19 @@ static float readBatteryVoltageUncached() {
     const int numSamples = 10;
     uint32_t adcSum = 0;
     for (int i = 0; i < numSamples; i++) {
+#if defined(TARGET_ESP32)
+        adcSum += calibratedMv ? analogReadMilliVolts(sensePin) : analogRead(sensePin);
+#else
         adcSum += analogRead(sensePin);
+#endif
         delay(2);
     }
     uint32_t adcAverage = adcSum / numSamples;
     if (enablePin != 0xFF) {
         digitalWrite(enablePin, LOW);
     }
-    if (scalingFactor > 0) return (adcAverage * scalingFactor) / (100000.0);
-    return -1.0;
+    if (calibratedMv) return (adcAverage * (float)scalingFactor) / 1000000.0f;
+    return (adcAverage * scalingFactor) / (100000.0);
 }
 
 static constexpr uint32_t kBatteryVoltageTtlMs = 30000u;

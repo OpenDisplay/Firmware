@@ -269,9 +269,9 @@ BLOCKS: dict[int, Block] = {
             Field("sleep_flags", "u8", 1),
             Field("battery_sense_pin", "u8", 1),
             Field("battery_sense_enable_pin", "u8", 1),
-            Field("battery_sense_flags", "u8", 1),
+            Field("battery_sense_flags", "u8", 1),  # bit0 ENABLE_INVERTED, bit1 CALIBRATED_MV (ESP32)
             Field("capacity_estimator", "u8", 1),
-            Field("voltage_scaling_factor", "u16", 2),
+            Field("voltage_scaling_factor", "u16", 2),  # legacy: V=count*f/1e5; CALIBRATED_MV: V=mV*f/1e6
             Field("deep_sleep_current_ua", "u32", 4),
             Field("deep_sleep_time_seconds", "u16", 2),
             Field("charge_enable_pin", "u8", 1),
