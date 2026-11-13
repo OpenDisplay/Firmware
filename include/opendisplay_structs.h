@@ -21,7 +21,7 @@
  *
  *   OD_STRUCTS_VERSION  2.1   (MAJOR.MINOR spec marker for THIS file; see
  *                              VERSIONING POLICY below -- NOT sent on the wire)
- *   LAST CHANGED        2026-10-26
+ *   LAST CHANGED        2026-11-13
  *
  *   The two version schemes carried here are DISTINCT (see §6 Q2 of the plan):
  *     - OD_STRUCTS_VERSION_* : documents this spec file, like protocol.h's
@@ -97,6 +97,17 @@
  *       Together with OD_DEVICE_FLAG_PWR_LATCH, deep sleep arms the RTC and
  *       releases the latch; the RTC INT powers the board back on (M5Paper).
  *       Backward-compatible enum addition; publishes no MSD data.
+ *     - PanelIC 77: OD_PANEL_IC_EP42R3_400X300 (DEPG0420 / GDEY042Z98 4.2" B/W/R,
+ *       SSD1683; bb_epaper EP42R3_400x300). Firmware has mapped 0x004D since
+ *       2.27.1 using the raw value; backward-compatible enum addition.
+ *     - BatterySenseFlags bit1: OD_BATTERY_SENSE_FLAG_CALIBRATED_MV (ESP32 only).
+ *       When set, the battery-sense pin is read through the chip's eFuse ADC
+ *       calibration (millivolts at the pin) and voltage_scaling_factor is the
+ *       divider ratio x1000: V = pin_mV * factor / 1000 (2:1 divider = 2000).
+ *       When clear, the legacy raw-count path is unchanged:
+ *       V = raw * factor / 100000. Opt-in so existing per-board factors, which
+ *       fold each board's uncalibrated ADC error into the number, keep their
+ *       meaning. Ignored by non-ESP32 targets. Backward-compatible bit addition.
  *     - Add each payload-layout change here as it lands. On the next version bump,
  *       move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
@@ -512,9 +523,10 @@ enum CapacityEstimator {
  * Firmware ships bit0; config.yaml still lists it reserved_0 (yaml is behind). */
 #define OD_SLEEP_FLAG_BUTTON_WAKE_DISABLE   (1u << 0) /* @doc "opt out of button wake from timer deep sleep (buttons sharing wake-hostile pads)" */
 
-/* PowerOption.battery_sense_flags @bits BatterySenseFlags (bits 1-7 reserved).
+/* PowerOption.battery_sense_flags @bits BatterySenseFlags (bits 2-7 reserved).
  * Firmware ships bit0; config.yaml still lists it reserved_0 (yaml is behind). */
 #define OD_BATTERY_SENSE_FLAG_ENABLE_INVERTED (1u << 0) /* @doc "battery-sense enable is active-low (e.g. XIAO ~READ_BAT on P0.14)" */
+#define OD_BATTERY_SENSE_FLAG_CALIBRATED_MV   (1u << 1) /* @doc "ESP32 only: read the sense pin through the eFuse ADC calibration; voltage_scaling_factor is then the divider ratio x1000 (V = pin_mV * factor / 1000, 2:1 divider = 2000). Clear = legacy raw-count scaling. Ignored on other targets." */
 
 /* PowerOption.charger_flags @bits ChargerFlags (bits 2-7 reserved). */
 #define OD_CHARGER_FLAG_ENABLE_ACTIVE_LOW   (1u << 0) /* @doc "charge-enable (/CE) is active-low" */
@@ -533,7 +545,7 @@ struct PowerOption {
     uint8_t  battery_sense_enable_pin; /**< @doc "pin enabling the battery-sense divider; 0xFF = none." @default 0xFF */
     uint8_t  battery_sense_flags;      /**< @bits BatterySenseFlags @doc "battery-sense flags (bitfield)." */
     uint8_t  capacity_estimator;       /**< @enum CapacityEstimator @doc "battery chemistry model." */
-    uint16_t voltage_scaling_factor;   /**< @endian le @doc "ADC voltage scaling / divider factor (implementation-specific)." */
+    uint16_t voltage_scaling_factor;   /**< @endian le @doc "ADC voltage scaling / divider factor. With battery_sense_flags CALIBRATED_MV (ESP32): divider ratio x1000, V = pin_mV * factor / 1000. Otherwise implementation-specific (ESP32 legacy: V = raw_count * factor / 100000)." */
     uint32_t deep_sleep_current_ua;    /**< @endian le @unit uA @doc "board deep-sleep current excl. MCU; 0 = unknown." */
     uint16_t deep_sleep_time_seconds;  /**< @endian le @unit s @doc "timer deep-sleep duration (ESP32 on battery); 0 = disabled." */
     uint8_t  charge_enable_pin;        /**< @doc "BQ25616 charge-enable GPIO; 0 or 0xFF = unused." @default 0xFF */
@@ -678,6 +690,7 @@ enum PanelIC {
     OD_PANEL_IC_EP40_SPECTRA_400X600     = 74  , /**< @doc "GDEP040E01 Spectra 6 4\" 400x600" */
     OD_PANEL_IC_EP27_176X264             = 75  , /**< @doc "Badger2350 B/W 2.7\"" */
     OD_PANEL_IC_EP27_176X264_4GRAY       = 76  , /**< @doc "Badger2350 4-gray 2.7\"" */
+    OD_PANEL_IC_EP42R3_400X300           = 77  , /**< @doc "DEPG0420 / GDEY042Z98 4.2\" B/W/R 400x300 (SSD1683)" */
     OD_PANEL_IC_UC8176_420_BW            = 1000, /**< @doc "UC8176 4.2\" B/W (M3 / EPD-nRF5 driver line, values 1000-1030)" */
     OD_PANEL_IC_SSD1619_420_BWR          = 1001, /**< @doc "SSD1619 4.2\" B/W/R" */
     OD_PANEL_IC_UC8176_420_BWR           = 1002, /**< @doc "UC8176 4.2\" B/W/R" */
