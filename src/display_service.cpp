@@ -1031,6 +1031,26 @@ bool initOrRestoreWireForBus(uint8_t bus_id) {
 #endif
 }
 
+#ifdef TARGET_ESP32
+// True when the board's default I2C pins (SDA/SCL) are also a configured display
+// pin. Wire.begin() with no arguments would then take that pin from the display
+// bus: on the reTerminal EE03 the defaults (GPIO8/9) are the IT8951's SPI
+// MISO/MOSI, so every panel power-up took them from SPI and the next transfer
+// hung forever.
+static bool defaultWirePinsUsedByDisplay(void) {
+    for (uint8_t i = 0; i < globalConfig.display_count; i++) {
+        const DisplayConfig& d = globalConfig.displays[i];
+        const uint8_t pins[] = { d.clk_pin, d.data_pin, d.dc_pin, d.cs_pin, d.cs_pin_2, d.reset_pin, d.busy_pin };
+        for (uint8_t p : pins) {
+            if (p != 0xFF && (p == SDA || p == SCL)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
 void initOrRestoreWireForOpenDisplay(void) {
 #ifdef TARGET_ESP32
     if (globalConfig.data_bus_count > 0 && i2cDataBusValid(0)) {
@@ -1038,6 +1058,19 @@ void initOrRestoreWireForOpenDisplay(void) {
         return;
     }
     if (!s_wire_open_display_ready) {
+        // No I2C bus configured, so Wire would start on the board defaults.
+        // Refuse when those belong to the display (warn once per boot; this
+        // runs on every panel power-up).
+        if (defaultWirePinsUsedByDisplay()) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                od_log_warn("Default I2C pins (SDA=%u SCL=%u) are display pins; Wire not started. "
+                            "Configure an I2C data bus if this board needs I2C.",
+                            (unsigned)SDA, (unsigned)SCL);
+            }
+            return;
+        }
         if (Wire.begin()) {
             s_wire_open_display_ready = true;
         }
