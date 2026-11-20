@@ -48,6 +48,12 @@ void setup() {
     delay(100);
     #elif !defined(DISABLE_USB_SERIAL)
     Serial.begin(115200);
+    #if defined(TARGET_ESP32) && ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+    // HWCDC::write() otherwise waits up to 20 x 100 ms per call when a USB host
+    // is attached but nothing reads the port, stalling loop() for seconds per log
+    // line (OpenDisplay/Firmware#188). Drop instead of wait.
+    Serial.setTxTimeoutMs(0);
+    #endif
     #if defined(TARGET_NRF) && defined(OPENDISPLAY_BOOT_DIAG)
     // Full-firmware boot diagnostic. Reaching this LED proves that reset,
     // application handoff, C/C++ runtime initialization, global constructors,
